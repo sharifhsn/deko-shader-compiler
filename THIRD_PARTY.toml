@@ -1,0 +1,13 @@
+format = 1
+
+[[upstreams]]
+name = "Mesa NAK"
+repository = "https://gitlab.freedesktop.org/mesa/mesa.git"
+revision = "99bf1b953cba11d41dbee519ae1b53387477df9e"
+license = "MIT"
+status = "extraction-pending"
+source_root = "src/nouveau/compiler/nak"
+notice = "Every imported file must retain its original copyright and SPDX header."
+
+files = []
+

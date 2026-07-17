@@ -1,0 +1,31 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/deko-dksh",
+    "crates/deko-nak",
+    "crates/deko-shader-compiler",
+    "crates/deko-shader-compiler-macros",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.87"
+license = "MIT"
+repository = "https://github.com/sharifhsn/deko-shader-compiler"
+homepage = "https://github.com/sharifhsn/deko-shader-compiler"
+authors = ["Sharif Shamsi"]
+
+[workspace.dependencies]
+deko-dksh = { version = "0.1.0", path = "crates/deko-dksh" }
+deko-nak = { version = "0.1.0", path = "crates/deko-nak" }
+naga = { version = "29.0.0", default-features = false, features = ["wgsl-in"] }
+thiserror = "2.0"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"

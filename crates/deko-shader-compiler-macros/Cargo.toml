@@ -1,0 +1,20 @@
+[package]
+name = "deko-shader-compiler-macros"
+description = "Proc macros for the NAK-derived deko-shader-compiler IR"
+keywords = ["shader", "compiler", "proc-macro"]
+categories = ["compilers", "development-tools::procedural-macro-helpers"]
+readme = "../../README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[lib]
+proc-macro = true
+
+[lints]
+workspace = true
+

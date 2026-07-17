@@ -1,0 +1,20 @@
+[package]
+name = "deko-dksh"
+description = "Safe encoder and parser for Deko3D DKSH shader containers"
+keywords = ["deko3d", "dksh", "shader", "switch", "gpu"]
+categories = ["encoding", "graphics", "parser-implementations"]
+readme = "../../README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+[lints]
+workspace = true
+

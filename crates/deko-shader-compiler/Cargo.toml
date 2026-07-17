@@ -1,0 +1,23 @@
+[package]
+name = "deko-shader-compiler"
+description = "WGSL/Naga to native Deko3D shader compiler for Nintendo Switch"
+keywords = ["wgsl", "naga", "deko3d", "shader", "switch"]
+categories = ["compilers", "graphics", "rendering"]
+readme = "../../README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[dependencies]
+deko-dksh.workspace = true
+deko-nak.workspace = true
+naga.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
+
