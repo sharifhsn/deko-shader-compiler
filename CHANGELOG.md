@@ -12,6 +12,8 @@
   pipeline override constants required by the captured Bevy 0.19 workload.
 - Add independent sampled-texture and sampler targets, statically and dynamically
   indexed binding arrays, and the packed Maxwell bindless handle ABI.
+- Add native Maxwell TXD lowering for explicit 1D/2D texture gradients, including
+  array-layer and offset operand packing.
 - Add a safe deterministic DKSH encoder/parser with typed stage payloads and
   versioned binding metadata consumed by wgpu-hal.
 - Add the explicit GM20B target descriptor, register allocation, scheduling, SPH

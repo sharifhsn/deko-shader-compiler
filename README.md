@@ -13,6 +13,9 @@ support the core invocation built-ins,
 read/write storage buffers with static or dynamically indexed host-shareable data, storage and
 workgroup atomics, barriers, workgroup memory, and runtime storage-array lengths. Unsupported
 features return a typed error instead of silently changing shader semantics.
+Native Maxwell TXD lowering supports explicit WGSL gradients for 1D/2D sampled textures,
+including array layers and constant offsets. Explicit gradients for 3D and cube textures remain
+typed rejections until the compiler gains Mesa's derivative-to-LOD rewrite for those shapes.
 
 The compiler is integrated into the Deko3D backend of the accompanying wgpu fork.
 An override-free Ryujinx run has compiled ordinary Bevy WGSL at runtime and rendered

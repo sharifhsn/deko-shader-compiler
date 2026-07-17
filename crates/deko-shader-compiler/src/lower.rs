@@ -6,10 +6,11 @@ use deko_nak::ir::{
     OffsetStride, OpALd, OpASt, OpAtom, OpBar, OpBfe, OpBrk, OpCont, OpExit, OpF2I, OpFAdd,
     OpFMnMx, OpFMul, OpFSetP, OpFSwzAdd, OpFlo, OpI2F, OpIAdd2, OpIAdd2X, OpIMad, OpIMnMx, OpIMul,
     OpISetP, OpIpa, OpKill, OpLd, OpLdc, OpLop2, OpMemBar, OpMov, OpMuFu, OpPBk, OpPCnt, OpPSetP,
-    OpPhiDsts, OpPhiSrcs, OpRegOut, OpS2R, OpSel, OpShfl, OpShl, OpShr, OpSt, OpSuLd, OpSuSt,
-    OpTex, OpTld, OpTld4, OpTxq, Phi, Pred, PredRef, PredSetOp, RegFile, SSARef, SSAValue, Shader,
-    ShaderInfo, ShaderIoInfo, ShaderModelInfo, ShaderStageInfo, ShflOp, Src, SrcMod, SrcRef,
-    SrcSwizzle, TexDerivMode, TexDim, TexLodMode, TexOffsetMode, TexQuery, TexRef,
+    OpPhiDsts, OpPhiSrcs, OpPrmt, OpRegOut, OpS2R, OpSel, OpShfl, OpShl, OpShr, OpSt, OpSuLd,
+    OpSuSt, OpTex, OpTld, OpTld4, OpTxd, OpTxq, Phi, Pred, PredRef, PredSetOp, PrmtMode, RegFile,
+    SSARef, SSAValue, Shader, ShaderInfo, ShaderIoInfo, ShaderModelInfo, ShaderStageInfo, ShflOp,
+    Src, SrcMod, SrcRef, SrcSwizzle, TexDerivMode, TexDim, TexLodMode, TexOffsetMode, TexQuery,
+    TexRef,
 };
 use deko_nak::sph::PixelImap;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
@@ -1564,10 +1565,7 @@ impl<'function> FunctionLowerer<'function> {
         depth_ref: Option<naga::Handle<naga::Expression>>,
         clamp_to_edge: bool,
     ) -> Result<Value, Error> {
-        if clamp_to_edge
-            || matches!(level, naga::SampleLevel::Gradient { .. })
-            || (gather.is_some() && !matches!(level, naga::SampleLevel::Zero))
-        {
+        if clamp_to_edge || (gather.is_some() && !matches!(level, naga::SampleLevel::Zero)) {
             return Err(Error::UnsupportedFeature(format!(
                 "texture sample options gather={gather:?} array={} offset={} level={level:?} depth={} clamp={clamp_to_edge}",
                 array_index.is_some(),
@@ -1638,8 +1636,8 @@ impl<'function> FunctionLowerer<'function> {
                 "texture coordinate shape mismatch".to_owned(),
             ));
         }
-        let mut auxiliary = bindless_handle.into_iter().collect::<Vec<_>>();
-        if let Some(array_index) = array_index {
+        let mut auxiliary = bindless_handle.clone().into_iter().collect::<Vec<_>>();
+        let array_index = if let Some(array_index) = array_index {
             let array_index = self.expression(array_index)?;
             if array_index.components.len() != 1
                 || !matches!(
@@ -1651,10 +1649,10 @@ impl<'function> FunctionLowerer<'function> {
                     "texture array index must be an integer scalar".to_owned(),
                 ));
             }
-            coordinate
-                .components
-                .insert(0, array_index.components[0].clone());
-        }
+            Some(array_index.components[0].clone())
+        } else {
+            None
+        };
         let depth_reference = if let Some(depth_ref) = depth_ref {
             let depth_ref = self.expression(depth_ref)?;
             if depth_ref.kind != naga::ScalarKind::Float || depth_ref.components.len() != 1 {
@@ -1666,6 +1664,99 @@ impl<'function> FunctionLowerer<'function> {
         } else {
             None
         };
+        if let naga::SampleLevel::Gradient { x, y } = level {
+            if expected > 2 {
+                return Err(Error::UnsupportedFeature(format!(
+                    "explicit gradients for {dim} textures require the 3D/cube TXD rewrite"
+                )));
+            }
+            if depth_reference.is_some() {
+                return Err(Error::UnsupportedFeature(
+                    "explicit-gradient depth comparison sampling".to_owned(),
+                ));
+            }
+
+            // SM50 TXD has a different source contract from TEX. Mesa's NAK lowering
+            // packs the bindless handle and coordinates into source zero, then interleaves
+            // the explicit derivatives in source one. Array indices occupy the final
+            // source-zero component; when an offset is present, PRMT combines the low
+            // 16-bit array index with the packed offset in the high half.
+            let mut primary = bindless_handle.into_iter().collect::<Vec<_>>();
+            primary.extend(coordinate.components);
+            let offset_mode = if let Some(offset) = offset {
+                let packed_offset = self.pack_texture_offset(offset)?;
+                let packed_array_offset = self.target.ssa_alloc.alloc(RegFile::GPR);
+                self.emit(Instr::new(OpPrmt {
+                    dst: Dst::from(packed_array_offset),
+                    srcs: [packed_offset, array_index.clone().unwrap_or(Src::ZERO)],
+                    sel: Src::from(0x1054_u32),
+                    mode: PrmtMode::Index,
+                }));
+                primary.push(Src::from(packed_array_offset));
+                TexOffsetMode::AddOffI
+            } else {
+                primary.extend(array_index);
+                TexOffsetMode::None
+            };
+            if primary.len() > 4 {
+                return Err(Error::UnsupportedFeature(
+                    "explicit-gradient texture source exceeds the SM50 TXD register tuple"
+                        .to_owned(),
+                ));
+            }
+
+            let derivative_x = self.expression(x)?;
+            let derivative_y = self.expression(y)?;
+            if derivative_x.kind != naga::ScalarKind::Float
+                || derivative_y.kind != naga::ScalarKind::Float
+                || derivative_x.components.len() != expected
+                || derivative_y.components.len() != expected
+            {
+                return Err(Error::UnsupportedFeature(
+                    "texture gradients must match the floating-point coordinate shape".to_owned(),
+                ));
+            }
+            let mut derivatives = Vec::with_capacity(expected * 2);
+            for (dx, dy) in derivative_x
+                .components
+                .into_iter()
+                .zip(derivative_y.components)
+            {
+                derivatives.push(dx);
+                derivatives.push(dy);
+            }
+
+            let sources = [
+                Src::from(self.materialize(Value {
+                    components: primary,
+                    kind: naga::ScalarKind::Uint,
+                })?),
+                Src::from(self.materialize(Value {
+                    components: derivatives,
+                    kind: naga::ScalarKind::Float,
+                })?),
+            ];
+            let destination = self.target.ssa_alloc.alloc_vec(RegFile::GPR, 4);
+            self.emit(Instr::new(OpTxd {
+                dsts: [Dst::from(destination.clone()), Dst::None],
+                fault: Dst::None,
+                tex: texture_reference,
+                srcs: sources,
+                dim,
+                offset_mode,
+                mem_eviction_priority: MemEvictionPriority::Normal,
+                nodep: false,
+                channel_mask: ChannelMask::for_comps(4),
+            }));
+            return Ok(Value {
+                components: destination.iter().copied().map(Src::from).collect(),
+                kind,
+            });
+        }
+
+        if let Some(array_index) = array_index {
+            coordinate.components.insert(0, array_index);
+        }
         if let Some(component) = gather {
             let component = match component {
                 naga::SwizzleComponent::X => 0,
@@ -1722,7 +1813,7 @@ impl<'function> FunctionLowerer<'function> {
                 auxiliary.extend(level.components);
                 TexLodMode::Lod
             }
-            naga::SampleLevel::Gradient { .. } => unreachable!("rejected above"),
+            naga::SampleLevel::Gradient { .. } => unreachable!("handled above"),
         };
         let offset_mode = if let Some(offset) = offset {
             auxiliary.push(self.pack_texture_offset(offset)?);

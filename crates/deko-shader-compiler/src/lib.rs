@@ -1577,8 +1577,8 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_gradient_sampling_and_subgroup_barriers_fail_explicitly() {
-        let gradient_error = Compiler
+    fn gradient_sampling_compiles_and_remaining_limits_fail_explicitly() {
+        let gradient_shader = Compiler
             .compile_wgsl(
                 r"
                     @group(0) @binding(0) var image: texture_2d<f32>;
@@ -1598,10 +1598,57 @@ mod tests {
                 &PipelineConstants::new(),
                 Options::default(),
             )
+            .unwrap();
+        assert!(gradient_shader.dksh.starts_with(b"DKSH"));
+
+        Compiler
+            .compile_wgsl(
+                r"
+                    @group(0) @binding(0) var image: texture_2d_array<f32>;
+                    @group(0) @binding(1) var image_sampler: sampler;
+                    @fragment fn main() -> @location(0) vec4<f32> {
+                        return textureSampleGrad(
+                            image,
+                            image_sampler,
+                            vec2<f32>(0.5),
+                            2,
+                            vec2<f32>(1.0, 0.0),
+                            vec2<f32>(0.0, 1.0),
+                            vec2<i32>(1, -1),
+                        );
+                    }
+                ",
+                Stage::Fragment,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap();
+
+        let gradient_3d_error = Compiler
+            .compile_wgsl(
+                r"
+                    @group(0) @binding(0) var image: texture_3d<f32>;
+                    @group(0) @binding(1) var image_sampler: sampler;
+                    @fragment fn main() -> @location(0) vec4<f32> {
+                        return textureSampleGrad(
+                            image,
+                            image_sampler,
+                            vec3<f32>(0.5),
+                            vec3<f32>(1.0, 0.0, 0.0),
+                            vec3<f32>(0.0, 1.0, 0.0),
+                        );
+                    }
+                ",
+                Stage::Fragment,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
             .unwrap_err();
         assert!(matches!(
-            gradient_error,
-            Error::UnsupportedFeature(ref feature) if feature.contains("Gradient")
+            gradient_3d_error,
+            Error::UnsupportedFeature(ref feature) if feature.contains("3D/cube TXD rewrite")
         ));
 
         let subgroup_error = Compiler
