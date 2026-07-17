@@ -17,6 +17,8 @@
 - Add derivative-to-LOD lowering for explicit 3D and cube texture gradients, including
   the cube-face selection and quotient-rule calculation used by Mesa NIR.
 - Advance the backend ABI cache namespace for the explicit-gradient codegen changes.
+- Lower subgroup barriers to CTA-scoped memory fences on lockstep GM20B warps without
+  introducing a whole-workgroup synchronization point.
 - Add a safe deterministic DKSH encoder/parser with typed stage payloads and
   versioned binding metadata consumed by wgpu-hal.
 - Add the explicit GM20B target descriptor, register allocation, scheduling, SPH

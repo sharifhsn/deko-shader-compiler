@@ -27,9 +27,11 @@ fuzz_target!(|bytes: &[u8]| {
             2 => "@group(0) @binding(0) var image: texture_3d<f32>; @group(0) @binding(1) var image_sampler: sampler; @fragment fn main() -> @location(0) vec4<f32> { return textureSampleGrad(image, image_sampler, vec3<f32>(0.5), vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), vec3<i32>(1, 0, -1)); }".to_owned(),
             _ => "@group(0) @binding(0) var image: texture_cube_array<f32>; @group(0) @binding(1) var image_sampler: sampler; @fragment fn main() -> @location(0) vec4<f32> { return textureSampleGrad(image, image_sampler, normalize(vec3<f32>(0.5, 0.25, 1.0)), 2, vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0)); }".to_owned(),
         },
-        Stage::Compute => format!(
+        Stage::Compute if bytes[2] % 2 == 0 => format!(
             "@compute @workgroup_size(1) fn main(@builtin(global_invocation_id) id: vec3<u32>) {{ let left = id.x ^ {left}u; let right = id.x ^ {right}u; let value = left {operation} right; _ = value; }}"
         ),
+        Stage::Compute =>
+            "@compute @workgroup_size(32) fn main() { subgroupBarrier(); }".to_owned(),
     };
     Compiler
         .compile_wgsl(

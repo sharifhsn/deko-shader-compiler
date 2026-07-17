@@ -6631,11 +6631,13 @@ impl<'function> FunctionLowerer<'function> {
                 naga::Statement::Kill => self.emit(Instr::new(OpKill {})),
                 naga::Statement::ControlBarrier(flags) => {
                     if flags.contains(naga::Barrier::SUB_GROUP) {
-                        return Err(Error::UnsupportedFeature(
-                            "subgroup control barrier".to_owned(),
-                        ));
-                    }
-                    if flags.intersects(naga::Barrier::STORAGE | naga::Barrier::TEXTURE) {
+                        // GM20B warps execute in lockstep. A CTA memory fence supplies the
+                        // subgroup memory ordering required by Naga without using BAR.SYNC,
+                        // which would incorrectly wait for every warp in the workgroup.
+                        self.emit(Instr::new(OpMemBar {
+                            scope: MemScope::CTA,
+                        }));
+                    } else if flags.intersects(naga::Barrier::STORAGE | naga::Barrier::TEXTURE) {
                         self.emit(Instr::new(OpMemBar {
                             scope: MemScope::GPU,
                         }));
@@ -6644,14 +6646,11 @@ impl<'function> FunctionLowerer<'function> {
                             scope: MemScope::CTA,
                         }));
                     }
-                    self.emit(Instr::new(OpBar {}));
+                    if !flags.contains(naga::Barrier::SUB_GROUP) {
+                        self.emit(Instr::new(OpBar {}));
+                    }
                 }
                 naga::Statement::MemoryBarrier(flags) => {
-                    if flags.contains(naga::Barrier::SUB_GROUP) {
-                        return Err(Error::UnsupportedFeature(
-                            "subgroup memory barrier".to_owned(),
-                        ));
-                    }
                     let scope = if flags.intersects(naga::Barrier::STORAGE | naga::Barrier::TEXTURE)
                     {
                         MemScope::GPU

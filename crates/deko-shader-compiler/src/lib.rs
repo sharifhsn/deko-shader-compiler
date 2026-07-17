@@ -1586,7 +1586,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::too_many_lines)]
-    fn gradient_sampling_compiles_and_subgroup_barriers_fail_explicitly() {
+    fn gradient_sampling_and_subgroup_barriers_compile() {
         let gradient_shader = Compiler
             .compile_wgsl(
                 r"
@@ -1704,7 +1704,7 @@ mod tests {
             )
             .unwrap();
 
-        let subgroup_error = Compiler
+        let subgroup_shader = Compiler
             .compile_wgsl(
                 "@compute @workgroup_size(1) fn main() { subgroupBarrier(); }",
                 Stage::Compute,
@@ -1712,11 +1712,17 @@ mod tests {
                 &PipelineConstants::new(),
                 Options::default(),
             )
-            .unwrap_err();
-        assert!(matches!(
-            subgroup_error,
-            Error::UnsupportedFeature(ref feature) if feature == "subgroup control barrier"
-        ));
+            .unwrap();
+        assert!(subgroup_shader.dksh.starts_with(b"DKSH"));
+
+        let subgroup_ir = lowered_ir(
+            "@compute @workgroup_size(32) fn main() { subgroupBarrier(); }",
+            naga::ShaderStage::Compute,
+            "main",
+        );
+        assert!(subgroup_ir.contains("membar"), "{subgroup_ir}");
+        assert!(subgroup_ir.contains(".cta"), "{subgroup_ir}");
+        assert!(!subgroup_ir.contains("bar.sync"), "{subgroup_ir}");
     }
 
     #[test]
