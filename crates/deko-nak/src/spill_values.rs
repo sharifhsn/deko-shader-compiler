@@ -955,24 +955,39 @@ fn spill_values<S: Spill>(
     // Now that everthing is spilled, we handle phi sources and connect the
     // blocks by adding spills and fills as needed along edges.
     for p_idx in 0..blocks.len() {
-        let succ = blocks.succ_indices(p_idx);
-        if succ.len() != 1 {
-            // We don't have any critical edges
-            for s_idx in succ {
-                debug_assert!(blocks.pred_indices(*s_idx).len() == 1);
-            }
-            continue;
-        }
-        let s_idx = succ[0];
+        let successors = blocks.succ_indices(p_idx).to_vec();
+        let successor_predicates = if successors.len() <= 1 {
+            successors
+                .iter()
+                .map(|successor| (*successor, Pred::from(true)))
+                .collect::<FxHashMap<_, _>>()
+        } else {
+            assert_eq!(successors.len(), 2);
+            let branch = blocks[p_idx]
+                .instrs
+                .last()
+                .expect("multi-successor block has no branch");
+            let target = match branch.op {
+                Op::Brk(OpBrk { target }) => target,
+                _ => panic!("critical-edge spilling requires a predicated BRK"),
+            };
+            successors
+                .iter()
+                .map(|successor| {
+                    let predicate = if blocks[*successor].label == target {
+                        branch.pred
+                    } else {
+                        branch.pred.bnot()
+                    };
+                    (*successor, predicate)
+                })
+                .collect::<FxHashMap<_, _>>()
+        };
+        let p_out = &ssa_state_out[p_idx];
+        let mut spills = Vec::new();
+        let mut fills = FxHashMap::<SSAValue, (Pred, usize)>::default();
 
         let pb = &mut blocks[p_idx];
-        let p_out = &ssa_state_out[p_idx];
-        let s_in = &ssa_state_in[s_idx];
-        let phi_dst_map = &phi_dst_maps[s_idx];
-
-        let mut spills = Vec::new();
-        let mut fills = Vec::new();
-
         if let Some(op) = pb.phi_srcs_mut() {
             for (phi, src) in op.srcs.iter_mut() {
                 debug_assert!(src.is_unmodified());
@@ -991,26 +1006,51 @@ fn spill_values<S: Spill>(
                     *src = spill.get_spill(*ssa).into();
                 } else {
                     if !p_out.w.contains(ssa) {
-                        fills.push(*ssa);
+                        let successor = successors
+                            .iter()
+                            .find(|successor| {
+                                phi_dst_maps[**successor].get_dst_ssa(phi).is_some()
+                            })
+                            .copied()
+                            .expect("phi source has no successor destination");
+                        fills.insert(
+                            *ssa,
+                            (successor_predicates[&successor], successor),
+                        );
                     }
                 }
             }
         }
 
-        for ssa in s_in.s.iter() {
-            if !p_out.s.contains(ssa) {
-                assert!(p_out.w.contains(ssa) || spill.is_const(ssa));
-                spills.push(*ssa);
-            }
-        }
+        // Spills are safe to establish conservatively before a branch. Fills are predicated for
+        // their specific edge: an unconditional fill needed by only one successor could otherwise
+        // overwrite a coalesced register that remains live on the untaken path.
+        for s_idx in successors {
+            let s_in = &ssa_state_in[s_idx];
+            let phi_dst_map = &phi_dst_maps[s_idx];
 
-        for ssa in s_in.w.iter() {
-            if phi_dst_map.get_phi(ssa).is_some() {
-                continue;
+            for ssa in s_in.s.iter() {
+                if !p_out.s.contains(ssa) {
+                    assert!(p_out.w.contains(ssa) || spill.is_const(ssa));
+                    spills.push(*ssa);
+                }
             }
 
-            if !p_out.w.contains(ssa) {
-                fills.push(*ssa);
+            for ssa in s_in.w.iter() {
+                if phi_dst_map.get_phi(ssa).is_some() {
+                    continue;
+                }
+
+                if !p_out.w.contains(ssa) {
+                    fills
+                        .entry(*ssa)
+                        .and_modify(|(predicate, first_successor)| {
+                            if *first_successor != s_idx {
+                                *predicate = Pred::from(true);
+                            }
+                        })
+                        .or_insert((successor_predicates[&s_idx], s_idx));
+                }
             }
         }
 
@@ -1020,15 +1060,19 @@ fn spill_values<S: Spill>(
 
         // Sort to ensure stability of the algorithm
         spills.sort_by_key(|ssa| ssa.idx());
-        fills.sort_by_key(|ssa| ssa.idx());
+        spills.dedup();
+        let mut fills = fills.into_iter().collect::<Vec<_>>();
+        fills.sort_by_key(|(ssa, _)| ssa.idx());
 
         let mut instrs = Vec::new();
         for ssa in spills {
             instrs.push(spill.spill(ssa));
         }
-        for ssa in fills {
+        for (ssa, (predicate, _)) in fills {
             debug_assert!(pb.uniform || !ssa.is_uniform());
-            instrs.push(spill.fill(ssa));
+            let mut fill = spill.fill(ssa);
+            fill.pred = predicate;
+            instrs.push(fill);
         }
 
         // Insert spills and fills right after the phi (if any)

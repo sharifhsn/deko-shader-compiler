@@ -809,6 +809,72 @@ mod tests {
     }
 
     #[test]
+    fn structured_loops_mixed_aggregates_and_depth_queries_compile() {
+        let source = r"
+            struct Mixed {
+                enabled: bool,
+                color: vec3<f32>,
+            }
+
+            @group(0) @binding(0) var shadow: texture_depth_2d_array;
+            @group(0) @binding(1) var shadow_sampler: sampler_comparison;
+
+            fn find_index(limit: u32, wanted: u32) -> u32 {
+                var index = 0u;
+                loop {
+                    if index < limit {
+                    } else {
+                        break;
+                    }
+                    if index == wanted {
+                        return index;
+                    }
+                    continuing {
+                        index = index + 1u;
+                    }
+                }
+                return limit;
+            }
+
+            @fragment
+            fn main(
+                @builtin(front_facing) front: bool,
+                @location(0) uv: vec2<f32>,
+            ) -> @location(0) vec4<f32> {
+                var mixed: Mixed;
+                mixed.enabled = front;
+                mixed.color = vec3<f32>(0.25, 0.5, 0.75);
+                let dimensions = textureDimensions(shadow);
+                let index = find_index(4u, u32(dimensions.x) & 3u);
+                let candidates = array<vec2<f32>, 2>(uv, vec2<f32>(1.0) - uv);
+                let coordinate = candidates[index & 1u];
+                let visibility = textureSampleCompareLevel(
+                    shadow,
+                    shadow_sampler,
+                    coordinate,
+                    i32(index & 1u),
+                    0.5,
+                );
+                return vec4<f32>(mixed.color * visibility * f32(mixed.enabled), 1.0);
+            }
+        ";
+        let artifact = Compiler
+            .compile_wgsl(
+                source,
+                Stage::Fragment,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap();
+        assert_eq!(artifact.bindings.len(), 2);
+        let container = deko_dksh::parse(&artifact.dksh).unwrap();
+        assert_eq!(container.bindings, artifact.bindings);
+        assert!(container.program.num_gprs >= 4);
+        assert!(container.code[0x80..].iter().any(|byte| *byte != 0));
+    }
+
+    #[test]
     fn pipeline_overrides_are_resolved_and_multiview_fails_explicitly() {
         let source = "override scale: f32 = 1.0; @fragment fn main() -> @location(0) vec4<f32> { return vec4<f32>(scale, 0.0, 0.0, 1.0); }";
         let compile = |scale| {

@@ -341,6 +341,13 @@ impl SimpleLiveness {
 }
 
 impl SimpleLiveness {
+    pub fn live_in_values(&self, block: usize) -> impl Iterator<Item = SSAValue> + '_ {
+        self.ssa_block_ip
+            .keys()
+            .copied()
+            .filter(move |value| self.blocks[block].is_live_in(value))
+    }
+
     pub fn def_block_ip(&self, ssa: &SSAValue) -> (usize, usize) {
         *self.ssa_block_ip.get(ssa).unwrap()
     }

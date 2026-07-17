@@ -679,7 +679,7 @@ impl SM50Op for OpFMul {
             match &self.srcs[1].src_ref {
                 SrcRef::Zero | SrcRef::Reg(_) => {
                     e.set_opcode(0x5c68);
-                    e.set_reg_src(20..28, &self.srcs[1]);
+                    e.set_reg_src_ref(20..28, &self.srcs[1].src_ref);
                 }
                 SrcRef::Imm32(imm32) => {
                     e.set_opcode(0x3868);
@@ -1236,9 +1236,7 @@ impl SM50Op for OpIAdd2 {
             b.copy_alu_src_and_lower_ineg(src0, GPR, SrcType::I32);
         }
         b.copy_alu_src_if_not_reg(src0, GPR, SrcType::I32);
-        if !self.carry_out.is_none() {
-            b.copy_alu_src_if_ineg_imm(src1, GPR, SrcType::I32);
-        }
+        b.copy_alu_src_if_ineg_imm(src1, GPR, SrcType::I32);
     }
 
     fn encode(&self, e: &mut SM50Encoder<'_>) {
@@ -1546,6 +1544,17 @@ impl SM50Op for OpLop2 {
     fn legalize(&mut self, b: &mut LegalizeBuilder) {
         use RegFile::GPR;
         let [src0, src1] = &mut self.srcs;
+        for src in [&mut *src0, &mut *src1] {
+            match src.src_mod {
+                SrcMod::FAbs | SrcMod::FNeg | SrcMod::FNegAbs => {
+                    b.copy_alu_src_and_lower_fmod(src, GPR, SrcType::F32);
+                }
+                SrcMod::INeg => {
+                    b.copy_alu_src_and_lower_ineg(src, GPR, SrcType::I32);
+                }
+                SrcMod::None | SrcMod::BNot => {}
+            }
+        }
         match self.op {
             LogicOp2::PassB => {
                 *src0 = 0.into();

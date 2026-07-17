@@ -3,7 +3,7 @@
 
 use crate::api::{GetDebugFlags, DEBUG};
 use crate::ir::*;
-use crate::liveness::{BlockLiveness, LiveSet, Liveness, SimpleLiveness};
+use crate::liveness::{LiveSet, Liveness, SimpleLiveness};
 use crate::opt_instr_sched_common::{
     calc_statistics, estimate_variable_latency, side_effect_type, DepGraph,
     EdgeLabel, FutureReadyInstr, ReadyInstr, SideEffect,
@@ -804,8 +804,6 @@ impl Function {
         max_regs: PerRegFile<i32>,
     ) {
         let liveness = SimpleLiveness::for_function(self);
-        let mut live_out_sets: Vec<LiveSet> = Vec::new();
-
         #[cfg(debug_assertions)]
         let orig_instr_counts: Vec<usize> =
             self.blocks.iter().map(|b| b.instrs.len()).collect();
@@ -823,15 +821,7 @@ impl Function {
 
         for block_idx in 0..self.blocks.len() {
             let block_live = liveness.block_live(block_idx);
-            let mut live_set = match self.blocks.pred_indices(block_idx) {
-                [] => LiveSet::new(),
-                [pred, ..] => LiveSet::from_iter(
-                    live_out_sets[*pred]
-                        .iter()
-                        .filter(|ssa| block_live.is_live_in(ssa))
-                        .cloned(),
-                ),
-            };
+            let mut live_set = LiveSet::from_iter(liveness.live_in_values(block_idx));
 
             let block = &mut self.blocks[block_idx];
             let mut unit: ScheduleUnit = Default::default();
@@ -912,7 +902,6 @@ impl Function {
             unit.finish_block(&live_set);
             schedule_units.push(unit);
 
-            live_out_sets.push(live_set);
         }
 
         // Second pass: Generate a schedule for each schedule_unit

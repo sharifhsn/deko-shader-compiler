@@ -102,7 +102,7 @@ impl LowerCopySwap {
                             access: access,
                         });
                     }
-                    _ => panic!("Cannot copy to GPR"),
+                    _ => panic!("Cannot copy {} to GPR {}", copy.src, copy.dst),
                 },
                 SrcRef::SSA(_) => panic!("Should be run after RA"),
             },

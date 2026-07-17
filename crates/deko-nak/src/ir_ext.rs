@@ -29,6 +29,21 @@ impl Function {
             blocks: cfg.as_cfg(false),
         }
     }
+
+    /// Replace this function's control-flow graph while preserving its SSA and phi allocators.
+    ///
+    /// Blocks must be supplied in final physical fall-through order. Edges describe the same
+    /// graph for dominance, loop, and register-allocation analyses.
+    pub fn replace_blocks(&mut self, blocks: Vec<BasicBlock>, edges: &[(usize, usize)]) {
+        let mut cfg = CFGBuilder::<_, _, RandomState>::new();
+        for (index, block) in blocks.into_iter().enumerate() {
+            cfg.add_node(index, block);
+        }
+        for &(from, to) in edges {
+            cfg.add_edge(from, to);
+        }
+        self.blocks = cfg.as_cfg(false);
+    }
 }
 
 impl ShaderInfo {

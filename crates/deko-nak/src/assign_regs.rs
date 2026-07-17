@@ -594,7 +594,7 @@ impl<'a> VecRegAllocator<'a> {
 
             self.assign_pin_reg(ssa, new_reg);
         } else {
-            panic!("Unknown SSA value");
+            panic!("Unknown SSA value {ssa}");
         }
     }
 
