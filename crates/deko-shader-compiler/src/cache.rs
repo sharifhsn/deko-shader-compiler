@@ -14,7 +14,7 @@ pub const CACHE_KEY_VERSION: u32 = 1;
 ///
 /// This must be incremented whenever a backend change can alter or invalidate DKSH output without
 /// a package-version change.
-pub const BACKEND_ABI_VERSION: u32 = 4;
+pub const BACKEND_ABI_VERSION: u32 = 5;
 
 /// Deterministic identity of one fully specified shader compilation.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]

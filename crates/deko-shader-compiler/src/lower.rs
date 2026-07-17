@@ -83,6 +83,7 @@ struct FunctionLowerer<'function> {
     source: &'function naga::Function,
     target: Function,
     values: HashMap<naga::Handle<naga::Expression>, Value>,
+    locals: HashMap<naga::Handle<naga::LocalVariable>, Value>,
     arguments: Vec<Value>,
 }
 
@@ -97,6 +98,7 @@ impl<'function> FunctionLowerer<'function> {
             source,
             target: Function::single_block(Vec::new()),
             values: HashMap::new(),
+            locals: HashMap::new(),
             arguments,
         }
     }
@@ -138,6 +140,14 @@ impl<'function> FunctionLowerer<'function> {
                 .get(*index as usize)
                 .cloned()
                 .ok_or_else(|| Error::UnsupportedFeature(format!("argument {index}")))?,
+            naga::Expression::Load { pointer } => match self.source.expressions[*pointer] {
+                naga::Expression::LocalVariable(local) => self.local_value(local)?,
+                ref pointer => {
+                    return Err(Error::UnsupportedFeature(format!(
+                        "load pointer {pointer:?}"
+                    )));
+                }
+            },
             naga::Expression::Splat { size, value } => self.splat(*size, *value)?,
             naga::Expression::Swizzle {
                 size,
@@ -251,6 +261,19 @@ impl<'function> FunctionLowerer<'function> {
         }
     }
 
+    fn local_value(&mut self, handle: naga::Handle<naga::LocalVariable>) -> Result<Value, Error> {
+        if let Some(value) = self.locals.get(&handle) {
+            return Ok(value.clone());
+        }
+        let local = &self.source.local_variables[handle];
+        let value = match local.init {
+            Some(init) => self.expression(init)?,
+            None => zero_value(self.module, local.ty)?,
+        };
+        self.locals.insert(handle, value.clone());
+        Ok(value)
+    }
+
     fn binary(
         &mut self,
         op: naga::BinaryOperator,
@@ -318,15 +341,17 @@ impl<'function> FunctionLowerer<'function> {
     }
 
     fn return_value(&mut self) -> Result<Value, Error> {
-        let mut result = None;
         let body = self.source.body.clone();
-        for statement in &body {
+        self.execute_statements(&body)?
+            .ok_or_else(|| Error::UnsupportedFeature("missing return value".to_owned()))
+    }
+
+    fn execute_statements(&mut self, body: &naga::Block) -> Result<Option<Value>, Error> {
+        for statement in body {
             match statement {
                 naga::Statement::Return {
                     value: Some(handle),
-                } if result.is_none() => {
-                    result = Some(self.expression(*handle)?);
-                }
+                } => return Ok(Some(self.expression(*handle)?)),
                 naga::Statement::Call {
                     function,
                     arguments,
@@ -339,13 +364,29 @@ impl<'function> FunctionLowerer<'function> {
                     let value = self.inline_call(*function, arguments)?;
                     self.values.insert(*call_result, value);
                 }
+                naga::Statement::Store { pointer, value } => {
+                    let naga::Expression::LocalVariable(local) = self.source.expressions[*pointer]
+                    else {
+                        return Err(Error::UnsupportedFeature(format!(
+                            "store pointer {:?}",
+                            self.source.expressions[*pointer]
+                        )));
+                    };
+                    let value = self.expression(*value)?;
+                    self.locals.insert(local, value);
+                }
+                naga::Statement::Block(block) => {
+                    if let Some(value) = self.execute_statements(block)? {
+                        return Ok(Some(value));
+                    }
+                }
                 naga::Statement::Emit(_) | naga::Statement::Return { value: None } => {}
                 other => {
                     return Err(Error::UnsupportedFeature(format!("statement {other:?}")));
                 }
             }
         }
-        result.ok_or_else(|| Error::UnsupportedFeature("missing return value".to_owned()))
+        Ok(None)
     }
 
     fn inline_call(
@@ -359,6 +400,7 @@ impl<'function> FunctionLowerer<'function> {
             source: &self.module.functions[function],
             target,
             values: HashMap::new(),
+            locals: HashMap::new(),
             arguments,
         };
         let result = callee.return_value();

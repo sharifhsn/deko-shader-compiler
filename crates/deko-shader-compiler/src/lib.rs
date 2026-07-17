@@ -546,6 +546,29 @@ mod tests {
     }
 
     #[test]
+    fn mutable_function_locals_lower_to_ssa_values() {
+        let source = r"
+            @fragment
+            fn main(@location(0) color: vec4<f32>) -> @location(0) vec4<f32> {
+                var result = vec4<f32>();
+                result = color * 0.5;
+                { result = result + vec4<f32>(0.1, 0.0, 0.0, 0.0); }
+                return result;
+            }
+        ";
+        let artifact = Compiler
+            .compile_wgsl(
+                source,
+                Stage::Fragment,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap();
+        assert!(deko_dksh::parse(&artifact.dksh).is_ok());
+    }
+
+    #[test]
     fn pipeline_overrides_are_resolved_and_multiview_fails_explicitly() {
         let source = "override scale: f32 = 1.0; @fragment fn main() -> @location(0) vec4<f32> { return vec4<f32>(scale, 0.0, 0.0, 1.0); }";
         let compile = |scale| {
