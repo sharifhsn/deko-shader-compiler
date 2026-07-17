@@ -397,6 +397,46 @@ mod tests {
     }
 
     #[test]
+    fn compute_storage_buffers_lower_to_global_memory_and_binding_metadata() {
+        let source = r"
+            struct Data {
+                values: array<u32, 4>,
+            }
+
+            @group(2) @binding(3)
+            var<storage, read_write> data: Data;
+
+            @compute @workgroup_size(4)
+            fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+                let index = id.x % 4u;
+                let value = data.values[index];
+                data.values[index] = value + 1u;
+            }
+        ";
+        let artifact = Compiler
+            .compile_wgsl(
+                source,
+                Stage::Compute,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            artifact.bindings,
+            vec![deko_dksh::Binding {
+                group: 2,
+                binding: 3,
+                target: 0,
+                kind: deko_dksh::BindingKind::Storage,
+            }]
+        );
+        let container = deko_dksh::parse(&artifact.dksh).unwrap();
+        assert_eq!(container.bindings, artifact.bindings);
+        assert!(container.code.iter().any(|byte| *byte != 0));
+    }
+
+    #[test]
     fn constant_vertex_and_fragment_compile_to_graphics_dksh() {
         let vertex = Compiler
             .compile_wgsl(

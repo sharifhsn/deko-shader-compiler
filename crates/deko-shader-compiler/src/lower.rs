@@ -1,11 +1,12 @@
 use deko_nak::ir::{
     BasicBlock, CBuf, CBufRef, ChannelMask, Dst, FRndMode, FloatCmpOp, FloatType, Function,
     HasRegFile, Instr, IntCmpOp, IntCmpType, IntType, InterpFreq, InterpLoc, Label, LabelAllocator,
-    LdcMode, LogicOp2, MemEvictionPriority, MemType, MuFuOp, OpALd, OpASt, OpBrk, OpCont, OpExit,
-    OpF2I, OpFAdd, OpFMnMx, OpFMul, OpFSetP, OpI2F, OpIAdd2, OpIMad, OpIMnMx, OpIMul, OpISetP,
-    OpIpa, OpLdc, OpLop2, OpMov, OpMuFu, OpPBk, OpPCnt, OpPSetP, OpPhiDsts, OpPhiSrcs, OpRegOut,
-    OpSel, OpShl, OpShr, OpTex, OpTxq, Phi, Pred, PredRef, PredSetOp, RegFile, SSARef, SSAValue,
-    Shader, ShaderInfo, ShaderIoInfo, ShaderModelInfo, Src, SrcMod, SrcRef, SrcSwizzle,
+    LdcMode, LogicOp2, MemAccess, MemAddrType, MemEvictionPriority, MemOrder, MemScope, MemSpace,
+    MemType, MuFuOp, OffsetStride, OpALd, OpASt, OpBrk, OpCont, OpExit, OpF2I, OpFAdd, OpFMnMx,
+    OpFMul, OpFSetP, OpI2F, OpIAdd2, OpIAdd2X, OpIMad, OpIMnMx, OpIMul, OpISetP, OpIpa, OpLd,
+    OpLdc, OpLop2, OpMov, OpMuFu, OpPBk, OpPCnt, OpPSetP, OpPhiDsts, OpPhiSrcs, OpRegOut, OpS2R,
+    OpSel, OpShl, OpShr, OpSt, OpTex, OpTxq, Phi, Pred, PredRef, PredSetOp, RegFile, SSARef,
+    SSAValue, Shader, ShaderInfo, ShaderIoInfo, ShaderModelInfo, Src, SrcMod, SrcRef, SrcSwizzle,
     TexDerivMode, TexDim, TexLodMode, TexOffsetMode, TexQuery, TexRef,
 };
 use deko_nak::sph::PixelImap;
@@ -21,6 +22,8 @@ pub(crate) struct LoweredShader<'sm> {
 #[derive(Default)]
 struct ResourceMap {
     uniforms: HashMap<naga::Handle<naga::GlobalVariable>, u8>,
+    storages: HashMap<naga::Handle<naga::GlobalVariable>, u8>,
+    storage_descriptor_base: u16,
     textures: HashMap<naga::Handle<naga::GlobalVariable>, u16>,
     samplers: HashMap<naga::Handle<naga::GlobalVariable>, u16>,
     bindings: Vec<deko_dksh::Binding>,
@@ -42,7 +45,7 @@ pub(crate) fn lower_entry_point<'sm>(
     entry: &naga::EntryPoint,
     sm: &'sm ShaderModelInfo,
 ) -> Result<LoweredShader<'sm>, Error> {
-    let resources = resource_map(module)?;
+    let resources = resource_map(module, entry.stage)?;
     let shader = match entry.stage {
         naga::ShaderStage::Compute => lower_compute(module, entry, sm, &resources),
         naga::ShaderStage::Vertex => lower_vertex(module, entry, sm, &resources),
@@ -55,8 +58,24 @@ pub(crate) fn lower_entry_point<'sm>(
     })
 }
 
-fn resource_map(module: &naga::Module) -> Result<ResourceMap, Error> {
-    let mut resources = ResourceMap::default();
+#[allow(clippy::too_many_lines)]
+fn resource_map(module: &naga::Module, stage: naga::ShaderStage) -> Result<ResourceMap, Error> {
+    // Deko3D places 16-byte storage descriptors in its driver constant buffer. Graphics stages
+    // share GraphicsDriverCbuf and compute uses the smaller ComputeDriverCbuf layout.
+    let storage_descriptor_base = match stage {
+        naga::ShaderStage::Vertex => 0x0b0,
+        naga::ShaderStage::Fragment => 0x730,
+        naga::ShaderStage::Compute => 0x140,
+        stage => {
+            return Err(Error::UnsupportedFeature(format!(
+                "storage descriptor ABI for {stage:?} stage"
+            )));
+        }
+    };
+    let mut resources = ResourceMap {
+        storage_descriptor_base,
+        ..ResourceMap::default()
+    };
     let mut uniforms = module
         .global_variables
         .iter()
@@ -83,6 +102,34 @@ fn resource_map(module: &naga::Module) -> Result<ResourceMap, Error> {
             binding: binding.binding,
             target: u32::from(target),
             kind: deko_dksh::BindingKind::Uniform,
+        });
+    }
+    let mut storages = module
+        .global_variables
+        .iter()
+        .filter_map(|(handle, variable)| {
+            matches!(variable.space, naga::AddressSpace::Storage { .. })
+                .then_some((handle, variable.binding.as_ref()))
+        })
+        .collect::<Vec<_>>();
+    storages.sort_by_key(|(_, binding)| binding.map(|binding| (binding.group, binding.binding)));
+    for (target, (handle, binding)) in storages.into_iter().enumerate() {
+        let binding = binding.ok_or_else(|| {
+            Error::UnsupportedFeature("storage global without a resource binding".to_owned())
+        })?;
+        let target = u8::try_from(target)
+            .map_err(|_| Error::UnsupportedFeature("too many storage buffers".to_owned()))?;
+        if target >= 16 {
+            return Err(Error::UnsupportedFeature(
+                "more than 16 storage buffers".to_owned(),
+            ));
+        }
+        resources.storages.insert(handle, target);
+        resources.bindings.push(deko_dksh::Binding {
+            group: binding.group,
+            binding: binding.binding,
+            target: u32::from(target),
+            kind: deko_dksh::BindingKind::Storage,
         });
     }
     let mut textures = module
@@ -158,9 +205,9 @@ fn lower_compute<'sm>(
     sm: &'sm ShaderModelInfo,
     resources: &ResourceMap,
 ) -> Result<Shader<'sm>, Error> {
-    if !entry.function.arguments.is_empty() || entry.function.result.is_some() {
+    if entry.function.result.is_some() {
         return Err(Error::UnsupportedFeature(
-            "compute entry-point parameters or return values".to_owned(),
+            "compute entry-point return values".to_owned(),
         ));
     }
     if entry.workgroup_size_overrides.is_some() {
@@ -176,6 +223,7 @@ fn lower_compute<'sm>(
     let local_size = [dimension(x)?, dimension(y)?, dimension(z)?];
 
     let mut lowerer = FunctionLowerer::new(module, &entry.function, resources, Vec::new());
+    bind_compute_arguments(module, &mut lowerer, entry.workgroup_size)?;
     let body = entry.function.body.clone();
     if lowerer.execute_statements(&body)?.is_some() {
         return Err(Error::UnsupportedFeature(
@@ -189,6 +237,148 @@ fn lower_compute<'sm>(
     })
 }
 
+fn bind_compute_arguments(
+    module: &naga::Module,
+    lowerer: &mut FunctionLowerer<'_>,
+    workgroup_size: [u32; 3],
+) -> Result<(), Error> {
+    let arguments = lowerer.source.arguments.clone();
+    for argument in &arguments {
+        let fields = if let Some(binding) = &argument.binding {
+            vec![(binding.clone(), argument.ty)]
+        } else if let naga::TypeInner::Struct { ref members, .. } = module.types[argument.ty].inner
+        {
+            members
+                .iter()
+                .map(|member| {
+                    Ok((
+                        member.binding.clone().ok_or_else(|| {
+                            Error::UnsupportedFeature(
+                                "unbound compute input struct member".to_owned(),
+                            )
+                        })?,
+                        member.ty,
+                    ))
+                })
+                .collect::<Result<Vec<_>, Error>>()?
+        } else {
+            return Err(Error::UnsupportedFeature(
+                "unbound non-struct compute argument".to_owned(),
+            ));
+        };
+        let mut components = Vec::new();
+        for (binding, ty) in fields {
+            let naga::Binding::BuiltIn(builtin) = binding else {
+                return Err(Error::UnsupportedFeature(format!(
+                    "compute input binding {binding:?}"
+                )));
+            };
+            let value = bind_compute_builtin(module, lowerer, builtin, ty, workgroup_size)?;
+            components.extend(value.components);
+        }
+        lowerer.arguments.push(Value {
+            components,
+            kind: naga::ScalarKind::Uint,
+        });
+    }
+    Ok(())
+}
+
+fn read_compute_system_value(lowerer: &mut FunctionLowerer<'_>, indices: &[u8]) -> Vec<Src> {
+    indices
+        .iter()
+        .map(|index| {
+            let dst = lowerer.target.ssa_alloc.alloc(RegFile::GPR);
+            lowerer.emit(Instr::new(OpS2R {
+                dst: Dst::from(dst),
+                idx: *index,
+            }));
+            Src::from(dst)
+        })
+        .collect()
+}
+
+fn bind_compute_builtin(
+    module: &naga::Module,
+    lowerer: &mut FunctionLowerer<'_>,
+    builtin: naga::BuiltIn,
+    ty: naga::Handle<naga::Type>,
+    workgroup_size: [u32; 3],
+) -> Result<Value, Error> {
+    let (components, kind) = type_shape(module, ty)?;
+    if kind != naga::ScalarKind::Uint {
+        return Err(Error::UnsupportedFeature(format!(
+            "compute builtin {builtin:?} must be unsigned integer"
+        )));
+    }
+    let value = match builtin {
+        naga::BuiltIn::LocalInvocationId if components == 3 => {
+            read_compute_system_value(lowerer, &[32, 33, 34])
+        }
+        naga::BuiltIn::WorkGroupId if components == 3 => {
+            read_compute_system_value(lowerer, &[37, 38, 39])
+        }
+        naga::BuiltIn::NumWorkGroups if components == 3 => {
+            read_compute_system_value(lowerer, &[43, 44, 45])
+        }
+        naga::BuiltIn::WorkGroupSize if components == 3 => {
+            workgroup_size.into_iter().map(Src::from).collect()
+        }
+        naga::BuiltIn::GlobalInvocationId if components == 3 => {
+            let local = read_compute_system_value(lowerer, &[32, 33, 34]);
+            let group = read_compute_system_value(lowerer, &[37, 38, 39]);
+            let mut global = Vec::with_capacity(3);
+            for component in 0..3 {
+                let dst = lowerer.target.ssa_alloc.alloc(RegFile::GPR);
+                lowerer.emit(Instr::new(OpIMad {
+                    dst: Dst::from(dst),
+                    srcs: [
+                        group[component].clone(),
+                        Src::from(workgroup_size[component]),
+                        local[component].clone(),
+                    ],
+                    signed: false,
+                }));
+                global.push(Src::from(dst));
+            }
+            global
+        }
+        naga::BuiltIn::LocalInvocationIndex if components == 1 => {
+            let local = read_compute_system_value(lowerer, &[32, 33, 34]);
+            let xy = lowerer.target.ssa_alloc.alloc(RegFile::GPR);
+            lowerer.emit(Instr::new(OpIMad {
+                dst: Dst::from(xy),
+                srcs: [
+                    local[1].clone(),
+                    Src::from(workgroup_size[0]),
+                    local[0].clone(),
+                ],
+                signed: false,
+            }));
+            let index = lowerer.target.ssa_alloc.alloc(RegFile::GPR);
+            lowerer.emit(Instr::new(OpIMad {
+                dst: Dst::from(index),
+                srcs: [
+                    local[2].clone(),
+                    Src::from(workgroup_size[0].saturating_mul(workgroup_size[1])),
+                    Src::from(xy),
+                ],
+                signed: false,
+            }));
+            vec![Src::from(index)]
+        }
+        _ => {
+            return Err(Error::UnsupportedFeature(format!(
+                "compute input builtin {builtin:?} with {components} components"
+            )));
+        }
+    };
+    Ok(Value {
+        components: value,
+        kind,
+    })
+}
+
 #[derive(Clone)]
 struct Value {
     components: Vec<Src>,
@@ -198,6 +388,14 @@ struct Value {
 type UniformPointer = (
     naga::Handle<naga::GlobalVariable>,
     naga::Handle<naga::Type>,
+    u32,
+    Option<Src>,
+);
+
+type StoragePointer = (
+    naga::Handle<naga::GlobalVariable>,
+    naga::Handle<naga::Type>,
+    naga::StorageAccess,
     u32,
     Option<Src>,
 );
@@ -366,6 +564,8 @@ impl<'function> FunctionLowerer<'function> {
                     self.load_argument_pointer(*pointer)?
                 } else if self.pointer_is_local(*pointer) {
                     self.load_local_pointer(*pointer)?
+                } else if self.pointer_is_storage(*pointer) {
+                    self.load_storage(*pointer)?
                 } else {
                     self.load_uniform(*pointer)?
                 }
@@ -1863,6 +2063,282 @@ impl<'function> FunctionLowerer<'function> {
         Ok(Value { components, kind })
     }
 
+    #[allow(clippy::too_many_lines)]
+    fn storage_pointer(
+        &mut self,
+        handle: naga::Handle<naga::Expression>,
+    ) -> Result<StoragePointer, Error> {
+        match self.source.expressions[handle] {
+            naga::Expression::GlobalVariable(global) => {
+                let variable = &self.module.global_variables[global];
+                let naga::AddressSpace::Storage { access } = variable.space else {
+                    return Err(Error::UnsupportedFeature(format!(
+                        "storage pointer rooted in {:?} address space",
+                        variable.space
+                    )));
+                };
+                Ok((global, variable.ty, access, 0, None))
+            }
+            naga::Expression::Access { base, index } => {
+                let (global, ty, access, offset, dynamic_offset) = self.storage_pointer(base)?;
+                let (element, stride) = match self.module.types[ty].inner {
+                    naga::TypeInner::Array {
+                        base: element,
+                        stride,
+                        ..
+                    } => (element, stride),
+                    naga::TypeInner::Vector { scalar, .. } => (
+                        self.scalar_type_handle(scalar).ok_or_else(|| {
+                            Error::UnsupportedFeature(
+                                "dynamic storage vector scalar type is absent".to_owned(),
+                            )
+                        })?,
+                        u32::from(scalar.width),
+                    ),
+                    naga::TypeInner::Matrix { rows, scalar, .. } => {
+                        let row_bytes = u32::from(scalar.width)
+                            * u32::try_from(vector_size(rows))
+                                .expect("vectors have at most 4 rows");
+                        let alignment = if rows == naga::VectorSize::Bi { 8 } else { 16 };
+                        (
+                            self.vector_type_handle(rows, scalar).ok_or_else(|| {
+                                Error::UnsupportedFeature(
+                                    "dynamic storage matrix column type is absent".to_owned(),
+                                )
+                            })?,
+                            row_bytes.div_ceil(alignment) * alignment,
+                        )
+                    }
+                    ref inner => {
+                        return Err(Error::UnsupportedFeature(format!(
+                            "dynamic storage access into {inner:?}"
+                        )));
+                    }
+                };
+                let index = self.expression(index)?;
+                if index.components.len() != 1
+                    || !matches!(index.kind, naga::ScalarKind::Sint | naga::ScalarKind::Uint)
+                {
+                    return Err(Error::UnsupportedFeature(
+                        "storage array index must be an integer scalar".to_owned(),
+                    ));
+                }
+                let scaled = self.target.ssa_alloc.alloc(RegFile::GPR);
+                self.emit(Instr::new(OpIMad {
+                    dst: Dst::from(scaled),
+                    srcs: [
+                        index.components[0].clone(),
+                        Src::from(stride),
+                        dynamic_offset.unwrap_or(Src::ZERO),
+                    ],
+                    signed: false,
+                }));
+                Ok((global, element, access, offset, Some(Src::from(scaled))))
+            }
+            naga::Expression::AccessIndex { base, index } => {
+                let (global, ty, access, offset, dynamic_offset) = self.storage_pointer(base)?;
+                let (element, field_offset) = match self.module.types[ty].inner {
+                    naga::TypeInner::Struct { ref members, .. } => {
+                        let member = members.get(index as usize).ok_or_else(|| {
+                            Error::UnsupportedFeature(
+                                "storage member index out of bounds".to_owned(),
+                            )
+                        })?;
+                        (member.ty, member.offset)
+                    }
+                    naga::TypeInner::Array {
+                        base: element,
+                        stride,
+                        size,
+                    } => {
+                        if let naga::ArraySize::Constant(count) = size
+                            && index >= count.get()
+                        {
+                            return Err(Error::UnsupportedFeature(
+                                "storage array index out of bounds".to_owned(),
+                            ));
+                        }
+                        (
+                            element,
+                            index.checked_mul(stride).ok_or_else(|| {
+                                Error::UnsupportedFeature(
+                                    "storage array offset overflow".to_owned(),
+                                )
+                            })?,
+                        )
+                    }
+                    naga::TypeInner::Matrix {
+                        columns,
+                        rows,
+                        scalar,
+                    } => {
+                        if index as usize >= vector_size(columns) {
+                            return Err(Error::UnsupportedFeature(
+                                "storage matrix column index out of bounds".to_owned(),
+                            ));
+                        }
+                        let row_bytes = u32::from(scalar.width)
+                            * u32::try_from(vector_size(rows))
+                                .expect("vectors have at most 4 rows");
+                        let alignment = if rows == naga::VectorSize::Bi { 8 } else { 16 };
+                        let stride = row_bytes.div_ceil(alignment) * alignment;
+                        let element = self.vector_type_handle(rows, scalar).ok_or_else(|| {
+                            Error::UnsupportedFeature(
+                                "storage matrix column type is absent".to_owned(),
+                            )
+                        })?;
+                        (element, index * stride)
+                    }
+                    naga::TypeInner::Vector { size, scalar } => {
+                        if index as usize >= vector_size(size) {
+                            return Err(Error::UnsupportedFeature(
+                                "storage vector index out of bounds".to_owned(),
+                            ));
+                        }
+                        let element = self.scalar_type_handle(scalar).ok_or_else(|| {
+                            Error::UnsupportedFeature(
+                                "storage vector scalar type is absent".to_owned(),
+                            )
+                        })?;
+                        (element, index * u32::from(scalar.width))
+                    }
+                    ref inner => {
+                        return Err(Error::UnsupportedFeature(format!(
+                            "storage access into {inner:?}"
+                        )));
+                    }
+                };
+                let offset = offset.checked_add(field_offset).ok_or_else(|| {
+                    Error::UnsupportedFeature("storage offset overflow".to_owned())
+                })?;
+                Ok((global, element, access, offset, dynamic_offset))
+            }
+            ref pointer => Err(Error::UnsupportedFeature(format!(
+                "storage pointer {pointer:?}"
+            ))),
+        }
+    }
+
+    fn storage_address(
+        &mut self,
+        global: naga::Handle<naga::GlobalVariable>,
+        dynamic_offset: Option<Src>,
+    ) -> Result<SSARef, Error> {
+        let target = *self.resources.storages.get(&global).ok_or_else(|| {
+            Error::UnsupportedFeature("storage buffer has no allocated Deko slot".to_owned())
+        })?;
+        let descriptor = self
+            .resources
+            .storage_descriptor_base
+            .checked_add(u16::from(target) * 0x10)
+            .ok_or_else(|| Error::UnsupportedFeature("storage descriptor overflow".to_owned()))?;
+        let base = self.target.ssa_alloc.alloc_vec(RegFile::GPR, 2);
+        for (component, offset) in [descriptor, descriptor + 4].into_iter().enumerate() {
+            self.emit(Instr::new(OpLdc {
+                dst: Dst::from(base[component]),
+                cb: Src::from(CBufRef {
+                    buf: CBuf::Binding(0),
+                    offset,
+                }),
+                offset: Src::ZERO,
+                mode: LdcMode::Indexed,
+                mem_type: MemType::B32,
+            }));
+        }
+        let Some(dynamic_offset) = dynamic_offset else {
+            return Ok(base);
+        };
+        let address = self.target.ssa_alloc.alloc_vec(RegFile::GPR, 2);
+        let carry = self.target.ssa_alloc.alloc(RegFile::Carry);
+        self.emit(Instr::new(OpIAdd2 {
+            dst: Dst::from(address[0]),
+            carry_out: Dst::from(carry),
+            srcs: [Src::from(base[0]), dynamic_offset],
+        }));
+        self.emit(Instr::new(OpIAdd2X {
+            dst: Dst::from(address[1]),
+            carry_out: Dst::None,
+            srcs: [Src::from(base[1]), Src::ZERO],
+            carry_in: Src::from(carry),
+        }));
+        Ok(address)
+    }
+
+    fn storage_access(mem_type: MemType) -> MemAccess {
+        MemAccess {
+            mem_type,
+            space: MemSpace::Global(MemAddrType::A64),
+            order: MemOrder::Strong(MemScope::GPU),
+            eviction_priority: MemEvictionPriority::Normal,
+        }
+    }
+
+    fn load_storage(&mut self, pointer: naga::Handle<naga::Expression>) -> Result<Value, Error> {
+        let (global, ty, access, base_offset, dynamic_offset) = self.storage_pointer(pointer)?;
+        if !access.contains(naga::StorageAccess::LOAD) {
+            return Err(Error::UnsupportedFeature(
+                "load from write-only storage buffer".to_owned(),
+            ));
+        }
+        let address = self.storage_address(global, dynamic_offset)?;
+        let (offsets, kind) = uniform_component_offsets(self.module, ty, base_offset)?;
+        let mut components = Vec::with_capacity(offsets.len());
+        for offset in offsets {
+            let offset = i32::try_from(offset).map_err(|_| {
+                Error::UnsupportedFeature("storage load offset exceeds Maxwell range".to_owned())
+            })?;
+            let dst = self.target.ssa_alloc.alloc(RegFile::GPR);
+            self.emit(Instr::new(OpLd {
+                dst: Dst::from(dst),
+                addr: Src::from(address.clone()),
+                uniform_addr: Src::ZERO,
+                pred: Src::new_imm_bool(true),
+                offset,
+                stride: OffsetStride::X1,
+                access: Self::storage_access(MemType::B32),
+            }));
+            components.push(Src::from(dst));
+        }
+        Ok(self.decode_aggregate_value(components, kind))
+    }
+
+    fn store_storage(
+        &mut self,
+        pointer: naga::Handle<naga::Expression>,
+        value: &Value,
+    ) -> Result<(), Error> {
+        let (global, ty, access, base_offset, dynamic_offset) = self.storage_pointer(pointer)?;
+        if !access.contains(naga::StorageAccess::STORE) {
+            return Err(Error::UnsupportedFeature(
+                "store to read-only storage buffer".to_owned(),
+            ));
+        }
+        let (offsets, _) = uniform_component_offsets(self.module, ty, base_offset)?;
+        if value.components.len() != offsets.len() {
+            return Err(Error::UnsupportedFeature(format!(
+                "storage store shape mismatch: expected {}, got {}",
+                offsets.len(),
+                value.components.len()
+            )));
+        }
+        let data = self.materialize_loop_components(value)?;
+        let address = self.storage_address(global, dynamic_offset)?;
+        for (offset, data) in offsets.into_iter().zip(data) {
+            let offset = i32::try_from(offset).map_err(|_| {
+                Error::UnsupportedFeature("storage store offset exceeds Maxwell range".to_owned())
+            })?;
+            self.emit(Instr::new(OpSt {
+                addr: Src::from(address.clone()),
+                data: Src::from(data),
+                uniform_addr: Src::ZERO,
+                offset,
+                stride: OffsetStride::X1,
+                access: Self::storage_access(MemType::B32),
+            }));
+        }
+        Ok(())
+    }
+
     fn local_value(&mut self, handle: naga::Handle<naga::LocalVariable>) -> Result<Value, Error> {
         if let Some(value) = self.locals.get(&handle) {
             return Ok(value.clone());
@@ -1880,6 +2356,19 @@ impl<'function> FunctionLowerer<'function> {
         match self.source.expressions[handle] {
             naga::Expression::LocalVariable(_) => true,
             naga::Expression::AccessIndex { base, .. } => self.pointer_is_local(base),
+            _ => false,
+        }
+    }
+
+    fn pointer_is_storage(&self, handle: naga::Handle<naga::Expression>) -> bool {
+        match self.source.expressions[handle] {
+            naga::Expression::GlobalVariable(global) => matches!(
+                self.module.global_variables[global].space,
+                naga::AddressSpace::Storage { .. }
+            ),
+            naga::Expression::Access { base, .. } | naga::Expression::AccessIndex { base, .. } => {
+                self.pointer_is_storage(base)
+            }
             _ => false,
         }
     }
@@ -2951,6 +3440,11 @@ impl<'function> FunctionLowerer<'function> {
                     self.values.insert(*call_result, value);
                 }
                 naga::Statement::Store { pointer, value } => {
+                    if self.pointer_is_storage(*pointer) {
+                        let value = self.expression(*value)?;
+                        self.store_storage(*pointer, &value)?;
+                        continue;
+                    }
                     if !self.pointer_is_local(*pointer) {
                         return Err(Error::UnsupportedFeature(format!(
                             "store pointer {:?}",

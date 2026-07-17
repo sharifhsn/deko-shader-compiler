@@ -6,9 +6,10 @@ Switch's GM20B GPU.
 
 The project is under active development. Its first end-to-end slice compiles validated WGSL
 vertex, fragment, and compute entry points through a Rust extraction of Mesa NAK's SM50 backend
-and packages the resulting GM20B machine code as DKSH. The currently supported language surface
-is deliberately small; unsupported features return a typed error instead of silently changing
-shader semantics.
+and packages the resulting GM20B machine code as DKSH. Vertex and fragment shaders cover the
+captured Bevy UI, mesh, and PBR corpus. Compute shaders support the core invocation built-ins and
+read/write storage buffers with static or dynamically indexed host-shareable data. Unsupported
+features return a typed error instead of silently changing shader semantics.
 
 The finished compiler will not require Nintendo's proprietary SDK, Mesa at runtime, or
 the host-side UAM executable. Mesa's MIT-licensed NAK compiler is the machine-backend
