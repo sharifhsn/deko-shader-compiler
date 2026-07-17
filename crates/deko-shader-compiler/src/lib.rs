@@ -159,7 +159,7 @@ impl Compiler {
         deko_nak::validate_target(deko_nak::Target::GM20B)?;
 
         let sm = deko_nak::ir::ShaderModelInfo::new(53, 64);
-        let shader = lower::lower_entry_point(entry, &sm)?;
+        let shader = lower::lower_entry_point(request.module, entry, &sm)?;
         let binary = deko_nak::compile_ir(shader, None)?;
 
         let (program_type, entrypoint, payload, code) = match request.stage {
@@ -366,5 +366,89 @@ mod tests {
             0x1462
         );
         assert!(fragment.code[0x80..].iter().any(|byte| *byte != 0));
+    }
+
+    #[test]
+    fn location_inputs_flow_through_vertex_and_fragment_stages() {
+        let vertex = Compiler
+            .compile_wgsl(
+                "@vertex fn main(@location(0) position: vec3<f32>) -> @builtin(position) vec4<f32> { return vec4<f32>(position, 1.0); }",
+                naga::ShaderStage::Vertex,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap();
+        let vertex = deko_dksh::parse(&vertex.dksh).unwrap();
+        assert_eq!(vertex.program.program_type, deko_dksh::ProgramType::Vertex);
+        assert!(vertex.code[0x80..].iter().any(|byte| *byte != 0));
+
+        let fragment = Compiler
+            .compile_wgsl(
+                "@fragment fn main(@location(0) color: vec4<f32>) -> @location(0) vec4<f32> { return color; }",
+                naga::ShaderStage::Fragment,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap();
+        let fragment = deko_dksh::parse(&fragment.dksh).unwrap();
+        assert_eq!(
+            fragment.program.program_type,
+            deko_dksh::ProgramType::Fragment
+        );
+        assert!(fragment.code[0x80..].iter().any(|byte| *byte != 0));
+    }
+
+    #[test]
+    fn float_vector_arithmetic_lowers_to_maxwell_code() {
+        let artifact = Compiler
+            .compile_wgsl(
+                "@fragment fn main(@location(0) color: vec4<f32>) -> @location(0) vec4<f32> { return color * 0.5 + vec4<f32>(0.1, 0.2, 0.3, 0.0); }",
+                naga::ShaderStage::Fragment,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap();
+        let container = deko_dksh::parse(&artifact.dksh).unwrap();
+        assert_eq!(
+            container.program.program_type,
+            deko_dksh::ProgramType::Fragment
+        );
+        assert!(container.program.num_gprs >= 4);
+        assert!(container.code[0x80..].iter().any(|byte| *byte != 0));
+    }
+
+    #[test]
+    fn vertex_struct_outputs_position_and_varying() {
+        let source = r"
+            struct VertexOut {
+                @builtin(position) position: vec4<f32>,
+                @location(0) color: vec4<f32>,
+            }
+            @vertex
+            fn main(
+                @location(0) position: vec3<f32>,
+                @location(1) color: vec4<f32>,
+            ) -> VertexOut {
+                return VertexOut(vec4<f32>(position, 1.0), color);
+            }
+        ";
+        let artifact = Compiler
+            .compile_wgsl(
+                source,
+                naga::ShaderStage::Vertex,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap();
+        let container = deko_dksh::parse(&artifact.dksh).unwrap();
+        assert_eq!(
+            container.program.program_type,
+            deko_dksh::ProgramType::Vertex
+        );
+        assert!(container.code[0x80..].iter().any(|byte| *byte != 0));
     }
 }

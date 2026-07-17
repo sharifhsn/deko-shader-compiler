@@ -1,7 +1,9 @@
 use deko_nak::ir::{
-    Dst, Function, Instr, OpASt, OpExit, OpMov, OpRegOut, RegFile, SSARef, Shader, ShaderInfo,
-    ShaderIoInfo, ShaderModelInfo, Src,
+    Dst, FRndMode, Function, Instr, InterpFreq, InterpLoc, OpALd, OpASt, OpExit, OpFAdd, OpFMul,
+    OpIpa, OpMov, OpRegOut, RegFile, SSARef, Shader, ShaderInfo, ShaderIoInfo, ShaderModelInfo,
+    Src,
 };
+use deko_nak::sph::PixelImap;
 use std::collections::HashMap;
 
 use crate::Error;
@@ -18,13 +20,14 @@ pub(crate) fn entry_point<'module>(
 }
 
 pub(crate) fn lower_entry_point<'sm>(
+    module: &naga::Module,
     entry: &naga::EntryPoint,
     sm: &'sm ShaderModelInfo,
 ) -> Result<Shader<'sm>, Error> {
     match entry.stage {
         naga::ShaderStage::Compute => lower_compute(entry, sm),
-        naga::ShaderStage::Vertex => lower_vertex(entry, sm),
-        naga::ShaderStage::Fragment => lower_fragment(entry, sm),
+        naga::ShaderStage::Vertex => lower_vertex(module, entry, sm),
+        naga::ShaderStage::Fragment => lower_fragment(module, entry, sm),
         stage => Err(Error::UnsupportedFeature(format!("{stage:?} stage"))),
     }
 }
@@ -72,20 +75,23 @@ fn lower_compute<'sm>(
 #[derive(Clone)]
 struct Value {
     components: Vec<Src>,
+    kind: naga::ScalarKind,
 }
 
 struct FunctionLowerer<'function> {
     source: &'function naga::Function,
     target: Function,
     values: HashMap<naga::Handle<naga::Expression>, Value>,
+    arguments: Vec<Value>,
 }
 
 impl<'function> FunctionLowerer<'function> {
-    fn new(source: &'function naga::Function) -> Self {
+    fn new(source: &'function naga::Function, arguments: Vec<Value>) -> Self {
         Self {
             source,
             target: Function::single_block(Vec::new()),
             values: HashMap::new(),
+            arguments,
         }
     }
 
@@ -96,15 +102,36 @@ impl<'function> FunctionLowerer<'function> {
         let value = match &self.source.expressions[handle] {
             naga::Expression::Literal(literal) => Value {
                 components: vec![literal_source(*literal)?],
+                kind: literal_kind(*literal)?,
             },
             naga::Expression::Compose { components, .. } => {
                 let mut flattened = Vec::new();
+                let mut kind = None;
                 for component in components {
-                    flattened.extend(self.expression(*component)?.components);
+                    let value = self.expression(*component)?;
+                    if kind.is_some_and(|existing| existing != value.kind) {
+                        return Err(Error::UnsupportedFeature(
+                            "mixed scalar kinds in compose".to_owned(),
+                        ));
+                    }
+                    kind = Some(value.kind);
+                    flattened.extend(value.components);
                 }
                 Value {
                     components: flattened,
+                    kind: kind
+                        .ok_or_else(|| Error::UnsupportedFeature("empty compose".to_owned()))?,
                 }
+            }
+            naga::Expression::FunctionArgument(index) => self
+                .arguments
+                .get(*index as usize)
+                .cloned()
+                .ok_or_else(|| Error::UnsupportedFeature(format!("argument {index}")))?,
+            naga::Expression::Binary { op, left, right } => {
+                let left = self.expression(*left)?;
+                let right = self.expression(*right)?;
+                self.binary(*op, &left, &right)?
             }
             expression => {
                 return Err(Error::UnsupportedFeature(format!(
@@ -114,6 +141,72 @@ impl<'function> FunctionLowerer<'function> {
         };
         self.values.insert(handle, value.clone());
         Ok(value)
+    }
+
+    fn binary(
+        &mut self,
+        op: naga::BinaryOperator,
+        left: &Value,
+        right: &Value,
+    ) -> Result<Value, Error> {
+        if left.kind != right.kind || left.kind != naga::ScalarKind::Float {
+            return Err(Error::UnsupportedFeature(format!(
+                "{op:?} for {:?} and {:?}",
+                left.kind, right.kind
+            )));
+        }
+        let width = left.components.len().max(right.components.len());
+        if (left.components.len() != 1 && left.components.len() != width)
+            || (right.components.len() != 1 && right.components.len() != width)
+        {
+            return Err(Error::UnsupportedFeature(
+                "binary operands with incompatible widths".to_owned(),
+            ));
+        }
+        let mut components = Vec::with_capacity(width);
+        for index in 0..width {
+            let lhs = left.components[if left.components.len() == 1 { 0 } else { index }].clone();
+            let rhs = right.components[if right.components.len() == 1 {
+                0
+            } else {
+                index
+            }]
+            .clone();
+            let dst = self.target.ssa_alloc.alloc(RegFile::GPR);
+            let instruction = match op {
+                naga::BinaryOperator::Add => Instr::new(OpFAdd {
+                    dst: Dst::from(dst),
+                    srcs: [lhs, rhs],
+                    saturate: false,
+                    rnd_mode: FRndMode::NearestEven,
+                    ftz: false,
+                }),
+                naga::BinaryOperator::Subtract => Instr::new(OpFAdd {
+                    dst: Dst::from(dst),
+                    srcs: [lhs, rhs.fneg()],
+                    saturate: false,
+                    rnd_mode: FRndMode::NearestEven,
+                    ftz: false,
+                }),
+                naga::BinaryOperator::Multiply => Instr::new(OpFMul {
+                    dst: Dst::from(dst),
+                    srcs: [lhs, rhs],
+                    saturate: false,
+                    rnd_mode: FRndMode::NearestEven,
+                    ftz: false,
+                    dnz: false,
+                }),
+                _ => {
+                    return Err(Error::UnsupportedFeature(format!("binary operator {op:?}")));
+                }
+            };
+            self.target.blocks[0].instrs.push(instruction);
+            components.push(Src::from(dst));
+        }
+        Ok(Value {
+            components,
+            kind: left.kind,
+        })
     }
 
     fn return_value(&mut self) -> Result<Value, Error> {
@@ -168,51 +261,256 @@ fn literal_source(literal: naga::Literal) -> Result<Src, Error> {
     }
 }
 
+fn literal_kind(literal: naga::Literal) -> Result<naga::ScalarKind, Error> {
+    match literal {
+        naga::Literal::F32(_) => Ok(naga::ScalarKind::Float),
+        naga::Literal::U32(_) => Ok(naga::ScalarKind::Uint),
+        naga::Literal::I32(_) => Ok(naga::ScalarKind::Sint),
+        naga::Literal::Bool(_) => Ok(naga::ScalarKind::Bool),
+        other => Err(Error::UnsupportedFeature(format!("literal {other:?}"))),
+    }
+}
+
+fn type_shape(
+    module: &naga::Module,
+    ty: naga::Handle<naga::Type>,
+) -> Result<(u8, naga::ScalarKind), Error> {
+    match module.types[ty].inner {
+        naga::TypeInner::Scalar(scalar) => Ok((1, scalar.kind)),
+        naga::TypeInner::Vector { size, scalar } => {
+            let components = match size {
+                naga::VectorSize::Bi => 2,
+                naga::VectorSize::Tri => 3,
+                naga::VectorSize::Quad => 4,
+            };
+            Ok((components, scalar.kind))
+        }
+        ref inner => Err(Error::UnsupportedFeature(format!(
+            "entry-point IO type {inner:?}"
+        ))),
+    }
+}
+
+fn location_address(location: u32) -> Result<u16, Error> {
+    let address = 0x80_u32
+        .checked_add(location.checked_mul(16).ok_or_else(|| {
+            Error::UnsupportedFeature("shader location address overflow".to_owned())
+        })?)
+        .ok_or_else(|| Error::UnsupportedFeature("shader location address overflow".to_owned()))?;
+    u16::try_from(address)
+        .map_err(|_| Error::UnsupportedFeature("shader location exceeds Maxwell IO".to_owned()))
+}
+
+struct OutputField {
+    binding: naga::Binding,
+    range: std::ops::Range<usize>,
+}
+
+fn output_fields(
+    module: &naga::Module,
+    result: &naga::FunctionResult,
+) -> Result<Vec<OutputField>, Error> {
+    if let Some(binding) = &result.binding {
+        let (components, _) = type_shape(module, result.ty)?;
+        return Ok(vec![OutputField {
+            binding: binding.clone(),
+            range: 0..usize::from(components),
+        }]);
+    }
+    let naga::TypeInner::Struct { members, .. } = &module.types[result.ty].inner else {
+        return Err(Error::UnsupportedFeature(
+            "unbound non-struct entry-point result".to_owned(),
+        ));
+    };
+    let mut offset = 0;
+    let mut fields = Vec::with_capacity(members.len());
+    for member in members {
+        let binding = member.binding.clone().ok_or_else(|| {
+            Error::UnsupportedFeature("unbound entry-point result member".to_owned())
+        })?;
+        let (components, _) = type_shape(module, member.ty)?;
+        let end = offset + usize::from(components);
+        fields.push(OutputField {
+            binding,
+            range: offset..end,
+        });
+        offset = end;
+    }
+    Ok(fields)
+}
+
+fn bind_vertex_arguments(
+    module: &naga::Module,
+    lowerer: &mut FunctionLowerer<'_>,
+    info: &mut ShaderInfo,
+) -> Result<(), Error> {
+    for argument in &lowerer.source.arguments {
+        let Some(naga::Binding::Location { location, .. }) = argument.binding.as_ref() else {
+            return Err(Error::UnsupportedFeature(format!(
+                "vertex argument binding {:?}",
+                argument.binding
+            )));
+        };
+        let (components, kind) = type_shape(module, argument.ty)?;
+        if kind == naga::ScalarKind::Bool {
+            return Err(Error::UnsupportedFeature(
+                "boolean vertex attributes".to_owned(),
+            ));
+        }
+        let addr = location_address(*location)?;
+        let ssa = lowerer.target.ssa_alloc.alloc_vec(RegFile::GPR, components);
+        lowerer.target.blocks[0].instrs.push(Instr::new(OpALd {
+            dst: Dst::from(ssa.clone()),
+            vtx: Src::ZERO,
+            offset: Src::ZERO,
+            addr,
+            comps: components,
+            patch: false,
+            output: false,
+            phys: false,
+        }));
+        lowerer.arguments.push(Value {
+            components: ssa.iter().copied().map(Src::from).collect(),
+            kind,
+        });
+        let ShaderIoInfo::Vtg(io) = &mut info.io else {
+            unreachable!();
+        };
+        io.mark_attrs_read(addr..addr + u16::from(components) * 4);
+    }
+    Ok(())
+}
+
+fn bind_fragment_arguments(
+    module: &naga::Module,
+    lowerer: &mut FunctionLowerer<'_>,
+    info: &mut ShaderInfo,
+) -> Result<(), Error> {
+    for argument in &lowerer.source.arguments {
+        let Some(naga::Binding::Location {
+            location,
+            interpolation,
+            sampling,
+            ..
+        }) = argument.binding.as_ref()
+        else {
+            return Err(Error::UnsupportedFeature(format!(
+                "fragment argument binding {:?}",
+                argument.binding
+            )));
+        };
+        let (components, kind) = type_shape(module, argument.ty)?;
+        if kind != naga::ScalarKind::Float {
+            return Err(Error::UnsupportedFeature(
+                "non-float fragment varyings".to_owned(),
+            ));
+        }
+        let (imap, freq) = match interpolation.unwrap_or(naga::Interpolation::Perspective) {
+            naga::Interpolation::Perspective => (PixelImap::Perspective, InterpFreq::Pass),
+            naga::Interpolation::Linear => (PixelImap::ScreenLinear, InterpFreq::Pass),
+            naga::Interpolation::Flat => (PixelImap::Constant, InterpFreq::Constant),
+            naga::Interpolation::PerVertex => {
+                return Err(Error::UnsupportedFeature(
+                    "per-vertex fragment interpolation".to_owned(),
+                ));
+            }
+        };
+        let loc = match sampling.unwrap_or(naga::Sampling::Center) {
+            naga::Sampling::Center => InterpLoc::Default,
+            naga::Sampling::Centroid => InterpLoc::Centroid,
+            sampling => {
+                return Err(Error::UnsupportedFeature(format!(
+                    "fragment sampling {sampling:?}"
+                )));
+            }
+        };
+        let base = location_address(*location)?;
+        let mut value = Vec::with_capacity(usize::from(components));
+        for component in 0..components {
+            let addr = base + u16::from(component) * 4;
+            let ssa = lowerer.target.ssa_alloc.alloc(RegFile::GPR);
+            lowerer.target.blocks[0].instrs.push(Instr::new(OpIpa {
+                dst: Dst::from(ssa),
+                addr,
+                freq,
+                loc,
+                inv_w: Src::ZERO,
+                offset: Src::ZERO,
+            }));
+            value.push(Src::from(ssa));
+            let ShaderIoInfo::Fragment(io) = &mut info.io else {
+                unreachable!();
+            };
+            io.mark_attr_read(addr, imap);
+        }
+        lowerer.arguments.push(Value {
+            components: value,
+            kind,
+        });
+    }
+    Ok(())
+}
+
 fn lower_vertex<'sm>(
+    module: &naga::Module,
     entry: &naga::EntryPoint,
     sm: &'sm ShaderModelInfo,
 ) -> Result<Shader<'sm>, Error> {
-    if !entry.function.arguments.is_empty() {
-        return Err(Error::UnsupportedFeature(
-            "vertex entry-point arguments".to_owned(),
-        ));
-    }
     let result = entry.function.result.as_ref().ok_or_else(|| {
         Error::UnsupportedFeature("vertex entry point without a result".to_owned())
     })?;
-    if !matches!(
-        result.binding,
-        Some(naga::Binding::BuiltIn(naga::BuiltIn::Position { .. }))
-    ) {
-        return Err(Error::UnsupportedFeature(
-            "vertex result other than @builtin(position)".to_owned(),
-        ));
-    }
-
-    let mut lowerer = FunctionLowerer::new(&entry.function);
-    let value = lowerer.return_value()?;
-    if value.components.len() != 4 {
-        return Err(Error::UnsupportedFeature(
-            "vertex position must contain four components".to_owned(),
-        ));
-    }
-    let ssa = lowerer.materialize(value)?;
-    lowerer.target.blocks[0].instrs.push(Instr::new(OpASt {
-        vtx: Src::ZERO,
-        offset: Src::ZERO,
-        data: Src::from(ssa),
-        addr: 0x70,
-        comps: 4,
-        patch: false,
-        phys: false,
-    }));
-
     let mut info = ShaderInfo::vertex();
-    let ShaderIoInfo::Vtg(io) = &mut info.io else {
-        unreachable!();
-    };
-    io.mark_attrs_written(0x70..0x80);
-    io.mark_store_req(0x70..0x80);
+    let mut lowerer = FunctionLowerer::new(&entry.function, Vec::new());
+    bind_vertex_arguments(module, &mut lowerer, &mut info)?;
+    let value = lowerer.return_value()?;
+    let mut wrote_position = false;
+    for field in output_fields(module, result)? {
+        if field.range.end > value.components.len() {
+            return Err(Error::UnsupportedFeature(
+                "vertex result shape mismatch".to_owned(),
+            ));
+        }
+        let components = field.range.len();
+        let addr = match field.binding {
+            naga::Binding::BuiltIn(naga::BuiltIn::Position { .. }) if components == 4 => {
+                wrote_position = true;
+                0x70
+            }
+            naga::Binding::Location { location, .. } if components <= 4 => {
+                location_address(location)?
+            }
+            binding => {
+                return Err(Error::UnsupportedFeature(format!(
+                    "vertex result binding {binding:?}"
+                )));
+            }
+        };
+        let field_value = Value {
+            components: value.components[field.range].to_vec(),
+            kind: value.kind,
+        };
+        let ssa = lowerer.materialize(field_value)?;
+        lowerer.target.blocks[0].instrs.push(Instr::new(OpASt {
+            vtx: Src::ZERO,
+            offset: Src::ZERO,
+            data: Src::from(ssa),
+            addr,
+            comps: u8::try_from(components).expect("vertex field has at most four components"),
+            patch: false,
+            phys: false,
+        }));
+        let end = addr + u16::try_from(components * 4).expect("vertex field is small");
+        let ShaderIoInfo::Vtg(io) = &mut info.io else {
+            unreachable!();
+        };
+        io.mark_attrs_written(addr..end);
+        io.mark_store_req(addr..end);
+    }
+    if !wrote_position {
+        return Err(Error::UnsupportedFeature(
+            "vertex result does not write @builtin(position)".to_owned(),
+        ));
+    }
     Ok(Shader {
         sm,
         info,
@@ -221,43 +519,48 @@ fn lower_vertex<'sm>(
 }
 
 fn lower_fragment<'sm>(
+    module: &naga::Module,
     entry: &naga::EntryPoint,
     sm: &'sm ShaderModelInfo,
 ) -> Result<Shader<'sm>, Error> {
-    if !entry.function.arguments.is_empty() {
-        return Err(Error::UnsupportedFeature(
-            "fragment entry-point arguments".to_owned(),
-        ));
-    }
     let result = entry.function.result.as_ref().ok_or_else(|| {
         Error::UnsupportedFeature("fragment entry point without a result".to_owned())
     })?;
-    if !matches!(
-        result.binding,
-        Some(naga::Binding::Location { location: 0, .. })
-    ) {
-        return Err(Error::UnsupportedFeature(
-            "fragment result other than @location(0)".to_owned(),
-        ));
-    }
-
-    let mut lowerer = FunctionLowerer::new(&entry.function);
-    let value = lowerer.return_value()?;
-    if value.components.len() != 4 {
-        return Err(Error::UnsupportedFeature(
-            "fragment color must contain four components".to_owned(),
-        ));
-    }
-    let ssa = lowerer.materialize(value)?;
-    lowerer.target.blocks[0].instrs.push(Instr::new(OpRegOut {
-        srcs: ssa.iter().copied().map(Src::from).collect(),
-    }));
-
     let mut info = ShaderInfo::fragment(entry.early_depth_test.is_some(), false, false);
+    let mut lowerer = FunctionLowerer::new(&entry.function, Vec::new());
+    bind_fragment_arguments(module, &mut lowerer, &mut info)?;
+    let value = lowerer.return_value()?;
+    let mut outputs = Vec::new();
+    let mut writes_color = 0_u32;
+    for field in output_fields(module, result)? {
+        let naga::Binding::Location { location, .. } = field.binding else {
+            return Err(Error::UnsupportedFeature(format!(
+                "fragment result binding {:?}",
+                field.binding
+            )));
+        };
+        if location >= 8 || field.range.len() > 4 || field.range.end > value.components.len() {
+            return Err(Error::UnsupportedFeature(
+                "fragment color output shape".to_owned(),
+            ));
+        }
+        let field_value = Value {
+            components: value.components[field.range].to_vec(),
+            kind: value.kind,
+        };
+        let ssa = lowerer.materialize(field_value)?;
+        let mut target = ssa.iter().copied().map(Src::from).collect::<Vec<_>>();
+        writes_color |= ((1_u32 << target.len()) - 1) << (location * 4);
+        target.resize(4, Src::ZERO);
+        outputs.extend(target);
+    }
+    lowerer.target.blocks[0]
+        .instrs
+        .push(Instr::new(OpRegOut { srcs: outputs }));
     let ShaderIoInfo::Fragment(io) = &mut info.io else {
         unreachable!();
     };
-    io.writes_color = 0xf;
+    io.writes_color = writes_color;
     Ok(Shader {
         sm,
         info,
