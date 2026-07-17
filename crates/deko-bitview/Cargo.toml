@@ -1,0 +1,25 @@
+[package]
+name = "deko-bitview"
+description = "Bit-range views used by the NAK-derived Deko shader compiler"
+keywords = ["bits", "compiler", "shader"]
+categories = ["data-structures", "encoding"]
+readme = "../../README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[lib]
+doctest = false
+
+[lints.rust]
+unsafe_code = "allow"
+missing_docs = "allow"
+
+[lints.clippy]
+all = "allow"
+pedantic = "allow"
+

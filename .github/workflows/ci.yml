@@ -19,6 +19,7 @@ jobs:
       - run: cargo test --workspace
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo package -p deko-dksh
+      - run: cargo package -p deko-bitview
       - run: cargo package -p deko-nak
       - run: cargo package -p deko-compiler-utils
       - run: cargo package -p deko-shader-compiler-macros

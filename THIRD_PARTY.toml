@@ -10,6 +10,7 @@ source_root = "src/nouveau/compiler/nak"
 notice = "Every imported file must retain its original copyright and SPDX header."
 
 files = [
+    { upstream = "src/nouveau/rust/bitview/lib.rs", local = "crates/deko-bitview/src/upstream.rs", modified = false },
     { upstream = "src/compiler/rust/as_slice.rs", local = "crates/deko-compiler-utils/src/as_slice.rs", modified = false },
     { upstream = "src/compiler/rust/bitset.rs", local = "crates/deko-compiler-utils/src/bitset.rs", modified = false },
     { upstream = "src/compiler/rust/cfg.rs", local = "crates/deko-compiler-utils/src/cfg.rs", modified = false },

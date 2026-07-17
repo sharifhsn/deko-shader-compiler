@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/deko-bitview",
     "crates/deko-compiler-utils",
     "crates/deko-dksh",
     "crates/deko-nak",
@@ -18,6 +19,7 @@ homepage = "https://github.com/sharifhsn/deko-shader-compiler"
 authors = ["Sharif Shamsi"]
 
 [workspace.dependencies]
+deko-bitview = { version = "0.1.0", path = "crates/deko-bitview" }
 deko-compiler-utils = { version = "0.1.0", path = "crates/deko-compiler-utils" }
 deko-dksh = { version = "0.1.0", path = "crates/deko-dksh" }
 deko-nak = { version = "0.1.0", path = "crates/deko-nak" }
