@@ -524,6 +524,37 @@ mod tests {
     }
 
     #[test]
+    fn matrix_vector_multiply_lowers_vertex_transforms() {
+        let source = r"
+            @vertex
+            fn main(@location(0) position: vec3<f32>) -> @builtin(position) vec4<f32> {
+                let transform = mat4x4<f32>(
+                    vec4<f32>(2.0, 0.0, 0.0, 0.0),
+                    vec4<f32>(0.0, 3.0, 0.0, 0.0),
+                    vec4<f32>(0.0, 0.0, 4.0, 0.0),
+                    vec4<f32>(1.0, 2.0, 3.0, 1.0),
+                );
+                return transform * vec4<f32>(position, 1.0);
+            }
+        ";
+        let artifact = Compiler
+            .compile_wgsl(
+                source,
+                Stage::Vertex,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap();
+        let container = deko_dksh::parse(&artifact.dksh).unwrap();
+        assert_eq!(
+            container.program.program_type,
+            deko_dksh::ProgramType::Vertex
+        );
+        assert!(container.code[0x80..].iter().any(|byte| *byte != 0));
+    }
+
+    #[test]
     fn splat_swizzle_zero_and_negate_lower_componentwise() {
         let artifact = Compiler
             .compile_wgsl(

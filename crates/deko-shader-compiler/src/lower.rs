@@ -161,9 +161,10 @@ impl<'function> FunctionLowerer<'function> {
             }
             naga::Expression::Unary { op, expr } => self.unary(*op, *expr)?,
             naga::Expression::Binary { op, left, right } => {
+                let left_matrix = self.expression_matrix_shape(*left);
                 let left = self.expression(*left)?;
                 let right = self.expression(*right)?;
-                self.binary(*op, &left, &right)?
+                self.binary(*op, &left, &right, left_matrix)?
             }
             expression => {
                 return Err(Error::UnsupportedFeature(format!(
@@ -257,6 +258,23 @@ impl<'function> FunctionLowerer<'function> {
         }
     }
 
+    fn expression_matrix_shape(
+        &self,
+        handle: naga::Handle<naga::Expression>,
+    ) -> Option<(usize, usize)> {
+        let ty = match self.source.expressions[handle] {
+            naga::Expression::Compose { ty, .. } | naga::Expression::ZeroValue(ty) => ty,
+            naga::Expression::FunctionArgument(index) => {
+                self.source.arguments.get(index as usize)?.ty
+            }
+            _ => return None,
+        };
+        let naga::TypeInner::Matrix { columns, rows, .. } = self.module.types[ty].inner else {
+            return None;
+        };
+        Some((vector_size(columns), vector_size(rows)))
+    }
+
     fn local_value(&mut self, handle: naga::Handle<naga::LocalVariable>) -> Result<Value, Error> {
         if let Some(value) = self.locals.get(&handle) {
             return Ok(value.clone());
@@ -275,12 +293,18 @@ impl<'function> FunctionLowerer<'function> {
         op: naga::BinaryOperator,
         left: &Value,
         right: &Value,
+        left_matrix: Option<(usize, usize)>,
     ) -> Result<Value, Error> {
         if left.kind != right.kind || left.kind != naga::ScalarKind::Float {
             return Err(Error::UnsupportedFeature(format!(
                 "{op:?} for {:?} and {:?}",
                 left.kind, right.kind
             )));
+        }
+        if op == naga::BinaryOperator::Multiply {
+            if let Some((columns, rows)) = left_matrix {
+                return self.multiply_matrix_vector(left, right, columns, rows);
+            }
         }
         let width = left.components.len().max(right.components.len());
         if (left.components.len() != 1 && left.components.len() != width)
@@ -333,6 +357,61 @@ impl<'function> FunctionLowerer<'function> {
         Ok(Value {
             components,
             kind: left.kind,
+        })
+    }
+
+    fn multiply_matrix_vector(
+        &mut self,
+        matrix: &Value,
+        vector: &Value,
+        columns: usize,
+        rows: usize,
+    ) -> Result<Value, Error> {
+        if matrix.kind != naga::ScalarKind::Float
+            || vector.kind != naga::ScalarKind::Float
+            || matrix.components.len() != columns * rows
+            || vector.components.len() != columns
+        {
+            return Err(Error::UnsupportedFeature(
+                "matrix-vector multiply shape".to_owned(),
+            ));
+        }
+        let mut result = Vec::with_capacity(rows);
+        for row in 0..rows {
+            let mut accumulator = None;
+            for column in 0..columns {
+                let product = self.target.ssa_alloc.alloc(RegFile::GPR);
+                self.target.blocks[0].instrs.push(Instr::new(OpFMul {
+                    dst: Dst::from(product),
+                    srcs: [
+                        matrix.components[column * rows + row].clone(),
+                        vector.components[column].clone(),
+                    ],
+                    saturate: false,
+                    rnd_mode: FRndMode::NearestEven,
+                    ftz: false,
+                    dnz: false,
+                }));
+                accumulator = Some(match accumulator {
+                    None => Src::from(product),
+                    Some(previous) => {
+                        let sum = self.target.ssa_alloc.alloc(RegFile::GPR);
+                        self.target.blocks[0].instrs.push(Instr::new(OpFAdd {
+                            dst: Dst::from(sum),
+                            srcs: [previous, Src::from(product)],
+                            saturate: false,
+                            rnd_mode: FRndMode::NearestEven,
+                            ftz: false,
+                        }));
+                        Src::from(sum)
+                    }
+                });
+            }
+            result.push(accumulator.expect("validated matrices have at least two columns"));
+        }
+        Ok(Value {
+            components: result,
+            kind: naga::ScalarKind::Float,
         })
     }
 
