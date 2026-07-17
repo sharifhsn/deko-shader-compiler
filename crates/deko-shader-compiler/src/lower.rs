@@ -25,7 +25,7 @@ pub(crate) fn lower_entry_point<'sm>(
     sm: &'sm ShaderModelInfo,
 ) -> Result<Shader<'sm>, Error> {
     match entry.stage {
-        naga::ShaderStage::Compute => lower_compute(entry, sm),
+        naga::ShaderStage::Compute => lower_compute(module, entry, sm),
         naga::ShaderStage::Vertex => lower_vertex(module, entry, sm),
         naga::ShaderStage::Fragment => lower_fragment(module, entry, sm),
         stage => Err(Error::UnsupportedFeature(format!("{stage:?} stage"))),
@@ -33,6 +33,7 @@ pub(crate) fn lower_entry_point<'sm>(
 }
 
 fn lower_compute<'sm>(
+    module: &naga::Module,
     entry: &naga::EntryPoint,
     sm: &'sm ShaderModelInfo,
 ) -> Result<Shader<'sm>, Error> {
@@ -46,18 +47,6 @@ fn lower_compute<'sm>(
             "overridden compute workgroup sizes".to_owned(),
         ));
     }
-    for statement in &entry.function.body {
-        match statement {
-            naga::Statement::Return { value: None } => {}
-            naga::Statement::Emit(range) if range.clone().next().is_none() => {}
-            other => {
-                return Err(Error::UnsupportedFeature(format!(
-                    "compute statement {other:?}"
-                )));
-            }
-        }
-    }
-
     let [x, y, z] = entry.workgroup_size;
     let dimension = |value| {
         u16::try_from(value)
@@ -65,10 +54,17 @@ fn lower_compute<'sm>(
     };
     let local_size = [dimension(x)?, dimension(y)?, dimension(z)?];
 
+    let mut lowerer = FunctionLowerer::new(module, &entry.function, Vec::new());
+    let body = entry.function.body.clone();
+    if lowerer.execute_statements(&body)?.is_some() {
+        return Err(Error::UnsupportedFeature(
+            "compute entry point returned a value".to_owned(),
+        ));
+    }
     Ok(Shader {
         sm,
         info: ShaderInfo::compute(local_size, 0),
-        functions: vec![Function::single_block(vec![Instr::new(OpExit {})])],
+        functions: vec![lowerer.finish()],
     })
 }
 

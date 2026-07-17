@@ -372,6 +372,31 @@ mod tests {
     }
 
     #[test]
+    fn compute_entry_points_lower_local_arithmetic() {
+        let artifact = Compiler
+            .compile_wgsl(
+                "@compute @workgroup_size(4) fn main() { var value = vec4<f32>(1.0); value = value * 0.5 + vec4<f32>(0.25); }",
+                Stage::Compute,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap();
+        let container = deko_dksh::parse(&artifact.dksh).unwrap();
+        assert_eq!(
+            container.program.payload,
+            deko_dksh::StagePayload::Compute {
+                block_dimensions: [4, 1, 1],
+                shared_memory_size: 0,
+                local_positive_memory_size: 0,
+                local_negative_memory_size: 0,
+                crs_size: 0x800,
+                num_barriers: 0,
+            }
+        );
+    }
+
+    #[test]
     fn constant_vertex_and_fragment_compile_to_graphics_dksh() {
         let vertex = Compiler
             .compile_wgsl(
