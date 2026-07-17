@@ -189,10 +189,13 @@ impl<'function> FunctionLowerer<'function> {
                 .get(*index as usize)
                 .cloned()
                 .ok_or_else(|| Error::UnsupportedFeature(format!("argument {index}")))?,
-            naga::Expression::Load { pointer } => match self.source.expressions[*pointer] {
-                naga::Expression::LocalVariable(local) => self.local_value(local)?,
-                _ => self.load_uniform(*pointer)?,
-            },
+            naga::Expression::Load { pointer } => {
+                if self.pointer_is_local(*pointer) {
+                    self.load_local_pointer(*pointer)?
+                } else {
+                    self.load_uniform(*pointer)?
+                }
+            }
             naga::Expression::Splat { size, value } => self.splat(*size, *value)?,
             naga::Expression::Swizzle {
                 size,
@@ -416,6 +419,76 @@ impl<'function> FunctionLowerer<'function> {
         Ok(value)
     }
 
+    fn pointer_is_local(&self, handle: naga::Handle<naga::Expression>) -> bool {
+        match self.source.expressions[handle] {
+            naga::Expression::LocalVariable(_) => true,
+            naga::Expression::AccessIndex { base, .. } => self.pointer_is_local(base),
+            _ => false,
+        }
+    }
+
+    fn local_pointer(
+        &self,
+        handle: naga::Handle<naga::Expression>,
+    ) -> Result<
+        (
+            naga::Handle<naga::LocalVariable>,
+            naga::Handle<naga::Type>,
+            usize,
+        ),
+        Error,
+    > {
+        match self.source.expressions[handle] {
+            naga::Expression::LocalVariable(local) => {
+                Ok((local, self.source.local_variables[local].ty, 0))
+            }
+            naga::Expression::AccessIndex { base, index } => {
+                let (local, ty, component_offset) = self.local_pointer(base)?;
+                let naga::TypeInner::Struct { ref members, .. } = self.module.types[ty].inner
+                else {
+                    return Err(Error::UnsupportedFeature(
+                        "local access into a non-struct value".to_owned(),
+                    ));
+                };
+                let member = members.get(index as usize).ok_or_else(|| {
+                    Error::UnsupportedFeature("local member index out of bounds".to_owned())
+                })?;
+                let mut preceding = 0_usize;
+                for previous in &members[..index as usize] {
+                    preceding = preceding
+                        .checked_add(flat_type_components(self.module, previous.ty)?)
+                        .ok_or_else(|| {
+                            Error::UnsupportedFeature("local component offset overflow".to_owned())
+                        })?;
+                }
+                Ok((local, member.ty, component_offset + preceding))
+            }
+            ref pointer => Err(Error::UnsupportedFeature(format!(
+                "local pointer {pointer:?}"
+            ))),
+        }
+    }
+
+    fn load_local_pointer(
+        &mut self,
+        pointer: naga::Handle<naga::Expression>,
+    ) -> Result<Value, Error> {
+        let (local, ty, offset) = self.local_pointer(pointer)?;
+        let count = flat_type_components(self.module, ty)?;
+        let value = self.local_value(local)?;
+        let end = offset.checked_add(count).ok_or_else(|| {
+            Error::UnsupportedFeature("local component range overflow".to_owned())
+        })?;
+        Ok(Value {
+            components: value
+                .components
+                .get(offset..end)
+                .ok_or_else(|| Error::UnsupportedFeature("local value shape mismatch".to_owned()))?
+                .to_vec(),
+            kind: flat_type_kind(self.module, ty)?,
+        })
+    }
+
     fn binary(
         &mut self,
         op: naga::BinaryOperator,
@@ -568,15 +641,24 @@ impl<'function> FunctionLowerer<'function> {
                     self.values.insert(*call_result, value);
                 }
                 naga::Statement::Store { pointer, value } => {
-                    let naga::Expression::LocalVariable(local) = self.source.expressions[*pointer]
-                    else {
+                    if !self.pointer_is_local(*pointer) {
                         return Err(Error::UnsupportedFeature(format!(
                             "store pointer {:?}",
                             self.source.expressions[*pointer]
                         )));
-                    };
+                    }
+                    let (local, ty, offset) = self.local_pointer(*pointer)?;
                     let value = self.expression(*value)?;
-                    self.locals.insert(local, value);
+                    let expected = flat_type_components(self.module, ty)?;
+                    if value.components.len() != expected {
+                        return Err(Error::UnsupportedFeature(
+                            "local store shape mismatch".to_owned(),
+                        ));
+                    }
+                    let mut local_value = self.local_value(local)?;
+                    let end = offset + expected;
+                    local_value.components[offset..end].clone_from_slice(&value.components);
+                    self.locals.insert(local, local_value);
                 }
                 naga::Statement::Block(block) => {
                     if let Some(value) = self.execute_statements(block)? {
@@ -665,7 +747,8 @@ fn vector_size(size: naga::VectorSize) -> usize {
 }
 
 fn zero_value(module: &naga::Module, ty: naga::Handle<naga::Type>) -> Result<Value, Error> {
-    let (components, kind) = type_shape(module, ty)?;
+    let components = flat_type_components(module, ty)?;
+    let kind = flat_type_kind(module, ty)?;
     let source = match kind {
         naga::ScalarKind::Float => Src::from(0.0_f32),
         naga::ScalarKind::Sint | naga::ScalarKind::Uint => Src::ZERO,
@@ -677,9 +760,72 @@ fn zero_value(module: &naga::Module, ty: naga::Handle<naga::Type>) -> Result<Val
         }
     };
     Ok(Value {
-        components: vec![source; usize::from(components)],
+        components: vec![source; components],
         kind,
     })
+}
+
+fn flat_type_components(
+    module: &naga::Module,
+    ty: naga::Handle<naga::Type>,
+) -> Result<usize, Error> {
+    match module.types[ty].inner {
+        naga::TypeInner::Scalar(_) => Ok(1),
+        naga::TypeInner::Vector { size, .. } => Ok(vector_size(size)),
+        naga::TypeInner::Matrix { columns, rows, .. } => {
+            Ok(vector_size(columns) * vector_size(rows))
+        }
+        naga::TypeInner::Array { base, size, .. } => {
+            let naga::ArraySize::Constant(size) = size else {
+                return Err(Error::UnsupportedFeature(
+                    "runtime-sized local array".to_owned(),
+                ));
+            };
+            flat_type_components(module, base)?
+                .checked_mul(size.get() as usize)
+                .ok_or_else(|| Error::UnsupportedFeature("local array size overflow".to_owned()))
+        }
+        naga::TypeInner::Struct { ref members, .. } => members
+            .iter()
+            .map(|member| flat_type_components(module, member.ty))
+            .try_fold(0_usize, |sum, count| {
+                sum.checked_add(count?).ok_or_else(|| {
+                    Error::UnsupportedFeature("local struct size overflow".to_owned())
+                })
+            }),
+        ref inner => Err(Error::UnsupportedFeature(format!(
+            "local value type {inner:?}"
+        ))),
+    }
+}
+
+fn flat_type_kind(
+    module: &naga::Module,
+    ty: naga::Handle<naga::Type>,
+) -> Result<naga::ScalarKind, Error> {
+    match module.types[ty].inner {
+        naga::TypeInner::Scalar(scalar)
+        | naga::TypeInner::Vector { scalar, .. }
+        | naga::TypeInner::Matrix { scalar, .. } => Ok(scalar.kind),
+        naga::TypeInner::Array { base, .. } => flat_type_kind(module, base),
+        naga::TypeInner::Struct { ref members, .. } => {
+            let mut kinds = members
+                .iter()
+                .map(|member| flat_type_kind(module, member.ty));
+            let first = kinds
+                .next()
+                .ok_or_else(|| Error::UnsupportedFeature("empty local struct".to_owned()))??;
+            for kind in kinds {
+                if kind? != first {
+                    return Ok(naga::ScalarKind::Float);
+                }
+            }
+            Ok(first)
+        }
+        ref inner => Err(Error::UnsupportedFeature(format!(
+            "local scalar kind for type {inner:?}"
+        ))),
+    }
 }
 
 fn global_value(
