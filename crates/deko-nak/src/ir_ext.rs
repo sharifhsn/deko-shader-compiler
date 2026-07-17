@@ -7,14 +7,14 @@ use crate::ir::{
 };
 use crate::sph::PixelImap;
 use compiler::cfg::CFGBuilder;
-use std::hash::RandomState;
+use rustc_hash::FxBuildHasher;
 
 impl Function {
     /// Construct a one-block function with fresh SSA and phi allocators.
     #[must_use]
     pub fn single_block(instrs: Vec<Instr>) -> Self {
         let mut labels = LabelAllocator::new();
-        let mut cfg = CFGBuilder::<_, _, RandomState>::new();
+        let mut cfg = CFGBuilder::<_, _, FxBuildHasher>::new();
         cfg.add_node(
             0,
             BasicBlock {
@@ -35,7 +35,7 @@ impl Function {
     /// Blocks must be supplied in final physical fall-through order. Edges describe the same
     /// graph for dominance, loop, and register-allocation analyses.
     pub fn replace_blocks(&mut self, blocks: Vec<BasicBlock>, edges: &[(usize, usize)]) {
-        let mut cfg = CFGBuilder::<_, _, RandomState>::new();
+        let mut cfg = CFGBuilder::<_, _, FxBuildHasher>::new();
         for (index, block) in blocks.into_iter().enumerate() {
             cfg.add_node(index, block);
         }

@@ -12,7 +12,7 @@ use deko_nak::ir::{
     SrcSwizzle, TexDerivMode, TexDim, TexLodMode, TexOffsetMode, TexQuery, TexRef,
 };
 use deko_nak::sph::PixelImap;
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::Error;
 
@@ -191,7 +191,7 @@ fn resource_map(
         })
         .collect::<Vec<_>>();
     textures.sort_by_key(|(_, binding)| binding.map(|binding| (binding.group, binding.binding)));
-    let mut texture_targets = HashMap::<(u32, u32), ResourceRange>::new();
+    let mut texture_targets = HashMap::<(u32, u32), ResourceRange>::default();
     let mut next_image_target = 0_u16;
     for (handle, binding) in textures {
         let count = sampled_image_count(module, handle, options).expect("filtered above");
@@ -226,7 +226,7 @@ fn resource_map(
         })
         .collect::<Vec<_>>();
     samplers.sort_by_key(|(_, binding)| binding.map(|binding| (binding.group, binding.binding)));
-    let mut sampler_targets = HashMap::<(u32, u32), ResourceRange>::new();
+    let mut sampler_targets = HashMap::<(u32, u32), ResourceRange>::default();
     let mut next_sampler_target = 0_u16;
     for (handle, binding) in samplers {
         let count = sampler_binding_count(module, handle, options).expect("filtered above");
@@ -251,7 +251,7 @@ fn resource_map(
             });
         }
     }
-    let mut storage_texture_targets = HashMap::new();
+    let mut storage_texture_targets = HashMap::default();
     for (handle, variable) in module.global_variables.iter() {
         if !used_globals.contains(&handle)
             || !matches!(
@@ -433,7 +433,7 @@ fn reachable_functions(
         }
     }
 
-    let mut reachable = HashSet::new();
+    let mut reachable = HashSet::default();
     visit(module, &entry.body, &mut reachable);
     reachable
 }
@@ -443,7 +443,7 @@ fn used_globals(
     entry: &naga::Function,
     reachable_functions: &HashSet<naga::Handle<naga::Function>>,
 ) -> HashSet<naga::Handle<naga::GlobalVariable>> {
-    let mut globals = HashSet::new();
+    let mut globals = HashSet::default();
     let mut collect = |function: &naga::Function| {
         globals.extend(function.expressions.iter().filter_map(|(_, expression)| {
             if let naga::Expression::GlobalVariable(global) = expression {
@@ -739,10 +739,10 @@ impl<'function> FunctionLowerer<'function> {
             labels,
             loops: Vec::new(),
             loop_base_depth: 0,
-            values: HashMap::new(),
-            locals: HashMap::new(),
+            values: HashMap::default(),
+            locals: HashMap::default(),
             arguments,
-            resource_arguments: HashMap::new(),
+            resource_arguments: HashMap::default(),
             early_returns: Vec::new(),
         }
     }
@@ -5882,8 +5882,8 @@ impl<'function> FunctionLowerer<'function> {
         let exit_label = self.allocate_label();
         let preheader = self.current_block;
 
-        let mut written_locals = HashSet::new();
-        let mut carried_locals = HashSet::new();
+        let mut written_locals = HashSet::default();
+        let mut carried_locals = HashSet::default();
         self.collect_loop_carried_locals(body, &mut written_locals, &mut carried_locals);
         self.collect_loop_carried_locals(continuing, &mut written_locals, &mut carried_locals);
         let mut local_handles = carried_locals.into_iter().collect::<Vec<_>>();
@@ -6700,8 +6700,8 @@ impl<'function> FunctionLowerer<'function> {
             labels: std::mem::replace(&mut self.labels, LabelAllocator::new()),
             loops: std::mem::take(&mut self.loops),
             loop_base_depth,
-            values: HashMap::new(),
-            locals: HashMap::new(),
+            values: HashMap::default(),
+            locals: HashMap::default(),
             arguments,
             resource_arguments,
             early_returns: Vec::new(),
@@ -6741,8 +6741,8 @@ impl<'function> FunctionLowerer<'function> {
             labels: std::mem::replace(&mut self.labels, LabelAllocator::new()),
             loops: std::mem::take(&mut self.loops),
             loop_base_depth,
-            values: HashMap::new(),
-            locals: HashMap::new(),
+            values: HashMap::default(),
+            locals: HashMap::default(),
             arguments,
             resource_arguments,
             early_returns: Vec::new(),

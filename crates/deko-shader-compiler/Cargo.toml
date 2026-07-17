@@ -16,6 +16,7 @@ authors.workspace = true
 deko-dksh.workspace = true
 deko-nak.workspace = true
 naga.workspace = true
+rustc-hash.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 
