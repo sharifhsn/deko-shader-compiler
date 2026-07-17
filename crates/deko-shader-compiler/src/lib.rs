@@ -658,6 +658,81 @@ mod tests {
     }
 
     #[test]
+    fn sampled_ui_fragment_control_flow_and_math_compile() {
+        let source = r"
+            @group(1) @binding(0) var image: texture_2d<f32>;
+            @group(1) @binding(1) var image_sampler: sampler;
+
+            fn enabled(flags: u32, mask: u32) -> bool {
+                return (flags & mask) != 0u;
+            }
+
+            fn border_active(point: vec2<f32>, flags: u32) -> bool {
+                var selected: bool;
+                if (flags & 6u) == 6u { return true; }
+                let distance = min(abs(point.x), abs(point.y));
+                if enabled(flags, 2u) {
+                    selected = distance == abs(point.x);
+                } else {
+                    selected = false;
+                }
+                return selected;
+            }
+
+            @fragment
+            fn main(
+                @location(0) uv: vec2<f32>,
+                @location(1) @interpolate(flat) flags: u32,
+                @location(2) color: vec4<f32>,
+            ) -> @location(0) vec4<f32> {
+                let texel = textureSample(image, image_sampler, uv);
+                let q = abs(uv) - vec2<f32>(0.5);
+                let distance = length(max(q, vec2<f32>(0.0))) / 2.0;
+                let alpha = saturate(1.0 - step(0.0, distance));
+                let selected = border_active(q, flags);
+                if enabled(flags, 1u) {
+                    return select(color, color * texel, selected);
+                } else {
+                    return vec4<f32>(color.xyz, clamp(color.w * alpha, 0.0, 1.0));
+                }
+            }
+        ";
+        let artifact = Compiler
+            .compile_wgsl(
+                source,
+                Stage::Fragment,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            artifact.bindings,
+            vec![
+                deko_dksh::Binding {
+                    group: 1,
+                    binding: 0,
+                    target: 0,
+                    kind: deko_dksh::BindingKind::Texture,
+                },
+                deko_dksh::Binding {
+                    group: 1,
+                    binding: 1,
+                    target: 0,
+                    kind: deko_dksh::BindingKind::Sampler,
+                },
+            ]
+        );
+        let container = deko_dksh::parse(&artifact.dksh).unwrap();
+        assert_eq!(container.bindings, artifact.bindings);
+        assert_eq!(
+            container.program.program_type,
+            deko_dksh::ProgramType::Fragment
+        );
+        assert!(container.code[0x80..].iter().any(|byte| *byte != 0));
+    }
+
+    #[test]
     fn pipeline_overrides_are_resolved_and_multiview_fails_explicitly() {
         let source = "override scale: f32 = 1.0; @fragment fn main() -> @location(0) vec4<f32> { return vec4<f32>(scale, 0.0, 0.0, 1.0); }";
         let compile = |scale| {
