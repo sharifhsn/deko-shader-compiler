@@ -5,7 +5,7 @@ name = "Mesa NAK"
 repository = "https://gitlab.freedesktop.org/mesa/mesa.git"
 revision = "99bf1b953cba11d41dbee519ae1b53387477df9e"
 license = "MIT"
-status = "extraction-pending"
+status = "extraction-in-progress"
 source_root = "src/nouveau/compiler/nak"
 notice = "Every imported file must retain its original copyright and SPDX header."
 
@@ -18,4 +18,8 @@ files = [
     { upstream = "src/compiler/rust/enum_as_u8.rs", local = "crates/deko-compiler-utils/src/enum_as_u8.rs", modified = false },
     { upstream = "src/compiler/rust/smallvec.rs", local = "crates/deko-compiler-utils/src/smallvec.rs", modified = false },
     { upstream = "src/compiler/rust/vec_pair.rs", local = "crates/deko-compiler-utils/src/vec_pair.rs", modified = false },
+    { upstream = "src/compiler/rust/proc/as_slice.rs", local = "crates/deko-shader-compiler-macros/src/compiler_proc/as_slice.rs", modified = false },
+    { upstream = "src/compiler/rust/proc/enum_as_u8.rs", local = "crates/deko-shader-compiler-macros/src/compiler_proc/enum_as_u8.rs", modified = false },
+    { upstream = "src/compiler/rust/proc/from_variants.rs", local = "crates/deko-shader-compiler-macros/src/compiler_proc/from_variants.rs", modified = false },
+    { upstream = "src/nouveau/compiler/nak/ir_proc.rs", local = "crates/deko-shader-compiler-macros/src/lib.rs", modified = true },
 ]
