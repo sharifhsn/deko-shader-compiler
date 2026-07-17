@@ -139,6 +139,50 @@ pub enum Error {
 pub struct Compiler;
 
 impl Compiler {
+    /// Resolve wgpu-style automatic entry-point selection for WGSL.
+    ///
+    /// The requested name wins when present. Otherwise, a module with exactly one entry point for
+    /// the requested stage selects that entry point, matching wgpu's omitted-entry behavior.
+    ///
+    /// # Errors
+    ///
+    /// Returns a parse error or [`Error::MissingEntryPoint`] when selection is ambiguous or absent.
+    pub fn resolve_wgsl_entry_point(
+        self,
+        source: &str,
+        stage: Stage,
+        requested: &str,
+    ) -> Result<String, Error> {
+        let module = naga::front::wgsl::parse_str(source)
+            .map_err(|error| Error::Parse(error.emit_to_string(source)))?;
+        let stage = naga::ShaderStage::from(stage);
+        if module
+            .entry_points
+            .iter()
+            .any(|entry| entry.stage == stage && entry.name == requested)
+        {
+            return Ok(requested.to_owned());
+        }
+        let mut candidates = module
+            .entry_points
+            .iter()
+            .filter(|entry| entry.stage == stage)
+            .map(|entry| entry.name.as_str());
+        let Some(candidate) = candidates.next() else {
+            return Err(Error::MissingEntryPoint {
+                stage,
+                entry_point: requested.to_owned(),
+            });
+        };
+        if candidates.next().is_some() {
+            return Err(Error::MissingEntryPoint {
+                stage,
+                entry_point: requested.to_owned(),
+            });
+        }
+        Ok(candidate.to_owned())
+    }
+
     /// Parse and validate WGSL, then compile one selected pipeline entry point.
     ///
     /// # Errors
@@ -337,6 +381,25 @@ mod tests {
         assert_eq!(container.program.per_warp_scratch_size, 0x800);
         assert!(artifact.bindings.is_empty());
         assert!(container.code.iter().any(|byte| *byte != 0));
+    }
+
+    #[test]
+    fn sole_stage_entry_point_can_be_selected_automatically() {
+        let source = "@vertex fn vertex_main() -> @builtin(position) vec4<f32> { return vec4<f32>(0.0, 0.0, 0.0, 1.0); }";
+        assert_eq!(
+            Compiler
+                .resolve_wgsl_entry_point(source, Stage::Vertex, "main")
+                .unwrap(),
+            "vertex_main"
+        );
+        let ambiguous = concat!(
+            "@compute @workgroup_size(1) fn first() {}",
+            "@compute @workgroup_size(1) fn second() {}",
+        );
+        assert!(matches!(
+            Compiler.resolve_wgsl_entry_point(ambiguous, Stage::Compute, "main"),
+            Err(Error::MissingEntryPoint { .. })
+        ));
     }
 
     #[test]
