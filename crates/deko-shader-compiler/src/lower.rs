@@ -4,10 +4,10 @@ use deko_nak::ir::{
     IntCmpType, IntType, InterpFreq, InterpLoc, Label, LabelAllocator, LdcMode, LogicOp2,
     MemAccess, MemAddrType, MemEvictionPriority, MemOrder, MemScope, MemSpace, MemType, MuFuOp,
     OffsetStride, OpALd, OpASt, OpAtom, OpBar, OpBfe, OpBrk, OpCont, OpExit, OpF2I, OpFAdd,
-    OpFMnMx, OpFMul, OpFSetP, OpI2F, OpIAdd2, OpIAdd2X, OpIMad, OpIMnMx, OpIMul, OpISetP, OpIpa,
-    OpKill, OpLd, OpLdc, OpLop2, OpMemBar, OpMov, OpMuFu, OpPBk, OpPCnt, OpPSetP, OpPhiDsts,
+    OpFMnMx, OpFMul, OpFSetP, OpFlo, OpI2F, OpIAdd2, OpIAdd2X, OpIMad, OpIMnMx, OpIMul, OpISetP,
+    OpIpa, OpKill, OpLd, OpLdc, OpLop2, OpMemBar, OpMov, OpMuFu, OpPBk, OpPCnt, OpPSetP, OpPhiDsts,
     OpPhiSrcs, OpRegOut, OpS2R, OpSel, OpShfl, OpShl, OpShr, OpSt, OpSuLd, OpSuSt, OpTex, OpTld,
-    OpTxq, Phi, Pred, PredRef, PredSetOp, RegFile, SSARef, SSAValue, Shader, ShaderInfo,
+    OpTld4, OpTxq, Phi, Pred, PredRef, PredSetOp, RegFile, SSARef, SSAValue, Shader, ShaderInfo,
     ShaderIoInfo, ShaderModelInfo, ShaderStageInfo, ShflOp, Src, SrcMod, SrcRef, SrcSwizzle,
     TexDerivMode, TexDim, TexLodMode, TexOffsetMode, TexQuery, TexRef,
 };
@@ -935,23 +935,23 @@ impl<'function> FunctionLowerer<'function> {
                 global_value(self.module, self.module.constants[*constant].init)?
             }
             naga::Expression::ZeroValue(ty) => zero_value(self.module, *ty)?,
-            naga::Expression::Compose { components, .. } => {
+            naga::Expression::Compose { ty, components } => {
                 let mut flattened = Vec::new();
-                let mut kind = None;
+                let kind = flat_type_kind(self.module, *ty)?;
                 for component in components {
-                    let value = self.expression(*component)?;
-                    if kind.is_some_and(|existing| existing != value.kind) {
-                        return Err(Error::UnsupportedFeature(
-                            "mixed scalar kinds in compose".to_owned(),
-                        ));
+                    let mut value = self.expression(*component)?;
+                    if value.kind == naga::ScalarKind::Bool && kind != naga::ScalarKind::Bool {
+                        value.components = self
+                            .materialize_loop_components(&value)?
+                            .into_iter()
+                            .map(Src::from)
+                            .collect();
                     }
-                    kind = Some(value.kind);
                     flattened.extend(value.components);
                 }
                 Value {
                     components: flattened,
-                    kind: kind
-                        .ok_or_else(|| Error::UnsupportedFeature("empty compose".to_owned()))?,
+                    kind,
                 }
             }
             naga::Expression::FunctionArgument(index) => self
@@ -1170,11 +1170,18 @@ impl<'function> FunctionLowerer<'function> {
             .resources
             .textures
             .get(&image)
+            .map(|range| range.target)
+            .or_else(|| self.resources.storage_textures.get(&image).copied())
             .ok_or_else(|| {
                 Error::UnsupportedFeature("queried texture has no Deko target".to_owned())
-            })?
-            .target;
-        let (dimension, _, _) = module_image_type(self.module, image)?;
+            })?;
+        let (image_type, _) = binding_resource_type(self.module, image)?;
+        let naga::TypeInner::Image { dim: dimension, .. } = self.module.types[image_type].inner
+        else {
+            return Err(Error::UnsupportedFeature(
+                "queried resource is not an image".to_owned(),
+            ));
+        };
         let (level, components) = match query {
             naga::ImageQuery::Size { level } => {
                 let level = match level {
@@ -1640,10 +1647,10 @@ impl<'function> FunctionLowerer<'function> {
         depth_ref: Option<naga::Handle<naga::Expression>>,
         clamp_to_edge: bool,
     ) -> Result<Value, Error> {
-        if gather.is_some()
-            || offset.is_some()
+        if (offset.is_some() && gather.is_none())
             || clamp_to_edge
             || matches!(level, naga::SampleLevel::Gradient { .. })
+            || (gather.is_some() && !matches!(level, naga::SampleLevel::Zero))
         {
             return Err(Error::UnsupportedFeature(format!(
                 "texture sample options gather={gather:?} array={} offset={} level={level:?} depth={} clamp={clamp_to_edge}",
@@ -1705,11 +1712,6 @@ impl<'function> FunctionLowerer<'function> {
                 ));
             }
         };
-        if kind != naga::ScalarKind::Float {
-            return Err(Error::UnsupportedFeature(format!(
-                "sampled texture scalar kind {kind:?}"
-            )));
-        }
         let mut coordinate = self.expression(coordinate)?;
         let expected = match dim {
             TexDim::_1D | TexDim::Array1D => 1,
@@ -1721,6 +1723,7 @@ impl<'function> FunctionLowerer<'function> {
                 "texture coordinate shape mismatch".to_owned(),
             ));
         }
+        let mut auxiliary = bindless_handle.into_iter().collect::<Vec<_>>();
         if let Some(array_index) = array_index {
             let array_index = self.expression(array_index)?;
             if array_index.components.len() != 1
@@ -1733,16 +1736,60 @@ impl<'function> FunctionLowerer<'function> {
                     "texture array index must be an integer scalar".to_owned(),
                 ));
             }
-            coordinate.components.extend(array_index.components);
+            coordinate
+                .components
+                .insert(0, array_index.components[0].clone());
         }
-        if let Some(depth_ref) = depth_ref {
+        let depth_reference = if let Some(depth_ref) = depth_ref {
             let depth_ref = self.expression(depth_ref)?;
             if depth_ref.kind != naga::ScalarKind::Float || depth_ref.components.len() != 1 {
                 return Err(Error::UnsupportedFeature(
                     "texture depth reference must be a float scalar".to_owned(),
                 ));
             }
-            coordinate.components.extend(depth_ref.components);
+            Some(depth_ref.components[0].clone())
+        } else {
+            None
+        };
+        if let Some(component) = gather {
+            let component = match component {
+                naga::SwizzleComponent::X => 0,
+                naga::SwizzleComponent::Y => 1,
+                naga::SwizzleComponent::Z => 2,
+                naga::SwizzleComponent::W => 3,
+            };
+            if let Some(offset) = offset {
+                auxiliary.push(self.pack_texture_offset(offset)?);
+            }
+            auxiliary.extend(depth_reference.iter().cloned());
+            let coordinate = self.materialize(coordinate)?;
+            let auxiliary = if auxiliary.is_empty() {
+                Src::ZERO
+            } else {
+                Src::from(self.materialize(Value {
+                    components: auxiliary,
+                    kind: naga::ScalarKind::Uint,
+                })?)
+            };
+            let destination = self.target.ssa_alloc.alloc_vec(RegFile::GPR, 4);
+            self.emit(Instr::new(OpTld4 {
+                dsts: [Dst::from(destination.clone()), Dst::None],
+                fault: Dst::None,
+                tex: texture_reference,
+                srcs: [Src::from(coordinate), auxiliary],
+                dim,
+                comp: component,
+                offset_mode: TexOffsetMode::None,
+                z_cmpr: depth_ref.is_some(),
+                mem_eviction_priority: MemEvictionPriority::Normal,
+                nodep: false,
+                channel_mask: ChannelMask::for_comps(4),
+                scalar: false,
+            }));
+            return Ok(Value {
+                components: destination.iter().copied().map(Src::from).collect(),
+                kind,
+            });
         }
         let lod_mode = match level {
             naga::SampleLevel::Auto => TexLodMode::Auto,
@@ -1754,7 +1801,7 @@ impl<'function> FunctionLowerer<'function> {
                         "texture bias must be a float scalar".to_owned(),
                     ));
                 }
-                coordinate.components.extend(level.components);
+                auxiliary.extend(level.components);
                 TexLodMode::Bias
             }
             naga::SampleLevel::Exact(level) => {
@@ -1764,12 +1811,21 @@ impl<'function> FunctionLowerer<'function> {
                         "texture LOD must be a float scalar".to_owned(),
                     ));
                 }
-                coordinate.components.extend(level.components);
+                auxiliary.extend(level.components);
                 TexLodMode::Lod
             }
             naga::SampleLevel::Gradient { .. } => unreachable!("rejected above"),
         };
+        auxiliary.extend(depth_reference);
         let coordinate = self.materialize(coordinate)?;
+        let auxiliary = if auxiliary.is_empty() {
+            Src::ZERO
+        } else {
+            Src::from(self.materialize(Value {
+                components: auxiliary,
+                kind: naga::ScalarKind::Uint,
+            })?)
+        };
         let output_components = if depth_ref.is_some() { 1 } else { 4 };
         let dst = self
             .target
@@ -1779,7 +1835,7 @@ impl<'function> FunctionLowerer<'function> {
             dsts: [Dst::from(dst.clone()), Dst::None],
             fault: Dst::None,
             tex: texture_reference,
-            srcs: [Src::from(coordinate), bindless_handle.unwrap_or(Src::ZERO)],
+            srcs: [Src::from(coordinate), auxiliary],
             dim,
             lod_mode,
             deriv_mode: TexDerivMode::Auto,
@@ -1794,6 +1850,57 @@ impl<'function> FunctionLowerer<'function> {
             components: dst.iter().copied().map(Src::from).collect(),
             kind,
         })
+    }
+
+    fn pack_texture_offset(
+        &mut self,
+        offset: naga::Handle<naga::Expression>,
+    ) -> Result<Src, Error> {
+        let offset = self.expression(offset)?;
+        if offset.components.is_empty()
+            || offset.components.len() > 4
+            || !matches!(offset.kind, naga::ScalarKind::Sint | naga::ScalarKind::Uint)
+        {
+            return Err(Error::UnsupportedFeature(
+                "texture offset must be a one-to-four component integer vector".to_owned(),
+            ));
+        }
+        let mut packed = Src::ZERO;
+        for (index, component) in offset.components.into_iter().enumerate() {
+            let masked = self.target.ssa_alloc.alloc(RegFile::GPR);
+            self.emit(Instr::new(OpLop2 {
+                dst: Dst::from(masked),
+                srcs: [component, Src::from(0xff_u32)],
+                op: LogicOp2::And,
+            }));
+            let shifted = if index == 0 {
+                masked
+            } else {
+                let shift = u32::try_from(index * 8).map_err(|_| {
+                    Error::UnsupportedFeature("texture offset shift overflow".to_owned())
+                })?;
+                let shifted = self.target.ssa_alloc.alloc(RegFile::GPR);
+                self.emit(Instr::new(OpShl {
+                    dst: Dst::from(shifted),
+                    src: Src::from(masked),
+                    shift: Src::from(shift),
+                    wrap: true,
+                }));
+                shifted
+            };
+            if index == 0 {
+                packed = Src::from(shifted);
+            } else {
+                let combined = self.target.ssa_alloc.alloc(RegFile::GPR);
+                self.emit(Instr::new(OpLop2 {
+                    dst: Dst::from(combined),
+                    srcs: [packed, Src::from(shifted)],
+                    op: LogicOp2::Or,
+                }));
+                packed = Src::from(combined);
+            }
+        }
+        Ok(packed)
     }
 
     fn global_expression(
@@ -2083,6 +2190,13 @@ impl<'function> FunctionLowerer<'function> {
                 let curve = self.binary(naga::BinaryOperator::Subtract, &three, &twice, None)?;
                 self.binary(naga::BinaryOperator::Multiply, &square, &curve, None)
             }
+            naga::MathFunction::ReverseBits => self.reverse_bits(value),
+            naga::MathFunction::CountLeadingZeros => self.count_leading_zeros(value),
+            naga::MathFunction::CountTrailingZeros => {
+                let reversed = self.reverse_bits(value)?;
+                self.count_leading_zeros(reversed)
+            }
+            naga::MathFunction::Unpack4x8unorm => self.unpack_4x8_unorm(&value),
             naga::MathFunction::ExtractBits => {
                 let offset = self.math_argument(fun, arg1, 1)?;
                 let count = self.math_argument(fun, arg2, 2)?;
@@ -2247,6 +2361,101 @@ impl<'function> FunctionLowerer<'function> {
             Error::UnsupportedFeature(format!("missing argument {index} for {fun:?}"))
         })?;
         self.expression(handle)
+    }
+
+    fn reverse_bits(&mut self, value: Value) -> Result<Value, Error> {
+        if !matches!(value.kind, naga::ScalarKind::Uint | naga::ScalarKind::Sint) {
+            return Err(Error::UnsupportedFeature(
+                "reverseBits argument is not an integer".to_owned(),
+            ));
+        }
+        let components = value
+            .components
+            .into_iter()
+            .map(|source| {
+                let destination = self.target.ssa_alloc.alloc(RegFile::GPR);
+                self.emit(Instr::new(OpBfe {
+                    dst: Dst::from(destination),
+                    base: source,
+                    range: Src::from(32_u32 << 8),
+                    signed: false,
+                    reverse: true,
+                }));
+                Src::from(destination)
+            })
+            .collect();
+        Ok(Value {
+            components,
+            kind: value.kind,
+        })
+    }
+
+    fn count_leading_zeros(&mut self, value: Value) -> Result<Value, Error> {
+        if !matches!(value.kind, naga::ScalarKind::Uint | naga::ScalarKind::Sint) {
+            return Err(Error::UnsupportedFeature(
+                "countLeadingZeros argument is not an integer".to_owned(),
+            ));
+        }
+        let components = value
+            .components
+            .into_iter()
+            .map(|source| {
+                let destination = self.target.ssa_alloc.alloc(RegFile::GPR);
+                self.emit(Instr::new(OpFlo {
+                    dst: Dst::from(destination),
+                    src: source,
+                    signed: false,
+                    return_shift_amount: true,
+                }));
+                Src::from(destination)
+            })
+            .collect();
+        Ok(Value {
+            components,
+            kind: value.kind,
+        })
+    }
+
+    fn unpack_4x8_unorm(&mut self, value: &Value) -> Result<Value, Error> {
+        if value.kind != naga::ScalarKind::Uint || value.components.len() != 1 {
+            return Err(Error::UnsupportedFeature(
+                "unpack4x8unorm argument is not a u32 scalar".to_owned(),
+            ));
+        }
+        let source = value.components[0].clone();
+        let mut components = Vec::with_capacity(4);
+        for index in 0..4_u32 {
+            let extracted = self.target.ssa_alloc.alloc(RegFile::GPR);
+            self.emit(Instr::new(OpBfe {
+                dst: Dst::from(extracted),
+                base: source.clone(),
+                range: Src::from((8_u32 << 8) | (index * 8)),
+                signed: false,
+                reverse: false,
+            }));
+            let converted = self.target.ssa_alloc.alloc(RegFile::GPR);
+            self.emit(Instr::new(OpI2F {
+                dst: Dst::from(converted),
+                src: Src::from(extracted),
+                dst_type: FloatType::F32,
+                src_type: IntType::U32,
+                rnd_mode: FRndMode::NearestEven,
+            }));
+            let normalized = self.target.ssa_alloc.alloc(RegFile::GPR);
+            self.emit(Instr::new(OpFMul {
+                dst: Dst::from(normalized),
+                srcs: [Src::from(converted), Src::from(1.0_f32 / 255.0_f32)],
+                saturate: false,
+                rnd_mode: FRndMode::NearestEven,
+                ftz: false,
+                dnz: false,
+            }));
+            components.push(Src::from(normalized));
+        }
+        Ok(Value {
+            components,
+            kind: naga::ScalarKind::Float,
+        })
     }
 
     fn clamped_bit_range(
@@ -4238,6 +4447,49 @@ impl<'function> FunctionLowerer<'function> {
         Ok(self.decode_aggregate_value(components, flat_type_kind(self.module, ty)?))
     }
 
+    fn store_argument_pointer(
+        &mut self,
+        pointer: naga::Handle<naga::Expression>,
+        mut value: Value,
+    ) -> Result<(), Error> {
+        let (argument, ty, offset) = self.argument_pointer(pointer)?;
+        let expected = flat_type_components(self.module, ty)?;
+        if value.components.len() != expected {
+            return Err(Error::UnsupportedFeature(format!(
+                "pointer-argument store shape mismatch: expected {expected}, got {}",
+                value.components.len()
+            )));
+        }
+        let argument_kind = self
+            .arguments
+            .get(argument as usize)
+            .ok_or_else(|| {
+                Error::UnsupportedFeature(format!("missing pointer argument {argument}"))
+            })?
+            .kind;
+        if value.kind == naga::ScalarKind::Bool && argument_kind != naga::ScalarKind::Bool {
+            value.components = self
+                .materialize_loop_components(&value)?
+                .into_iter()
+                .map(Src::from)
+                .collect();
+        }
+        let argument_value = self.arguments.get_mut(argument as usize).ok_or_else(|| {
+            Error::UnsupportedFeature(format!("missing pointer argument {argument}"))
+        })?;
+        let end = offset.checked_add(expected).ok_or_else(|| {
+            Error::UnsupportedFeature("pointer-argument store range overflow".to_owned())
+        })?;
+        let destination = argument_value
+            .components
+            .get_mut(offset..end)
+            .ok_or_else(|| {
+                Error::UnsupportedFeature("pointer-argument store value shape".to_owned())
+            })?;
+        destination.clone_from_slice(&value.components);
+        Ok(())
+    }
+
     fn local_pointer(
         &self,
         handle: naga::Handle<naga::Expression>,
@@ -5582,11 +5834,33 @@ impl<'function> FunctionLowerer<'function> {
                     arguments,
                     result: None,
                 } => {
-                    let arguments = arguments
+                    let argument_values = arguments
                         .iter()
                         .map(|argument| self.call_argument(*argument))
                         .collect::<Result<Vec<_>, _>>()?;
-                    self.inline_void_call(*function, arguments)?;
+                    let updated_arguments = self.inline_void_call(*function, argument_values)?;
+                    for ((argument, parameter), value) in arguments
+                        .iter()
+                        .zip(&self.module.functions[*function].arguments)
+                        .zip(updated_arguments)
+                    {
+                        if !matches!(
+                            self.module.types[parameter.ty].inner,
+                            naga::TypeInner::Pointer { .. }
+                        ) {
+                            continue;
+                        }
+                        if self.pointer_is_argument(*argument) {
+                            self.store_argument_pointer(*argument, value)?;
+                        } else if self.pointer_is_local(*argument) {
+                            self.store_local_pointer(*argument, value)?;
+                        } else {
+                            return Err(Error::UnsupportedFeature(format!(
+                                "call pointer argument {:?}",
+                                self.source.expressions[*argument]
+                            )));
+                        }
+                    }
                 }
                 naga::Statement::Kill => self.emit(Instr::new(OpKill {})),
                 naga::Statement::ControlBarrier(flags) => {
@@ -5632,6 +5906,11 @@ impl<'function> FunctionLowerer<'function> {
                     result,
                 } => self.subgroup_gather(*mode, *argument, *result)?,
                 naga::Statement::Store { pointer, value } => {
+                    if self.pointer_is_argument(*pointer) {
+                        let value = self.expression(*value)?;
+                        self.store_argument_pointer(*pointer, value)?;
+                        continue;
+                    }
                     if self.pointer_is_storage(*pointer) {
                         let value = self.expression(*value)?;
                         self.store_storage(*pointer, &value)?;
@@ -5931,7 +6210,7 @@ impl<'function> FunctionLowerer<'function> {
         &mut self,
         function: naga::Handle<naga::Function>,
         arguments: Vec<Value>,
-    ) -> Result<(), Error> {
+    ) -> Result<Vec<Value>, Error> {
         let target = std::mem::replace(&mut self.target, Function::single_block(Vec::new()));
         let loop_base_depth = self.loops.len();
         let mut callee = Self {
@@ -5957,7 +6236,7 @@ impl<'function> FunctionLowerer<'function> {
                     "void function returned a value".to_owned(),
                 ))
             } else {
-                Ok(())
+                Ok(callee.arguments.clone())
             }
         });
         let result = result.map_err(|error| match error {

@@ -1156,6 +1156,39 @@ mod tests {
     }
 
     #[test]
+    fn gather_offsets_packed_formats_and_storage_queries_compile() {
+        let source = r"
+            @group(0) @binding(0) var input: texture_2d<u32>;
+            @group(0) @binding(1) var input_sampler: sampler;
+            @group(0) @binding(2) var output: texture_storage_2d<rgba8unorm, write>;
+
+            @compute @workgroup_size(1)
+            fn main() {
+                let gathered = textureGather(0, input, input_sampler, vec2<f32>(0.5), vec2<i32>(1, -1));
+                let packed = reverseBits(gathered.x) ^ countLeadingZeros(gathered.y) ^ countTrailingZeros(gathered.z);
+                let color = unpack4x8unorm(packed);
+                let size = textureDimensions(output);
+                textureStore(output, min(size - vec2<u32>(1u), vec2<u32>(0u)), color);
+            }
+        ";
+        let artifact = Compiler
+            .compile_wgsl(
+                source,
+                Stage::Compute,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap();
+        assert!(
+            artifact
+                .bindings
+                .iter()
+                .any(|binding| binding.kind == deko_dksh::BindingKind::StorageTexture)
+        );
+    }
+
+    #[test]
     fn void_helpers_and_fragment_discard_compile() {
         let source = r"
             fn reject_negative(value: f32) {
@@ -1166,6 +1199,36 @@ mod tests {
             fn main(@location(0) value: f32) -> @location(0) vec4<f32> {
                 reject_negative(value);
                 return vec4<f32>(value);
+            }
+        ";
+        Compiler
+            .compile_wgsl(
+                source,
+                Stage::Fragment,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn pointer_arguments_write_back_nested_struct_members() {
+        let source = r"
+            struct Material { color: vec4<f32>, roughness: f32 }
+            struct Input { material: Material, normal: vec3<f32> }
+
+            fn update(input: ptr<function, Input>) {
+                (*input).material.color = vec4<f32>(0.25);
+                (*input).material.roughness = 0.5;
+                (*input).normal = normalize(vec3<f32>(1.0, 2.0, 3.0));
+            }
+
+            @fragment
+            fn main() -> @location(0) vec4<f32> {
+                var input: Input;
+                update(&input);
+                return input.material.color + vec4<f32>(input.normal * input.material.roughness, 0.0);
             }
         ";
         Compiler
