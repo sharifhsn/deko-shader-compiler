@@ -21,6 +21,7 @@ mod calc_instr_deps;
 #[rustfmt::skip]
 mod const_tracker;
 pub mod ir;
+mod ir_ext;
 #[rustfmt::skip]
 mod legalize;
 #[rustfmt::skip]
@@ -95,6 +96,12 @@ pub struct ShaderBinary {
     pub num_gprs: u32,
     /// Scratch bytes required per warp.
     pub per_warp_scratch_size: u32,
+    /// Local-memory bytes required per invocation.
+    pub local_memory_size: u32,
+    /// Call/return stack bytes required by the program.
+    pub crs_size: u32,
+    /// Number of hardware control barriers used.
+    pub num_control_barriers: u32,
     /// NAK shader program header. For GM20B the first 20 words are meaningful `SPHv3`.
     pub sph: [u32; 32],
 }

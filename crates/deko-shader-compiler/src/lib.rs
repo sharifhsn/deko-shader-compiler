@@ -8,6 +8,8 @@ use std::collections::BTreeMap;
 
 use thiserror::Error;
 
+mod lower;
+
 /// Pipeline override values after wgpu resolves their names.
 pub type PipelineConstants = BTreeMap<String, f64>;
 
@@ -98,6 +100,9 @@ pub enum Error {
     /// DKSH packaging failed.
     #[error(transparent)]
     Dksh(#[from] deko_dksh::Error),
+    /// The validated module uses a feature that has not reached the native lowering yet.
+    #[error("unsupported shader feature: {0}")]
+    UnsupportedFeature(String),
 }
 
 /// Stateless Deko shader compiler.
@@ -143,22 +148,57 @@ impl Compiler {
     ///
     /// Returns an entry-point, backend, or DKSH packaging error.
     pub fn compile_module(self, request: &ModuleRequest<'_>) -> Result<Artifact, Error> {
-        if !request
-            .module
-            .entry_points
-            .iter()
-            .any(|entry| entry.stage == request.stage && entry.name == request.entry_point)
-        {
-            return Err(Error::MissingEntryPoint {
+        let entry = lower::entry_point(request.module, request.stage, request.entry_point)
+            .ok_or_else(|| Error::MissingEntryPoint {
                 stage: request.stage,
                 entry_point: request.entry_point.to_owned(),
-            });
-        }
+            })?;
         let _ = request.info;
         let _ = request.constants;
         let _ = request.options;
         deko_nak::validate_target(deko_nak::Target::GM20B)?;
-        Err(deko_nak::Error::BackendUnavailable.into())
+
+        let sm = deko_nak::ir::ShaderModelInfo::new(53, 64);
+        let shader = lower::lower_entry_point(entry, &sm)?;
+        let binary = deko_nak::compile_ir(shader, None)?;
+
+        let (program_type, entrypoint, payload, code) = match request.stage {
+            naga::ShaderStage::Compute => {
+                let block_dimensions = entry.workgroup_size;
+                (
+                    deko_dksh::ProgramType::Compute,
+                    0,
+                    deko_dksh::StagePayload::Compute {
+                        block_dimensions,
+                        shared_memory_size: 0,
+                        local_positive_memory_size: binary.local_memory_size,
+                        local_negative_memory_size: 0,
+                        crs_size: binary.crs_size,
+                        num_barriers: binary.num_control_barriers,
+                    },
+                    binary.code,
+                )
+            }
+            stage => {
+                return Err(Error::UnsupportedFeature(format!(
+                    "{stage:?} DKSH packaging is not implemented yet"
+                )));
+            }
+        };
+        let bindings = Vec::new();
+        let dksh = deko_dksh::encode(
+            deko_dksh::Program {
+                program_type,
+                entrypoint,
+                num_gprs: binary.num_gprs,
+                constbuf1: None,
+                per_warp_scratch_size: binary.per_warp_scratch_size,
+                payload,
+            },
+            &code,
+            &bindings,
+        )?;
+        Ok(Artifact { dksh, bindings })
     }
 }
 
@@ -186,7 +226,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_entry_point_is_distinct_from_backend_progress() {
+    fn missing_entry_point_is_distinct_from_compilation() {
         let missing = Compiler
             .compile_wgsl(
                 COMPUTE,
@@ -198,7 +238,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(missing, Error::MissingEntryPoint { .. }));
 
-        let backend = Compiler
+        let artifact = Compiler
             .compile_wgsl(
                 COMPUTE,
                 naga::ShaderStage::Compute,
@@ -206,10 +246,48 @@ mod tests {
                 &PipelineConstants::new(),
                 Options::default(),
             )
-            .unwrap_err();
-        assert!(matches!(
-            backend,
-            Error::Backend(deko_nak::Error::BackendUnavailable)
-        ));
+            .unwrap();
+        let container = deko_dksh::parse(&artifact.dksh).unwrap();
+        assert_eq!(
+            container.program.program_type,
+            deko_dksh::ProgramType::Compute
+        );
+        assert_eq!(container.program.entrypoint, 0);
+        assert!(container.program.num_gprs >= 4);
+        assert_eq!(container.program.per_warp_scratch_size, 0x800);
+        assert!(artifact.bindings.is_empty());
+        assert!(container.code.iter().any(|byte| *byte != 0));
+    }
+
+    #[test]
+    fn compute_workgroup_metadata_and_output_are_deterministic() {
+        let source = "@compute @workgroup_size(8, 4, 2) fn main() {}";
+        let compile = || {
+            Compiler
+                .compile_wgsl(
+                    source,
+                    naga::ShaderStage::Compute,
+                    "main",
+                    &PipelineConstants::new(),
+                    Options::default(),
+                )
+                .unwrap()
+        };
+        let first = compile();
+        let second = compile();
+        assert_eq!(first, second);
+
+        let container = deko_dksh::parse(&first.dksh).unwrap();
+        assert_eq!(
+            container.program.payload,
+            deko_dksh::StagePayload::Compute {
+                block_dimensions: [8, 4, 2],
+                shared_memory_size: 0,
+                local_positive_memory_size: 0,
+                local_negative_memory_size: 0,
+                crs_size: 0x800,
+                num_barriers: 0,
+            }
+        );
     }
 }

@@ -1,7 +1,7 @@
 //! Standalone SM50 pass pipeline and machine-code emission.
 
 use crate::bindings::FsKey;
-use crate::ir::{Shader, ShaderModel};
+use crate::ir::{Shader, ShaderModel, ShaderStageInfo};
 use crate::{Error, ShaderBinary};
 
 /// Optimize, allocate, schedule, and encode one Maxwell NAK shader.
@@ -45,10 +45,30 @@ pub fn compile_ir(mut shader: Shader<'_>, fs_key: Option<&FsKey>) -> Result<Shad
         .flat_map(u32::to_le_bytes)
         .collect::<Vec<_>>();
 
+    let crs_size = sm.crs_size(shader.info.max_crs_depth);
+    let is_compute = matches!(shader.info.stage, ShaderStageInfo::Compute(_));
+    let per_warp_scratch_size = if is_compute {
+        shader
+            .info
+            .slm_size
+            .saturating_mul(32)
+            .max(crs_size)
+            .max(0x800)
+    } else {
+        shader.info.slm_size.saturating_mul(32)
+    };
+
     Ok(ShaderBinary {
         code,
         num_gprs: (u32::from(shader.info.num_gprs) + sm.hw_reserved_gprs()).max(4),
-        per_warp_scratch_size: shader.info.slm_size,
+        per_warp_scratch_size,
+        local_memory_size: shader.info.slm_size,
+        crs_size: if is_compute {
+            crs_size.max(0x800)
+        } else {
+            crs_size
+        },
+        num_control_barriers: u32::from(shader.info.num_control_barriers),
         sph,
     })
 }
