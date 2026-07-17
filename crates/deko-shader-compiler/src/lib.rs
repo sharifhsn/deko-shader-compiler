@@ -179,11 +179,31 @@ impl Compiler {
                     binary.code,
                 )
             }
-            stage => {
-                return Err(Error::UnsupportedFeature(format!(
-                    "{stage:?} DKSH packaging is not implemented yet"
-                )));
-            }
+            naga::ShaderStage::Vertex => (
+                deko_dksh::ProgramType::Vertex,
+                0x30,
+                deko_dksh::StagePayload::Vertex {
+                    alternate_entrypoint: 0,
+                    alternate_num_gprs: 0,
+                },
+                graphics_code_image(&binary),
+            ),
+            naga::ShaderStage::Fragment => (
+                deko_dksh::ProgramType::Fragment,
+                0x30,
+                deko_dksh::StagePayload::Fragment {
+                    has_table_3d1: false,
+                    early_fragment_tests: entry.early_depth_test.is_some(),
+                    post_depth_coverage: false,
+                    per_sample_invocation: false,
+                    table_3d1: [0, 0, 0, 0x0860_7f80],
+                    param_d8: 0,
+                    param_65b: 0,
+                    param_489: 0,
+                },
+                graphics_code_image(&binary),
+            ),
+            stage => return Err(Error::UnsupportedFeature(format!("{stage:?} stage"))),
         };
         let bindings = Vec::new();
         let dksh = deko_dksh::encode(
@@ -200,6 +220,20 @@ impl Compiler {
         )?;
         Ok(Artifact { dksh, bindings })
     }
+}
+
+fn graphics_code_image(binary: &deko_nak::ShaderBinary) -> Vec<u8> {
+    const PREFIX_SIZE: usize = 0x30;
+    const SPHV3_WORDS: usize = 20;
+
+    let mut code = vec![0; PREFIX_SIZE];
+    code.extend(
+        binary.sph[..SPHV3_WORDS]
+            .iter()
+            .flat_map(|word| word.to_le_bytes()),
+    );
+    code.extend_from_slice(&binary.code);
+    code
 }
 
 #[cfg(test)]
@@ -289,5 +323,48 @@ mod tests {
                 num_barriers: 0,
             }
         );
+    }
+
+    #[test]
+    fn constant_vertex_and_fragment_compile_to_graphics_dksh() {
+        let vertex = Compiler
+            .compile_wgsl(
+                "@vertex fn main() -> @builtin(position) vec4<f32> { return vec4<f32>(0.0, 0.0, 0.0, 1.0); }",
+                naga::ShaderStage::Vertex,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap();
+        let vertex = deko_dksh::parse(&vertex.dksh).unwrap();
+        assert_eq!(vertex.program.program_type, deko_dksh::ProgramType::Vertex);
+        assert_eq!(vertex.program.entrypoint, 0x30);
+        assert_eq!(&vertex.code[..0x30], &[0; 0x30]);
+        assert_eq!(
+            u32::from_le_bytes(vertex.code[0x30..0x34].try_into().unwrap()) & 0x3fff,
+            0x0461
+        );
+        assert!(vertex.code[0x80..].iter().any(|byte| *byte != 0));
+
+        let fragment = Compiler
+            .compile_wgsl(
+                "@fragment fn main() -> @location(0) vec4<f32> { return vec4<f32>(1.0, 0.0, 0.0, 1.0); }",
+                naga::ShaderStage::Fragment,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap();
+        let fragment = deko_dksh::parse(&fragment.dksh).unwrap();
+        assert_eq!(
+            fragment.program.program_type,
+            deko_dksh::ProgramType::Fragment
+        );
+        assert_eq!(fragment.program.entrypoint, 0x30);
+        assert_eq!(
+            u32::from_le_bytes(fragment.code[0x30..0x34].try_into().unwrap()) & 0x3fff,
+            0x1462
+        );
+        assert!(fragment.code[0x80..].iter().any(|byte| *byte != 0));
     }
 }

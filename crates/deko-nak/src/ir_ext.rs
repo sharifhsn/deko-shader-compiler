@@ -1,9 +1,11 @@
 //! Standalone construction helpers layered over the imported NAK IR.
 
 use crate::ir::{
-    BasicBlock, ComputeShaderInfo, Function, Instr, LabelAllocator, PhiAllocator,
-    SSAValueAllocator, ShaderInfo, ShaderIoInfo, ShaderStageInfo,
+    BasicBlock, ComputeShaderInfo, FragmentIoInfo, FragmentShaderInfo, Function, Instr,
+    LabelAllocator, PhiAllocator, SSAValueAllocator, ShaderInfo, ShaderIoInfo, ShaderStageInfo,
+    SysValInfo, VertexShaderInfo, VtgIoInfo,
 };
+use crate::sph::PixelImap;
 use compiler::cfg::CFGBuilder;
 use std::hash::RandomState;
 
@@ -30,9 +32,7 @@ impl Function {
 }
 
 impl ShaderInfo {
-    /// Construct initial metadata for a compute shader before NAK's gather pass.
-    #[must_use]
-    pub fn compute(local_size: [u16; 3], shared_memory_size: u16) -> Self {
+    fn base(stage: ShaderStageInfo, io: ShaderIoInfo) -> Self {
         Self {
             max_warps_per_sm: 0,
             num_gprs: 0,
@@ -48,12 +48,76 @@ impl ShaderInfo {
             uses_global_mem: false,
             writes_global_mem: false,
             uses_fp64: false,
-            stage: ShaderStageInfo::Compute(ComputeShaderInfo {
+            stage,
+            io,
+        }
+    }
+
+    /// Construct initial metadata for a compute shader before NAK's gather pass.
+    #[must_use]
+    pub fn compute(local_size: [u16; 3], shared_memory_size: u16) -> Self {
+        Self::base(
+            ShaderStageInfo::Compute(ComputeShaderInfo {
                 local_size,
                 smem_size: shared_memory_size,
             }),
-            io: ShaderIoInfo::None,
-        }
+            ShaderIoInfo::None,
+        )
+    }
+
+    /// Construct initial metadata for a vertex shader.
+    #[must_use]
+    pub fn vertex() -> Self {
+        Self::base(
+            ShaderStageInfo::Vertex(VertexShaderInfo {
+                isbe_space_sharing_enable: false,
+            }),
+            ShaderIoInfo::Vtg(VtgIoInfo {
+                sysvals_in: SysValInfo::default(),
+                sysvals_in_d: 0,
+                sysvals_out: SysValInfo::default(),
+                sysvals_out_d: 0,
+                attr_in: [0; 4],
+                attr_out: [0; 4],
+                store_req_start: u8::MAX,
+                store_req_end: 0,
+                clip_enable: 0,
+                cull_enable: 0,
+                xfb: None,
+            }),
+        )
+    }
+
+    /// Construct initial metadata for a fragment shader.
+    #[must_use]
+    pub fn fragment(
+        early_fragment_tests: bool,
+        post_depth_coverage: bool,
+        uses_sample_shading: bool,
+    ) -> Self {
+        Self::base(
+            ShaderStageInfo::Fragment(FragmentShaderInfo {
+                uses_kill: false,
+                does_interlock: false,
+                post_depth_coverage,
+                early_fragment_tests,
+                uses_sample_shading,
+            }),
+            ShaderIoInfo::Fragment(FragmentIoInfo {
+                sysvals_in: SysValInfo {
+                    // Required on fragment shaders; omitting it traps on Maxwell.
+                    ab: 1 << 31,
+                    c: 0,
+                },
+                sysvals_in_d: [PixelImap::Unused; 8],
+                attr_in: [PixelImap::Unused; 128],
+                barycentric_attr_in: [0; 4],
+                reads_sample_mask: false,
+                writes_color: 0,
+                writes_sample_mask: false,
+                writes_depth: false,
+            }),
+        )
     }
 }
 
