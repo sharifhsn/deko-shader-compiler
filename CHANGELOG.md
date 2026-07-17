@@ -25,6 +25,8 @@
   cube-layer conversion used by Mesa NIR.
 - Accept pipeline-specialized compute workgroup-size overrides and preserve their
   resolved dimensions in DKSH metadata.
+- Lower emulated multiview `view_index` inputs through wgpu's reserved Deko uniform
+  slot and emit the Maxwell layer output used by replayed vertex draws and fragment input.
 - Add a safe deterministic DKSH encoder/parser with typed stage payloads and
   versioned binding metadata consumed by wgpu-hal.
 - Add the explicit GM20B target descriptor, register allocation, scheduling, SPH

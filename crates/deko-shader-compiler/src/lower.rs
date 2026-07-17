@@ -17,6 +17,11 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::Error;
 
+// Deko reserves user uniform target 14 for wgpu's emulated multiview index and target 15
+// for immediate data. Maxwell's shader-visible constant-buffer numbering adds c0/c1.
+const MULTIVIEW_UNIFORM_TARGET: u8 = 14;
+const LAYER_ATTRIBUTE_ADDRESS: u16 = 0x064;
+
 pub(crate) struct LoweredShader<'sm> {
     pub shader: Shader<'sm>,
     pub bindings: Vec<deko_dksh::Binding>,
@@ -69,8 +74,20 @@ pub(crate) fn lower_entry_point<'sm>(
     let resources = resource_map(module, entry, options)?;
     let shader = match entry.stage {
         naga::ShaderStage::Compute => lower_compute(module, entry, sm, &resources),
-        naga::ShaderStage::Vertex => lower_vertex(module, entry, sm, &resources),
-        naga::ShaderStage::Fragment => lower_fragment(module, entry, sm, &resources),
+        naga::ShaderStage::Vertex => lower_vertex(
+            module,
+            entry,
+            sm,
+            &resources,
+            options.multiview_mask.is_some(),
+        ),
+        naga::ShaderStage::Fragment => lower_fragment(
+            module,
+            entry,
+            sm,
+            &resources,
+            options.multiview_mask.is_some(),
+        ),
         stage => Err(Error::UnsupportedFeature(format!("{stage:?} stage"))),
     }?;
     Ok(LoweredShader {
@@ -7555,10 +7572,26 @@ fn output_fields(
     Ok(fields)
 }
 
+fn load_multiview_index(lowerer: &mut FunctionLowerer<'_>) -> Src {
+    let dst = lowerer.target.ssa_alloc.alloc(RegFile::GPR);
+    lowerer.emit(Instr::new(OpLdc {
+        dst: Dst::from(dst),
+        cb: Src::from(CBufRef {
+            buf: CBuf::Binding(MULTIVIEW_UNIFORM_TARGET + 2),
+            offset: 0,
+        }),
+        offset: Src::ZERO,
+        mode: LdcMode::Indexed,
+        mem_type: MemType::B32,
+    }));
+    Src::from(dst)
+}
+
 fn bind_vertex_arguments(
     module: &naga::Module,
     lowerer: &mut FunctionLowerer<'_>,
     info: &mut ShaderInfo,
+    multiview: bool,
 ) -> Result<(), Error> {
     let arguments = lowerer.source.arguments.clone();
     for argument in &arguments {
@@ -7587,7 +7620,7 @@ fn bind_vertex_arguments(
         let mut value = Vec::new();
         let mut kinds = Vec::new();
         for (binding, ty) in fields {
-            let field = bind_vertex_field(module, lowerer, info, &binding, ty)?;
+            let field = bind_vertex_field(module, lowerer, info, &binding, ty, multiview)?;
             kinds.push(field.kind);
             value.extend(field.components);
         }
@@ -7613,10 +7646,21 @@ fn bind_vertex_field(
     info: &mut ShaderInfo,
     binding: &naga::Binding,
     ty: naga::Handle<naga::Type>,
+    multiview: bool,
 ) -> Result<Value, Error> {
     let (components, kind) = type_shape(module, ty)?;
     if kind == naga::ScalarKind::Bool {
         return Err(Error::UnsupportedFeature("boolean vertex input".to_owned()));
+    }
+    if matches!(binding, naga::Binding::BuiltIn(naga::BuiltIn::ViewIndex))
+        && components == 1
+        && kind == naga::ScalarKind::Uint
+        && multiview
+    {
+        return Ok(Value {
+            components: vec![load_multiview_index(lowerer)],
+            kind,
+        });
     }
     let addr = match binding {
         naga::Binding::Location { location, .. } => location_address(*location)?,
@@ -7653,6 +7697,7 @@ fn bind_fragment_arguments(
     module: &naga::Module,
     lowerer: &mut FunctionLowerer<'_>,
     info: &mut ShaderInfo,
+    multiview: bool,
 ) -> Result<(), Error> {
     let arguments = lowerer.source.arguments.clone();
     for (argument_index, argument) in arguments.iter().enumerate() {
@@ -7682,7 +7727,7 @@ fn bind_fragment_arguments(
         let mut components = Vec::new();
         let mut kinds = Vec::new();
         for (binding, ty, used) in fields {
-            let value = bind_fragment_field(module, lowerer, info, &binding, ty, used)?;
+            let value = bind_fragment_field(module, lowerer, info, &binding, ty, used, multiview)?;
             kinds.push(value.kind);
             components.extend(value.components);
         }
@@ -7722,7 +7767,37 @@ fn bind_fragment_builtin(
     components: u8,
     kind: naga::ScalarKind,
     used: bool,
+    multiview: bool,
 ) -> Result<Value, Error> {
+    if matches!(builtin, naga::BuiltIn::ViewIndex)
+        && components == 1
+        && kind == naga::ScalarKind::Uint
+        && multiview
+    {
+        if !used {
+            return Ok(Value {
+                components: vec![Src::ZERO],
+                kind,
+            });
+        }
+        let ssa = lowerer.target.ssa_alloc.alloc(RegFile::GPR);
+        lowerer.emit(Instr::new(OpIpa {
+            dst: Dst::from(ssa),
+            addr: LAYER_ATTRIBUTE_ADDRESS,
+            freq: InterpFreq::Constant,
+            loc: InterpLoc::Default,
+            inv_w: Src::ZERO,
+            offset: Src::ZERO,
+        }));
+        let ShaderIoInfo::Fragment(io) = &mut info.io else {
+            unreachable!();
+        };
+        io.mark_attr_read(LAYER_ATTRIBUTE_ADDRESS, PixelImap::Constant);
+        return Ok(Value {
+            components: vec![Src::from(ssa)],
+            kind,
+        });
+    }
     if matches!(builtin, naga::BuiltIn::FrontFacing)
         && components == 1
         && kind == naga::ScalarKind::Bool
@@ -7794,10 +7869,11 @@ fn bind_fragment_field(
     binding: &naga::Binding,
     ty: naga::Handle<naga::Type>,
     used: bool,
+    multiview: bool,
 ) -> Result<Value, Error> {
     let (components, kind) = type_shape(module, ty)?;
     if let naga::Binding::BuiltIn(builtin) = binding {
-        return bind_fragment_builtin(lowerer, info, *builtin, components, kind, used);
+        return bind_fragment_builtin(lowerer, info, *builtin, components, kind, used, multiview);
     }
     let naga::Binding::Location {
         location,
@@ -7862,13 +7938,14 @@ fn lower_vertex<'sm>(
     entry: &naga::EntryPoint,
     sm: &'sm ShaderModelInfo,
     resources: &ResourceMap,
+    multiview: bool,
 ) -> Result<Shader<'sm>, Error> {
     let result = entry.function.result.as_ref().ok_or_else(|| {
         Error::UnsupportedFeature("vertex entry point without a result".to_owned())
     })?;
     let mut info = ShaderInfo::vertex();
     let mut lowerer = FunctionLowerer::new(module, &entry.function, resources, Vec::new());
-    bind_vertex_arguments(module, &mut lowerer, &mut info)?;
+    bind_vertex_arguments(module, &mut lowerer, &mut info, multiview)?;
     let value = lowerer.return_value()?;
     let mut wrote_position = false;
     for field in output_fields(module, result)? {
@@ -7918,6 +7995,23 @@ fn lower_vertex<'sm>(
             "vertex result does not write @builtin(position)".to_owned(),
         ));
     }
+    if multiview {
+        let view_index = load_multiview_index(&mut lowerer);
+        lowerer.emit(Instr::new(OpASt {
+            vtx: Src::ZERO,
+            offset: Src::ZERO,
+            data: view_index,
+            addr: LAYER_ATTRIBUTE_ADDRESS,
+            comps: 1,
+            patch: false,
+            phys: false,
+        }));
+        let ShaderIoInfo::Vtg(io) = &mut info.io else {
+            unreachable!();
+        };
+        io.mark_attrs_written(LAYER_ATTRIBUTE_ADDRESS..LAYER_ATTRIBUTE_ADDRESS + 4);
+        io.mark_store_req(LAYER_ATTRIBUTE_ADDRESS..LAYER_ATTRIBUTE_ADDRESS + 4);
+    }
     Ok(Shader {
         sm,
         info,
@@ -7930,6 +8024,7 @@ fn lower_fragment<'sm>(
     entry: &naga::EntryPoint,
     sm: &'sm ShaderModelInfo,
     resources: &ResourceMap,
+    multiview: bool,
 ) -> Result<Shader<'sm>, Error> {
     let result = entry.function.result.as_ref();
     let mut info = ShaderInfo::fragment(entry.early_depth_test.is_some(), false, false);
@@ -7945,7 +8040,7 @@ fn lower_fragment<'sm>(
         stage.uses_kill = true;
     }
     let mut lowerer = FunctionLowerer::new(module, &entry.function, resources, Vec::new());
-    bind_fragment_arguments(module, &mut lowerer, &mut info)?;
+    bind_fragment_arguments(module, &mut lowerer, &mut info, multiview)?;
     let mut outputs = Vec::new();
     let mut writes_color = 0_u32;
     let mut depth = None;

@@ -262,8 +262,15 @@ impl Compiler {
                 }
             })?;
         let _ = info;
-        if request.options.multiview_mask.is_some() {
-            return Err(Error::UnsupportedFeature("multiview".to_owned()));
+        if let Some(mask) = request.options.multiview_mask {
+            if mask == 0 {
+                return Err(Error::UnsupportedFeature("zero multiview mask".to_owned()));
+            }
+            if request.stage == naga::ShaderStage::Compute {
+                return Err(Error::UnsupportedFeature(
+                    "multiview compute pipeline".to_owned(),
+                ));
+            }
         }
         match request.options.target {
             Target::Gm20b => deko_nak::validate_target(deko_nak::Target::GM20B)?,
@@ -357,10 +364,19 @@ mod tests {
     ";
 
     fn lowered_ir(source: &str, stage: naga::ShaderStage, entry_point: &str) -> String {
+        lowered_ir_with_options(source, stage, entry_point, &Options::default())
+    }
+
+    fn lowered_ir_with_options(
+        source: &str,
+        stage: naga::ShaderStage,
+        entry_point: &str,
+        options: &Options,
+    ) -> String {
         let module = naga::front::wgsl::parse_str(source).unwrap();
         let entry = lower::entry_point(&module, stage, entry_point).unwrap();
         let sm = deko_nak::ir::ShaderModelInfo::new(53, 64);
-        let lowered = lower::lower_entry_point(&module, entry, &sm, &Options::default()).unwrap();
+        let lowered = lower::lower_entry_point(&module, entry, &sm, options).unwrap();
         lowered.shader.to_string()
     }
 
@@ -1555,7 +1571,7 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_overrides_are_resolved_and_multiview_fails_explicitly() {
+    fn pipeline_overrides_and_multiview_are_lowered() {
         let source = "override scale: f32 = 1.0; @fragment fn main() -> @location(0) vec4<f32> { return vec4<f32>(scale, 0.0, 0.0, 1.0); }";
         let compile = |scale| {
             let mut constants = PipelineConstants::new();
@@ -1594,19 +1610,61 @@ mod tests {
             }
         ));
 
-        let multiview_error = Compiler
+        let multiview_options = Options {
+            multiview_mask: Some(0b101),
+            ..Options::default()
+        };
+        let vertex_source = r"
+            struct Output {
+                @builtin(position) position: vec4<f32>,
+                @location(0) view: u32,
+            }
+            @vertex fn main(@builtin(view_index) view: u32) -> Output {
+                return Output(vec4<f32>(), view);
+            }
+        ";
+        let vertex = Compiler
             .compile_wgsl(
-                "@vertex fn main() -> @builtin(position) vec4<f32> { return vec4<f32>(); }",
+                vertex_source,
                 Stage::Vertex,
                 "main",
                 &PipelineConstants::new(),
-                Options {
-                    multiview_mask: Some(1),
-                    ..Options::default()
-                },
+                multiview_options.clone(),
             )
-            .unwrap_err();
-        assert!(matches!(multiview_error, Error::UnsupportedFeature(_)));
+            .unwrap();
+        assert!(vertex.dksh.starts_with(b"DKSH"));
+        let vertex_ir = lowered_ir_with_options(
+            vertex_source,
+            naga::ShaderStage::Vertex,
+            "main",
+            &multiview_options,
+        );
+        assert!(vertex_ir.contains("c[0x10]"), "{vertex_ir}");
+        assert!(vertex_ir.contains("a[0x64]"), "{vertex_ir}");
+
+        let fragment_source = r"
+            @fragment fn main(@builtin(view_index) view: u32) -> @location(0) vec4<f32> {
+                return vec4<f32>(f32(view));
+            }
+        ";
+        let fragment = Compiler
+            .compile_wgsl(
+                fragment_source,
+                Stage::Fragment,
+                "main",
+                &PipelineConstants::new(),
+                multiview_options.clone(),
+            )
+            .unwrap();
+        assert!(fragment.dksh.starts_with(b"DKSH"));
+        let fragment_ir = lowered_ir_with_options(
+            fragment_source,
+            naga::ShaderStage::Fragment,
+            "main",
+            &multiview_options,
+        );
+        assert!(fragment_ir.contains("ipa.constant"), "{fragment_ir}");
+        assert!(fragment_ir.contains("a[0x64]"), "{fragment_ir}");
     }
 
     #[test]

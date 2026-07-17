@@ -16,6 +16,9 @@ features return a typed error instead of silently changing shader semantics.
 Native Maxwell TXD lowering supports explicit WGSL gradients for 1D/2D sampled textures,
 including array layers and constant offsets. 3D and cube gradients use Mesa's mathematically
 equivalent derivative-to-LOD rewrite before the ordinary Maxwell texture instruction.
+Multiview pipelines use wgpu's Deko draw-replay ABI: the compiler loads the current view from
+reserved uniform target 14, writes the Maxwell layer output, and exposes the layer as fragment
+`view_index`.
 
 The compiler is integrated into the Deko3D backend of the accompanying wgpu fork.
 An override-free Ryujinx run has compiled ordinary Bevy WGSL at runtime and rendered
@@ -69,8 +72,7 @@ on crates.io already. Publish dependency crates in topological order before runn
 full registry-backed package verification.
 
 The public support boundary is the operations exercised by the tests and Bevy corpus,
-not all of WGSL. Multiview is currently rejected explicitly. Native execution and
-performance claims require physical Switch evidence.
+not all of WGSL. Native execution and performance claims require physical Switch evidence.
 
 The three fuzz targets cover the untrusted DKSH parser, arbitrary WGSL bytes at the
 Naga boundary, and a valid generated vertex/fragment/compute family that reaches the
