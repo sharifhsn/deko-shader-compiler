@@ -1,12 +1,23 @@
 use deko_nak::ir::{
-    Dst, FRndMode, Function, Instr, InterpFreq, InterpLoc, OpALd, OpASt, OpExit, OpFAdd, OpFMul,
-    OpIpa, OpMov, OpRegOut, RegFile, SSARef, Shader, ShaderInfo, ShaderIoInfo, ShaderModelInfo,
-    Src,
+    CBuf, CBufRef, Dst, FRndMode, Function, Instr, InterpFreq, InterpLoc, LdcMode, MemType, OpALd,
+    OpASt, OpExit, OpFAdd, OpFMul, OpIpa, OpLdc, OpMov, OpRegOut, RegFile, SSARef, Shader,
+    ShaderInfo, ShaderIoInfo, ShaderModelInfo, Src,
 };
 use deko_nak::sph::PixelImap;
 use std::collections::HashMap;
 
 use crate::Error;
+
+pub(crate) struct LoweredShader<'sm> {
+    pub shader: Shader<'sm>,
+    pub bindings: Vec<deko_dksh::Binding>,
+}
+
+#[derive(Default)]
+struct ResourceMap {
+    uniforms: HashMap<naga::Handle<naga::GlobalVariable>, u8>,
+    bindings: Vec<deko_dksh::Binding>,
+}
 
 pub(crate) fn entry_point<'module>(
     module: &'module naga::Module,
@@ -23,19 +34,58 @@ pub(crate) fn lower_entry_point<'sm>(
     module: &naga::Module,
     entry: &naga::EntryPoint,
     sm: &'sm ShaderModelInfo,
-) -> Result<Shader<'sm>, Error> {
-    match entry.stage {
-        naga::ShaderStage::Compute => lower_compute(module, entry, sm),
-        naga::ShaderStage::Vertex => lower_vertex(module, entry, sm),
-        naga::ShaderStage::Fragment => lower_fragment(module, entry, sm),
+) -> Result<LoweredShader<'sm>, Error> {
+    let resources = resource_map(module)?;
+    let shader = match entry.stage {
+        naga::ShaderStage::Compute => lower_compute(module, entry, sm, &resources),
+        naga::ShaderStage::Vertex => lower_vertex(module, entry, sm, &resources),
+        naga::ShaderStage::Fragment => lower_fragment(module, entry, sm, &resources),
         stage => Err(Error::UnsupportedFeature(format!("{stage:?} stage"))),
+    }?;
+    Ok(LoweredShader {
+        shader,
+        bindings: resources.bindings,
+    })
+}
+
+fn resource_map(module: &naga::Module) -> Result<ResourceMap, Error> {
+    let mut resources = ResourceMap::default();
+    let mut uniforms = module
+        .global_variables
+        .iter()
+        .filter_map(|(handle, variable)| {
+            (variable.space == naga::AddressSpace::Uniform)
+                .then_some((handle, variable.binding.as_ref()))
+        })
+        .collect::<Vec<_>>();
+    uniforms.sort_by_key(|(_, binding)| binding.map(|binding| (binding.group, binding.binding)));
+    for (target, (handle, binding)) in uniforms.into_iter().enumerate() {
+        let binding = binding.ok_or_else(|| {
+            Error::UnsupportedFeature("uniform global without a resource binding".to_owned())
+        })?;
+        let target = u8::try_from(target)
+            .map_err(|_| Error::UnsupportedFeature("too many uniform buffers".to_owned()))?;
+        if target >= 14 {
+            return Err(Error::UnsupportedFeature(
+                "more than 14 user uniform buffers".to_owned(),
+            ));
+        }
+        resources.uniforms.insert(handle, target);
+        resources.bindings.push(deko_dksh::Binding {
+            group: binding.group,
+            binding: binding.binding,
+            target: u32::from(target),
+            kind: deko_dksh::BindingKind::Uniform,
+        });
     }
+    Ok(resources)
 }
 
 fn lower_compute<'sm>(
     module: &naga::Module,
     entry: &naga::EntryPoint,
     sm: &'sm ShaderModelInfo,
+    resources: &ResourceMap,
 ) -> Result<Shader<'sm>, Error> {
     if !entry.function.arguments.is_empty() || entry.function.result.is_some() {
         return Err(Error::UnsupportedFeature(
@@ -54,7 +104,7 @@ fn lower_compute<'sm>(
     };
     let local_size = [dimension(x)?, dimension(y)?, dimension(z)?];
 
-    let mut lowerer = FunctionLowerer::new(module, &entry.function, Vec::new());
+    let mut lowerer = FunctionLowerer::new(module, &entry.function, resources, Vec::new());
     let body = entry.function.body.clone();
     if lowerer.execute_statements(&body)?.is_some() {
         return Err(Error::UnsupportedFeature(
@@ -77,6 +127,7 @@ struct Value {
 struct FunctionLowerer<'function> {
     module: &'function naga::Module,
     source: &'function naga::Function,
+    resources: &'function ResourceMap,
     target: Function,
     values: HashMap<naga::Handle<naga::Expression>, Value>,
     locals: HashMap<naga::Handle<naga::LocalVariable>, Value>,
@@ -87,11 +138,13 @@ impl<'function> FunctionLowerer<'function> {
     fn new(
         module: &'function naga::Module,
         source: &'function naga::Function,
+        resources: &'function ResourceMap,
         arguments: Vec<Value>,
     ) -> Self {
         Self {
             module,
             source,
+            resources,
             target: Function::single_block(Vec::new()),
             values: HashMap::new(),
             locals: HashMap::new(),
@@ -138,11 +191,7 @@ impl<'function> FunctionLowerer<'function> {
                 .ok_or_else(|| Error::UnsupportedFeature(format!("argument {index}")))?,
             naga::Expression::Load { pointer } => match self.source.expressions[*pointer] {
                 naga::Expression::LocalVariable(local) => self.local_value(local)?,
-                ref pointer => {
-                    return Err(Error::UnsupportedFeature(format!(
-                        "load pointer {pointer:?}"
-                    )));
-                }
+                _ => self.load_uniform(*pointer)?,
             },
             naga::Expression::Splat { size, value } => self.splat(*size, *value)?,
             naga::Expression::Swizzle {
@@ -254,6 +303,11 @@ impl<'function> FunctionLowerer<'function> {
             naga::Expression::Splat { .. } | naga::Expression::Swizzle { .. } => true,
             naga::Expression::Binary { left, .. } => self.expression_is_vector(*left),
             naga::Expression::Unary { expr, .. } => self.expression_is_vector(*expr),
+            naga::Expression::Load { pointer } => {
+                self.uniform_pointer(*pointer).is_ok_and(|(_, ty, _)| {
+                    matches!(self.module.types[ty].inner, naga::TypeInner::Vector { .. })
+                })
+            }
             _ => false,
         }
     }
@@ -267,12 +321,86 @@ impl<'function> FunctionLowerer<'function> {
             naga::Expression::FunctionArgument(index) => {
                 self.source.arguments.get(index as usize)?.ty
             }
+            naga::Expression::Load { pointer } => self.uniform_pointer(pointer).ok()?.1,
             _ => return None,
         };
         let naga::TypeInner::Matrix { columns, rows, .. } = self.module.types[ty].inner else {
             return None;
         };
         Some((vector_size(columns), vector_size(rows)))
+    }
+
+    fn uniform_pointer(
+        &self,
+        handle: naga::Handle<naga::Expression>,
+    ) -> Result<
+        (
+            naga::Handle<naga::GlobalVariable>,
+            naga::Handle<naga::Type>,
+            u32,
+        ),
+        Error,
+    > {
+        match self.source.expressions[handle] {
+            naga::Expression::GlobalVariable(global) => {
+                let variable = &self.module.global_variables[global];
+                if variable.space != naga::AddressSpace::Uniform {
+                    return Err(Error::UnsupportedFeature(format!(
+                        "load from {:?} address space",
+                        variable.space
+                    )));
+                }
+                Ok((global, variable.ty, 0))
+            }
+            naga::Expression::AccessIndex { base, index } => {
+                let (global, ty, offset) = self.uniform_pointer(base)?;
+                let naga::TypeInner::Struct { ref members, .. } = self.module.types[ty].inner
+                else {
+                    return Err(Error::UnsupportedFeature(
+                        "uniform access into a non-struct value".to_owned(),
+                    ));
+                };
+                let member = members.get(index as usize).ok_or_else(|| {
+                    Error::UnsupportedFeature("uniform member index out of bounds".to_owned())
+                })?;
+                let offset = offset.checked_add(member.offset).ok_or_else(|| {
+                    Error::UnsupportedFeature("uniform offset overflow".to_owned())
+                })?;
+                Ok((global, member.ty, offset))
+            }
+            ref pointer => Err(Error::UnsupportedFeature(format!(
+                "load pointer {pointer:?}"
+            ))),
+        }
+    }
+
+    fn load_uniform(&mut self, pointer: naga::Handle<naga::Expression>) -> Result<Value, Error> {
+        let (global, ty, base_offset) = self.uniform_pointer(pointer)?;
+        let target = *self.resources.uniforms.get(&global).ok_or_else(|| {
+            Error::UnsupportedFeature("uniform has no allocated Deko slot".to_owned())
+        })?;
+        let (offsets, kind) = uniform_component_offsets(self.module, ty, base_offset)?;
+        let mut components = Vec::with_capacity(offsets.len());
+        for offset in offsets {
+            let offset = u16::try_from(offset).map_err(|_| {
+                Error::UnsupportedFeature(
+                    "uniform offset exceeds Maxwell constant buffer".to_owned(),
+                )
+            })?;
+            let dst = self.target.ssa_alloc.alloc(RegFile::GPR);
+            self.target.blocks[0].instrs.push(Instr::new(OpLdc {
+                dst: Dst::from(dst),
+                cb: Src::from(CBufRef {
+                    buf: CBuf::Binding(target),
+                    offset,
+                }),
+                offset: Src::ZERO,
+                mode: LdcMode::Indexed,
+                mem_type: MemType::B32,
+            }));
+            components.push(Src::from(dst));
+        }
+        Ok(Value { components, kind })
     }
 
     fn local_value(&mut self, handle: naga::Handle<naga::LocalVariable>) -> Result<Value, Error> {
@@ -473,6 +601,7 @@ impl<'function> FunctionLowerer<'function> {
         let mut callee = Self {
             module: self.module,
             source: &self.module.functions[function],
+            resources: self.resources,
             target,
             values: HashMap::new(),
             locals: HashMap::new(),
@@ -607,6 +736,46 @@ fn type_shape(
         }
         ref inner => Err(Error::UnsupportedFeature(format!(
             "entry-point IO type {inner:?}"
+        ))),
+    }
+}
+
+fn uniform_component_offsets(
+    module: &naga::Module,
+    ty: naga::Handle<naga::Type>,
+    base: u32,
+) -> Result<(Vec<u32>, naga::ScalarKind), Error> {
+    match module.types[ty].inner {
+        naga::TypeInner::Scalar(scalar) if scalar.width == 4 => Ok((vec![base], scalar.kind)),
+        naga::TypeInner::Vector { size, scalar } if scalar.width == 4 => Ok((
+            (0..vector_size(size))
+                .map(|component| base + u32::try_from(component * 4).expect("vector is small"))
+                .collect(),
+            scalar.kind,
+        )),
+        naga::TypeInner::Matrix {
+            columns,
+            rows,
+            scalar,
+        } if scalar.width == 4 => {
+            let columns = vector_size(columns);
+            let rows = vector_size(rows);
+            let row_bytes = u32::try_from(rows * 4).expect("matrix is small");
+            let alignment = if rows == 2 { 8 } else { 16 };
+            let stride = row_bytes.div_ceil(alignment) * alignment;
+            let mut offsets = Vec::with_capacity(columns * rows);
+            for column in 0..columns {
+                for row in 0..rows {
+                    offsets.push(
+                        base + u32::try_from(column).expect("matrix is small") * stride
+                            + u32::try_from(row * 4).expect("matrix is small"),
+                    );
+                }
+            }
+            Ok((offsets, scalar.kind))
+        }
+        ref inner => Err(Error::UnsupportedFeature(format!(
+            "uniform load type {inner:?}"
         ))),
     }
 }
@@ -775,12 +944,13 @@ fn lower_vertex<'sm>(
     module: &naga::Module,
     entry: &naga::EntryPoint,
     sm: &'sm ShaderModelInfo,
+    resources: &ResourceMap,
 ) -> Result<Shader<'sm>, Error> {
     let result = entry.function.result.as_ref().ok_or_else(|| {
         Error::UnsupportedFeature("vertex entry point without a result".to_owned())
     })?;
     let mut info = ShaderInfo::vertex();
-    let mut lowerer = FunctionLowerer::new(module, &entry.function, Vec::new());
+    let mut lowerer = FunctionLowerer::new(module, &entry.function, resources, Vec::new());
     bind_vertex_arguments(module, &mut lowerer, &mut info)?;
     let value = lowerer.return_value()?;
     let mut wrote_position = false;
@@ -842,12 +1012,13 @@ fn lower_fragment<'sm>(
     module: &naga::Module,
     entry: &naga::EntryPoint,
     sm: &'sm ShaderModelInfo,
+    resources: &ResourceMap,
 ) -> Result<Shader<'sm>, Error> {
     let result = entry.function.result.as_ref().ok_or_else(|| {
         Error::UnsupportedFeature("fragment entry point without a result".to_owned())
     })?;
     let mut info = ShaderInfo::fragment(entry.early_depth_test.is_some(), false, false);
-    let mut lowerer = FunctionLowerer::new(module, &entry.function, Vec::new());
+    let mut lowerer = FunctionLowerer::new(module, &entry.function, resources, Vec::new());
     bind_fragment_arguments(module, &mut lowerer, &mut info)?;
     let value = lowerer.return_value()?;
     let mut outputs = Vec::new();

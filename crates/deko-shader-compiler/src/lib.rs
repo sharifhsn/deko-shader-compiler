@@ -205,8 +205,8 @@ impl Compiler {
         }
 
         let sm = deko_nak::ir::ShaderModelInfo::new(53, 64);
-        let shader = lower::lower_entry_point(&module, entry, &sm)?;
-        let binary = deko_nak::compile_ir(shader, None)?;
+        let lowered = lower::lower_entry_point(&module, entry, &sm)?;
+        let binary = deko_nak::compile_ir(lowered.shader, None)?;
 
         let (program_type, entrypoint, payload, code) = match request.stage {
             naga::ShaderStage::Compute => {
@@ -251,7 +251,7 @@ impl Compiler {
             ),
             stage => return Err(Error::UnsupportedFeature(format!("{stage:?} stage"))),
         };
-        let bindings = Vec::new();
+        let bindings = lowered.bindings;
         let dksh = deko_dksh::encode(
             deko_dksh::Program {
                 program_type,
@@ -551,6 +551,39 @@ mod tests {
             container.program.program_type,
             deko_dksh::ProgramType::Vertex
         );
+        assert!(container.code[0x80..].iter().any(|byte| *byte != 0));
+    }
+
+    #[test]
+    fn uniform_matrix_loads_emit_binding_metadata() {
+        let source = r"
+            struct View { transform: mat4x4<f32> }
+            @group(2) @binding(7) var<uniform> view: View;
+            @vertex
+            fn main(@location(0) position: vec3<f32>) -> @builtin(position) vec4<f32> {
+                return view.transform * vec4<f32>(position, 1.0);
+            }
+        ";
+        let artifact = Compiler
+            .compile_wgsl(
+                source,
+                Stage::Vertex,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            artifact.bindings,
+            vec![deko_dksh::Binding {
+                group: 2,
+                binding: 7,
+                target: 0,
+                kind: deko_dksh::BindingKind::Uniform,
+            }]
+        );
+        let container = deko_dksh::parse(&artifact.dksh).unwrap();
+        assert_eq!(container.bindings, artifact.bindings);
         assert!(container.code[0x80..].iter().any(|byte| *byte != 0));
     }
 
