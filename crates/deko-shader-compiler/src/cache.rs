@@ -14,7 +14,7 @@ pub const CACHE_KEY_VERSION: u32 = 1;
 ///
 /// This must be incremented whenever a backend change can alter or invalidate DKSH output without
 /// a package-version change.
-pub const BACKEND_ABI_VERSION: u32 = 19;
+pub const BACKEND_ABI_VERSION: u32 = 20;
 
 /// Deterministic identity of one fully specified shader compilation.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -62,6 +62,14 @@ impl CacheKey {
             None => digest.update([0]),
         }
         digest.update([u8::from(options.zero_initialize_workgroup_memory)]);
+        let mut binding_array_sizes = options.binding_array_sizes.clone();
+        binding_array_sizes.sort_unstable();
+        digest.update((binding_array_sizes.len() as u64).to_le_bytes());
+        for size in binding_array_sizes {
+            digest.update(size.group.to_le_bytes());
+            digest.update(size.binding.to_le_bytes());
+            digest.update(size.count.to_le_bytes());
+        }
         Self(digest.finalize().into())
     }
 

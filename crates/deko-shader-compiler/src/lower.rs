@@ -1,15 +1,15 @@
 use deko_nak::ir::{
-    AtomCmpSrc, AtomOp, AtomType, BasicBlock, CBuf, CBufRef, ChannelMask, Dst, FRndMode,
+    AtomCmpSrc, AtomOp, AtomType, BasicBlock, CBuf, CBufRef, ChannelMask, Dst, FRndMode, FSwzAddOp,
     FloatCmpOp, FloatType, Function, HasRegFile, ImageAccess, ImageDim, Instr, IntCmpOp,
     IntCmpType, IntType, InterpFreq, InterpLoc, Label, LabelAllocator, LdcMode, LogicOp2,
     MemAccess, MemAddrType, MemEvictionPriority, MemOrder, MemScope, MemSpace, MemType, MuFuOp,
     OffsetStride, OpALd, OpASt, OpAtom, OpBar, OpBfe, OpBrk, OpCont, OpExit, OpF2I, OpFAdd,
-    OpFMnMx, OpFMul, OpFSetP, OpFlo, OpI2F, OpIAdd2, OpIAdd2X, OpIMad, OpIMnMx, OpIMul, OpISetP,
-    OpIpa, OpKill, OpLd, OpLdc, OpLop2, OpMemBar, OpMov, OpMuFu, OpPBk, OpPCnt, OpPSetP, OpPhiDsts,
-    OpPhiSrcs, OpRegOut, OpS2R, OpSel, OpShfl, OpShl, OpShr, OpSt, OpSuLd, OpSuSt, OpTex, OpTld,
-    OpTld4, OpTxq, Phi, Pred, PredRef, PredSetOp, RegFile, SSARef, SSAValue, Shader, ShaderInfo,
-    ShaderIoInfo, ShaderModelInfo, ShaderStageInfo, ShflOp, Src, SrcMod, SrcRef, SrcSwizzle,
-    TexDerivMode, TexDim, TexLodMode, TexOffsetMode, TexQuery, TexRef,
+    OpFMnMx, OpFMul, OpFSetP, OpFSwzAdd, OpFlo, OpI2F, OpIAdd2, OpIAdd2X, OpIMad, OpIMnMx, OpIMul,
+    OpISetP, OpIpa, OpKill, OpLd, OpLdc, OpLop2, OpMemBar, OpMov, OpMuFu, OpPBk, OpPCnt, OpPSetP,
+    OpPhiDsts, OpPhiSrcs, OpRegOut, OpS2R, OpSel, OpShfl, OpShl, OpShr, OpSt, OpSuLd, OpSuSt,
+    OpTex, OpTld, OpTld4, OpTxq, Phi, Pred, PredRef, PredSetOp, RegFile, SSARef, SSAValue, Shader,
+    ShaderInfo, ShaderIoInfo, ShaderModelInfo, ShaderStageInfo, ShflOp, Src, SrcMod, SrcRef,
+    SrcSwizzle, TexDerivMode, TexDim, TexLodMode, TexOffsetMode, TexQuery, TexRef,
 };
 use deko_nak::sph::PixelImap;
 use std::collections::{HashMap, HashSet};
@@ -75,8 +75,9 @@ pub(crate) fn lower_entry_point<'sm>(
     module: &naga::Module,
     entry: &naga::EntryPoint,
     sm: &'sm ShaderModelInfo,
+    options: &crate::Options,
 ) -> Result<LoweredShader<'sm>, Error> {
-    let resources = resource_map(module, entry)?;
+    let resources = resource_map(module, entry, options)?;
     let shader = match entry.stage {
         naga::ShaderStage::Compute => lower_compute(module, entry, sm, &resources),
         naga::ShaderStage::Vertex => lower_vertex(module, entry, sm, &resources),
@@ -90,7 +91,11 @@ pub(crate) fn lower_entry_point<'sm>(
 }
 
 #[allow(clippy::too_many_lines)]
-fn resource_map(module: &naga::Module, entry: &naga::EntryPoint) -> Result<ResourceMap, Error> {
+fn resource_map(
+    module: &naga::Module,
+    entry: &naga::EntryPoint,
+    options: &crate::Options,
+) -> Result<ResourceMap, Error> {
     let reachable_functions = reachable_functions(module, &entry.function);
     let used_globals = used_globals(module, &entry.function, &reachable_functions);
     let stage = entry.stage;
@@ -192,8 +197,9 @@ fn resource_map(module: &naga::Module, entry: &naga::EntryPoint) -> Result<Resou
         .global_variables
         .iter()
         .filter_map(|(handle, variable)| {
-            (used_globals.contains(&handle) && sampled_image_count(module, handle).is_some())
-                .then_some((handle, variable.binding.as_ref()))
+            (used_globals.contains(&handle)
+                && sampled_image_count(module, handle, options).is_some())
+            .then_some((handle, variable.binding.as_ref()))
         })
         .collect::<Vec<_>>();
     textures.sort_by_key(|(_, binding)| binding.map(|binding| (binding.group, binding.binding)));
@@ -202,7 +208,7 @@ fn resource_map(module: &naga::Module, entry: &naga::EntryPoint) -> Result<Resou
     let mut next_image_target = 0_u16;
     let mut next_sampler_target = 0_u16;
     for &(handle, binding) in &textures {
-        let count = sampled_image_count(module, handle).expect("filtered above");
+        let count = sampled_image_count(module, handle, options).expect("filtered above");
         if count == 1 {
             continue;
         }
@@ -256,13 +262,13 @@ fn resource_map(module: &naga::Module, entry: &naga::EntryPoint) -> Result<Resou
             sampler_binding.group,
             sampler_binding.binding,
         );
-        let image_count = sampled_image_count(module, image).ok_or_else(|| {
+        let image_count = sampled_image_count(module, image, options).ok_or_else(|| {
             Error::UnsupportedFeature(format!(
                 "sampled binding is not a texture: {:?}",
                 module.types[module.global_variables[image].ty].inner
             ))
         })?;
-        let sampler_count = sampler_binding_count(module, sampler).ok_or_else(|| {
+        let sampler_count = sampler_binding_count(module, sampler, options).ok_or_else(|| {
             Error::UnsupportedFeature("sampled binding is not a sampler".to_owned())
         })?;
         if image_count > 1 || sampler_count > 1 {
@@ -357,7 +363,7 @@ fn resource_map(module: &naga::Module, entry: &naga::EntryPoint) -> Result<Resou
             Error::UnsupportedFeature("texture global without a resource binding".to_owned())
         })?;
         let key = (binding.group, binding.binding);
-        let count = sampled_image_count(module, handle).expect("filtered above");
+        let count = sampled_image_count(module, handle, options).expect("filtered above");
         let (range, first_alias) = if let Some(range) = texture_targets.get(&key) {
             (*range, false)
         } else {
@@ -421,6 +427,7 @@ fn resource_map(module: &naga::Module, entry: &naga::EntryPoint) -> Result<Resou
 fn binding_resource_type(
     module: &naga::Module,
     global: naga::Handle<naga::GlobalVariable>,
+    options: &crate::Options,
 ) -> Result<(naga::Handle<naga::Type>, u16), Error> {
     let ty = module.global_variables[global].ty;
     let naga::TypeInner::BindingArray { base, size } = module.types[ty].inner else {
@@ -430,7 +437,29 @@ fn binding_resource_type(
         naga::ArraySize::Constant(size) => u16::try_from(size.get()).map_err(|_| {
             Error::UnsupportedFeature("resource binding array exceeds u16".to_owned())
         })?,
-        naga::ArraySize::Dynamic => 64,
+        naga::ArraySize::Dynamic => {
+            let binding = module.global_variables[global]
+                .binding
+                .as_ref()
+                .ok_or_else(|| {
+                    Error::UnsupportedFeature("resource binding array without a binding".to_owned())
+                })?;
+            let count = options
+                .binding_array_sizes
+                .iter()
+                .rev()
+                .find(|size| size.group == binding.group && size.binding == binding.binding)
+                .ok_or_else(|| {
+                    Error::UnsupportedFeature(format!(
+                        "runtime-sized binding array @group({}) @binding({}) requires its pipeline-layout descriptor count",
+                        binding.group, binding.binding
+                    ))
+                })?
+                .count;
+            u16::try_from(count).map_err(|_| {
+                Error::UnsupportedFeature("resource binding array exceeds u16".to_owned())
+            })?
+        }
         naga::ArraySize::Pending(_) => {
             return Err(Error::UnsupportedFeature(
                 "unresolved resource binding-array size".to_owned(),
@@ -440,11 +469,23 @@ fn binding_resource_type(
     Ok((base, count))
 }
 
+fn binding_resource_base_type(
+    module: &naga::Module,
+    global: naga::Handle<naga::GlobalVariable>,
+) -> naga::Handle<naga::Type> {
+    let ty = module.global_variables[global].ty;
+    match module.types[ty].inner {
+        naga::TypeInner::BindingArray { base, .. } => base,
+        _ => ty,
+    }
+}
+
 fn sampled_image_count(
     module: &naga::Module,
     global: naga::Handle<naga::GlobalVariable>,
+    options: &crate::Options,
 ) -> Option<u16> {
-    let (ty, count) = binding_resource_type(module, global).ok()?;
+    let (ty, count) = binding_resource_type(module, global, options).ok()?;
     matches!(
         module.types[ty].inner,
         naga::TypeInner::Image {
@@ -458,8 +499,9 @@ fn sampled_image_count(
 fn sampler_binding_count(
     module: &naga::Module,
     global: naga::Handle<naga::GlobalVariable>,
+    options: &crate::Options,
 ) -> Option<u16> {
-    let (ty, count) = binding_resource_type(module, global).ok()?;
+    let (ty, count) = binding_resource_type(module, global, options).ok()?;
     matches!(module.types[ty].inner, naga::TypeInner::Sampler { .. }).then_some(count)
 }
 
@@ -830,6 +872,7 @@ struct FunctionLowerer<'function> {
     values: HashMap<naga::Handle<naga::Expression>, Value>,
     locals: HashMap<naga::Handle<naga::LocalVariable>, Value>,
     arguments: Vec<Value>,
+    resource_arguments: HashMap<u32, naga::Handle<naga::GlobalVariable>>,
     early_returns: Vec<(Src, Value)>,
 }
 
@@ -860,6 +903,7 @@ impl<'function> FunctionLowerer<'function> {
             values: HashMap::new(),
             locals: HashMap::new(),
             arguments,
+            resource_arguments: HashMap::new(),
             early_returns: Vec::new(),
         }
     }
@@ -1035,6 +1079,7 @@ impl<'function> FunctionLowerer<'function> {
                 arg2,
                 arg3,
             } => self.math(*fun, *arg, *arg1, *arg2, *arg3)?,
+            naga::Expression::Derivative { axis, expr, .. } => self.derivative(*axis, *expr)?,
             naga::Expression::Relational { fun, argument } => self.relational(*fun, *argument)?,
             naga::Expression::As {
                 expr,
@@ -1165,24 +1210,35 @@ impl<'function> FunctionLowerer<'function> {
         image: naga::Handle<naga::Expression>,
         query: naga::ImageQuery,
     ) -> Result<Value, Error> {
-        let image = self.global_expression(image, "texture query")?;
-        let target = self
-            .resources
-            .textures
-            .get(&image)
-            .map(|range| range.target)
-            .or_else(|| self.resources.storage_textures.get(&image).copied())
-            .ok_or_else(|| {
-                Error::UnsupportedFeature("queried texture has no Deko target".to_owned())
+        let (image, binding_index) = self.sampled_resource(image, "texture query")?;
+        let (texture_reference, bindless_target) = if let Some(binding_index) = binding_index {
+            let range = *self.resources.textures.get(&image).ok_or_else(|| {
+                Error::UnsupportedFeature("queried texture array has no Deko target".to_owned())
             })?;
-        let (image_type, _) = binding_resource_type(self.module, image)?;
+            (
+                TexRef::Bindless,
+                Some(self.resource_array_target(range, Some(binding_index))?),
+            )
+        } else {
+            let target = self
+                .resources
+                .textures
+                .get(&image)
+                .map(|range| range.target)
+                .or_else(|| self.resources.storage_textures.get(&image).copied())
+                .ok_or_else(|| {
+                    Error::UnsupportedFeature("queried texture has no Deko target".to_owned())
+                })?;
+            (TexRef::Bound(target), None)
+        };
+        let image_type = binding_resource_base_type(self.module, image);
         let naga::TypeInner::Image { dim: dimension, .. } = self.module.types[image_type].inner
         else {
             return Err(Error::UnsupportedFeature(
                 "queried resource is not an image".to_owned(),
             ));
         };
-        let (level, components) = match query {
+        let (level, components, native_query, channel_mask) = match query {
             naga::ImageQuery::Size { level } => {
                 let level = match level {
                     Some(level) => self.expression(level)?,
@@ -1203,23 +1259,51 @@ impl<'function> FunctionLowerer<'function> {
                     naga::ImageDimension::D2 | naga::ImageDimension::Cube => 2,
                     naga::ImageDimension::D3 => 3,
                 };
-                (level, components)
+                (
+                    level,
+                    components,
+                    TexQuery::Dimension,
+                    ChannelMask::for_comps(components),
+                )
             }
-            query => {
+            naga::ImageQuery::NumSamples => (
+                Value {
+                    components: vec![Src::ZERO],
+                    kind: naga::ScalarKind::Uint,
+                },
+                1,
+                TexQuery::TextureType,
+                ChannelMask::new(1 << 2),
+            ),
+            naga::ImageQuery::NumLevels => (
+                Value {
+                    components: vec![Src::ZERO],
+                    kind: naga::ScalarKind::Uint,
+                },
+                1,
+                TexQuery::Dimension,
+                ChannelMask::new(1 << 3),
+            ),
+            query @ naga::ImageQuery::NumLayers => {
                 return Err(Error::UnsupportedFeature(format!(
                     "texture query {query:?}"
                 )));
             }
         };
-        let source = self.materialize(level)?;
+        let mut source = bindless_target.unwrap_or(Value {
+            components: Vec::new(),
+            kind: naga::ScalarKind::Uint,
+        });
+        source.components.extend(level.components);
+        let source = self.materialize(source)?;
         let destination = self.target.ssa_alloc.alloc_vec(RegFile::GPR, components);
         self.emit(Instr::new(OpTxq {
             dsts: [Dst::from(destination.clone()), Dst::None],
-            tex: TexRef::Bound(target),
+            tex: texture_reference,
             src: Src::from(source),
-            query: TexQuery::Dimension,
+            query: native_query,
             nodep: false,
-            channel_mask: ChannelMask::for_comps(components),
+            channel_mask,
         }));
         Ok(Value {
             components: destination.iter().copied().map(Src::from).collect(),
@@ -1647,8 +1731,7 @@ impl<'function> FunctionLowerer<'function> {
         depth_ref: Option<naga::Handle<naga::Expression>>,
         clamp_to_edge: bool,
     ) -> Result<Value, Error> {
-        if (offset.is_some() && gather.is_none())
-            || clamp_to_edge
+        if clamp_to_edge
             || matches!(level, naga::SampleLevel::Gradient { .. })
             || (gather.is_some() && !matches!(level, naga::SampleLevel::Zero))
         {
@@ -1816,6 +1899,12 @@ impl<'function> FunctionLowerer<'function> {
             }
             naga::SampleLevel::Gradient { .. } => unreachable!("rejected above"),
         };
+        let offset_mode = if let Some(offset) = offset {
+            auxiliary.push(self.pack_texture_offset(offset)?);
+            TexOffsetMode::AddOffI
+        } else {
+            TexOffsetMode::None
+        };
         auxiliary.extend(depth_reference);
         let coordinate = self.materialize(coordinate)?;
         let auxiliary = if auxiliary.is_empty() {
@@ -1840,7 +1929,7 @@ impl<'function> FunctionLowerer<'function> {
             lod_mode,
             deriv_mode: TexDerivMode::Auto,
             z_cmpr: depth_ref.is_some(),
-            offset_mode: TexOffsetMode::None,
+            offset_mode,
             mem_eviction_priority: MemEvictionPriority::Normal,
             nodep: false,
             channel_mask: ChannelMask::for_comps(output_components),
@@ -1910,6 +1999,13 @@ impl<'function> FunctionLowerer<'function> {
     ) -> Result<naga::Handle<naga::GlobalVariable>, Error> {
         match self.source.expressions[handle] {
             naga::Expression::GlobalVariable(global) => Ok(global),
+            naga::Expression::FunctionArgument(index) => {
+                self.resource_arguments.get(&index).copied().ok_or_else(|| {
+                    Error::UnsupportedFeature(format!(
+                        "{description} function argument {index} has no resource identity"
+                    ))
+                })
+            }
             ref expression => Err(Error::UnsupportedFeature(format!(
                 "{description} expression {expression:?}"
             ))),
@@ -1923,6 +2019,16 @@ impl<'function> FunctionLowerer<'function> {
     ) -> Result<(naga::Handle<naga::GlobalVariable>, Option<Value>), Error> {
         match self.source.expressions[handle] {
             naga::Expression::GlobalVariable(global) => Ok((global, None)),
+            naga::Expression::FunctionArgument(index) => self
+                .resource_arguments
+                .get(&index)
+                .copied()
+                .map(|global| (global, None))
+                .ok_or_else(|| {
+                    Error::UnsupportedFeature(format!(
+                        "{description} function argument {index} has no resource identity"
+                    ))
+                }),
             naga::Expression::Access { base, index } => {
                 let (global, previous) = self.sampled_resource(base, description)?;
                 if previous.is_some() {
@@ -2132,6 +2238,11 @@ impl<'function> FunctionLowerer<'function> {
                 };
                 self.binary(naga::BinaryOperator::Multiply, &logarithm, &scale, None)
             }
+            naga::MathFunction::Atan => self.float_atan(&value),
+            naga::MathFunction::Atan2 => {
+                let x = self.math_argument(fun, arg1, 1)?;
+                self.float_atan2(&value, &x)
+            }
             naga::MathFunction::Pow => {
                 let exponent = self.math_argument(fun, arg1, 1)?;
                 let logarithm = self.float_mufu(value, MuFuOp::Log2)?;
@@ -2226,6 +2337,82 @@ impl<'function> FunctionLowerer<'function> {
             }
             _ => Err(Error::UnsupportedFeature(format!("math function {fun:?}"))),
         }
+    }
+
+    fn derivative(
+        &mut self,
+        axis: naga::DerivativeAxis,
+        expression: naga::Handle<naga::Expression>,
+    ) -> Result<Value, Error> {
+        let value = self.expression(expression)?;
+        if value.kind != naga::ScalarKind::Float || value.components.is_empty() {
+            return Err(Error::UnsupportedFeature(
+                "derivative argument is not a float value".to_owned(),
+            ));
+        }
+        let sources = self.materialize_components(value);
+        let mut components = Vec::with_capacity(sources.len());
+        for source in sources {
+            let mut emit_axis = |lane, ops| {
+                let shuffled = self.target.ssa_alloc.alloc(RegFile::GPR);
+                self.emit(Instr::new(OpShfl {
+                    dst: Dst::from(shuffled),
+                    in_bounds: Dst::None,
+                    src: Src::from(source),
+                    lane: Src::from(lane),
+                    c: Src::from(0x3_u32 | (0x1c_u32 << 8)),
+                    op: ShflOp::Bfly,
+                }));
+                let derivative = self.target.ssa_alloc.alloc(RegFile::GPR);
+                self.emit(Instr::new(OpFSwzAdd {
+                    dst: Dst::from(derivative),
+                    srcs: [Src::from(shuffled), Src::from(source)],
+                    rnd_mode: FRndMode::NearestEven,
+                    ftz: false,
+                    deriv_mode: TexDerivMode::Auto,
+                    ops,
+                }));
+                derivative
+            };
+            let horizontal = || {
+                [
+                    FSwzAddOp::SubLeft,
+                    FSwzAddOp::SubRight,
+                    FSwzAddOp::SubLeft,
+                    FSwzAddOp::SubRight,
+                ]
+            };
+            let vertical = || {
+                [
+                    FSwzAddOp::SubLeft,
+                    FSwzAddOp::SubLeft,
+                    FSwzAddOp::SubRight,
+                    FSwzAddOp::SubRight,
+                ]
+            };
+            let result = match axis {
+                naga::DerivativeAxis::X => emit_axis(1_u32, horizontal()),
+                naga::DerivativeAxis::Y => emit_axis(2_u32, vertical()),
+                naga::DerivativeAxis::Width => {
+                    let dx = emit_axis(1_u32, horizontal());
+                    let dy = emit_axis(2_u32, vertical());
+                    let width = self.target.ssa_alloc.alloc(RegFile::GPR);
+                    self.emit(Instr::new(OpFAdd {
+                        dst: Dst::from(width),
+                        srcs: [Src::from(dx).fabs(), Src::from(dy).fabs()],
+                        saturate: false,
+                        rnd_mode: FRndMode::NearestEven,
+                        ftz: false,
+                    }));
+                    width
+                }
+            };
+            components.push(Src::from(result));
+        }
+        Ok(Value {
+            components,
+            kind: naga::ScalarKind::Float,
+        })
     }
 
     fn relational(
@@ -2742,9 +2929,13 @@ impl<'function> FunctionLowerer<'function> {
             || left.components.is_empty()
             || left.components.len() != right.components.len()
         {
-            return Err(Error::UnsupportedFeature(
-                "dot operands must be equally-sized float vectors".to_owned(),
-            ));
+            return Err(Error::UnsupportedFeature(format!(
+                "dot operands must be equally-sized float vectors (left {:?}/{}, right {:?}/{})",
+                left.kind,
+                left.components.len(),
+                right.kind,
+                right.components.len()
+            )));
         }
         let mut sum = None;
         for (left, right) in left.components.iter().zip(&right.components) {
@@ -2922,6 +3113,101 @@ impl<'function> FunctionLowerer<'function> {
         })
     }
 
+    fn float_atan(&mut self, value: &Value) -> Result<Value, Error> {
+        self.float_atan2(
+            value,
+            &Value {
+                components: vec![Src::from(1.0_f32)],
+                kind: naga::ScalarKind::Float,
+            },
+        )
+    }
+
+    fn float_atan2(&mut self, y: &Value, x: &Value) -> Result<Value, Error> {
+        if y.kind != naga::ScalarKind::Float || x.kind != naga::ScalarKind::Float {
+            return Err(Error::UnsupportedFeature(
+                "atan2 arguments are not float values".to_owned(),
+            ));
+        }
+        let zero = Value {
+            components: vec![Src::from(0.0_f32)],
+            kind: naga::ScalarKind::Float,
+        };
+        let abs_x = Value {
+            components: x.components.iter().cloned().map(Src::fabs).collect(),
+            kind: naga::ScalarKind::Float,
+        };
+        let abs_y = Value {
+            components: y.components.iter().cloned().map(Src::fabs).collect(),
+            kind: naga::ScalarKind::Float,
+        };
+        let minimum = self.float_minmax(&abs_x, &abs_y, true)?;
+        let maximum = self.float_minmax(&abs_x, &abs_y, false)?;
+        let ratio = self.binary(naga::BinaryOperator::Divide, &minimum, &maximum, None)?;
+        let ratio_squared = self.binary(naga::BinaryOperator::Multiply, &ratio, &ratio, None)?;
+
+        // Rajan et al.'s minimax atan approximation on [0, 1], followed by
+        // the standard atan2 quadrant reconstruction.
+        let mut polynomial = Value {
+            components: vec![Src::from(-0.046_496_473_f32)],
+            kind: naga::ScalarKind::Float,
+        };
+        for coefficient in [0.159_314_22_f32, -0.327_622_77_f32] {
+            polynomial = self.binary(
+                naga::BinaryOperator::Multiply,
+                &polynomial,
+                &ratio_squared,
+                None,
+            )?;
+            polynomial = self.binary(
+                naga::BinaryOperator::Add,
+                &polynomial,
+                &Value {
+                    components: vec![Src::from(coefficient)],
+                    kind: naga::ScalarKind::Float,
+                },
+                None,
+            )?;
+        }
+        polynomial = self.binary(
+            naga::BinaryOperator::Multiply,
+            &polynomial,
+            &ratio_squared,
+            None,
+        )?;
+        polynomial = self.binary(naga::BinaryOperator::Multiply, &polynomial, &ratio, None)?;
+        let mut angle = self.binary(naga::BinaryOperator::Add, &polynomial, &ratio, None)?;
+
+        let y_dominant = self.binary(naga::BinaryOperator::Greater, &abs_y, &abs_x, None)?;
+        let complement = self.binary(
+            naga::BinaryOperator::Subtract,
+            &Value {
+                components: vec![Src::from(std::f32::consts::FRAC_PI_2)],
+                kind: naga::ScalarKind::Float,
+            },
+            &angle,
+            None,
+        )?;
+        angle = self.select(&y_dominant, complement, angle)?;
+        let x_negative = self.binary(naga::BinaryOperator::Less, x, &zero, None)?;
+        let opposite = self.binary(
+            naga::BinaryOperator::Subtract,
+            &Value {
+                components: vec![Src::from(std::f32::consts::PI)],
+                kind: naga::ScalarKind::Float,
+            },
+            &angle,
+            None,
+        )?;
+        angle = self.select(&x_negative, opposite, angle)?;
+        let y_negative = self.binary(naga::BinaryOperator::Less, y, &zero, None)?;
+        let negated = Value {
+            components: angle.components.iter().cloned().map(Src::fneg).collect(),
+            kind: naga::ScalarKind::Float,
+        };
+        self.select(&y_negative, negated, angle)
+    }
+
     fn float_mufu(&mut self, value: Value, op: MuFuOp) -> Result<Value, Error> {
         if value.kind != naga::ScalarKind::Float {
             return Err(Error::UnsupportedFeature(
@@ -3030,6 +3316,34 @@ impl<'function> FunctionLowerer<'function> {
                 self.local_pointer(pointer).ok().map(|(_, ty, _)| ty)
             }
             naga::Expression::Load { pointer } => self.pointer_type(pointer),
+            naga::Expression::Math {
+                fun: naga::MathFunction::Transpose,
+                arg,
+                ..
+            } => {
+                let input = self.expression_type(arg)?;
+                let naga::TypeInner::Matrix {
+                    columns,
+                    rows,
+                    scalar,
+                } = self.module.types[input].inner
+                else {
+                    return None;
+                };
+                self.module.types.iter().find_map(|(handle, candidate)| {
+                    matches!(
+                        candidate.inner,
+                        naga::TypeInner::Matrix {
+                            columns: candidate_columns,
+                            rows: candidate_rows,
+                            scalar: candidate_scalar,
+                        } if candidate_columns == rows
+                            && candidate_rows == columns
+                            && candidate_scalar == scalar
+                    )
+                    .then_some(handle)
+                })
+            }
             _ => None,
         }
     }
@@ -3289,7 +3603,10 @@ impl<'function> FunctionLowerer<'function> {
                 naga::SwizzleComponent::W => 3,
             };
             components.push(vector.components.get(index).cloned().ok_or_else(|| {
-                Error::UnsupportedFeature("swizzle component out of bounds".to_owned())
+                Error::UnsupportedFeature(format!(
+                    "swizzle component {component:?} out of bounds for expression {handle:?} with {} components",
+                    vector.components.len()
+                ))
             })?);
         }
         Ok(Value {
@@ -3358,7 +3675,10 @@ impl<'function> FunctionLowerer<'function> {
         match self.source.expressions[handle] {
             naga::Expression::GlobalVariable(global) => {
                 let variable = &self.module.global_variables[global];
-                if variable.space != naga::AddressSpace::Uniform {
+                if !matches!(
+                    variable.space,
+                    naga::AddressSpace::Uniform | naga::AddressSpace::Immediate
+                ) {
                     return Err(Error::UnsupportedFeature(format!(
                         "load from {:?} address space",
                         variable.space
@@ -3497,9 +3817,17 @@ impl<'function> FunctionLowerer<'function> {
 
     fn load_uniform(&mut self, pointer: naga::Handle<naga::Expression>) -> Result<Value, Error> {
         let (global, ty, base_offset, dynamic_offset) = self.uniform_pointer(pointer)?;
-        let target = *self.resources.uniforms.get(&global).ok_or_else(|| {
-            Error::UnsupportedFeature("uniform has no allocated Deko slot".to_owned())
-        })?;
+        let target = if self.module.global_variables[global].space == naga::AddressSpace::Immediate
+        {
+            // wgpu-hal binds immediate data at Deko uniform slot 15. Maxwell's
+            // shader-visible constant-buffer index includes Deko's c0/c1
+            // driver reservation, hence c17 here.
+            15
+        } else {
+            *self.resources.uniforms.get(&global).ok_or_else(|| {
+                Error::UnsupportedFeature("uniform has no allocated Deko slot".to_owned())
+            })?
+        };
         let (offsets, kind) = uniform_component_offsets(self.module, ty, base_offset)?;
         let mut components = Vec::with_capacity(offsets.len());
         for offset in offsets {
@@ -4812,7 +5140,13 @@ impl<'function> FunctionLowerer<'function> {
         left_matrix: Option<(usize, usize)>,
         right_matrix: Option<(usize, usize)>,
     ) -> Result<Value, Error> {
-        if left.kind != right.kind {
+        let mixed_integer_shift =
+            matches!(
+                op,
+                naga::BinaryOperator::ShiftLeft | naga::BinaryOperator::ShiftRight
+            ) && matches!(left.kind, naga::ScalarKind::Sint | naga::ScalarKind::Uint)
+                && matches!(right.kind, naga::ScalarKind::Sint | naga::ScalarKind::Uint);
+        if left.kind != right.kind && !mixed_integer_shift {
             return Err(Error::UnsupportedFeature(format!(
                 "{op:?} for {:?} and {:?}",
                 left.kind, right.kind
@@ -4839,6 +5173,12 @@ impl<'function> FunctionLowerer<'function> {
                 }
                 _ => {}
             }
+        }
+        if op == naga::BinaryOperator::Modulo && left.kind == naga::ScalarKind::Float {
+            let quotient = self.binary(naga::BinaryOperator::Divide, left, right, left_matrix)?;
+            let quotient = self.float_round(quotient, FRndMode::Zero)?;
+            let product = self.binary(naga::BinaryOperator::Multiply, &quotient, right, None)?;
+            return self.binary(naga::BinaryOperator::Subtract, left, &product, left_matrix);
         }
         let width = left.components.len().max(right.components.len());
         if (left.components.len() != 1 && left.components.len() != width)
@@ -5523,7 +5863,13 @@ impl<'function> FunctionLowerer<'function> {
     }
 
     fn call_argument(&mut self, argument: naga::Handle<naga::Expression>) -> Result<Value, Error> {
-        if self.pointer_is_argument(argument) {
+        if self.resource_argument(argument).is_some() {
+            // Native resource identity is carried separately from SSA values.
+            Ok(Value {
+                components: vec![Src::ZERO],
+                kind: naga::ScalarKind::Uint,
+            })
+        } else if self.pointer_is_argument(argument) {
             self.load_argument_pointer(argument)
         } else if self.pointer_is_local(argument) {
             self.load_local_pointer(argument)
@@ -5532,9 +5878,56 @@ impl<'function> FunctionLowerer<'function> {
         }
     }
 
+    fn resource_argument(
+        &self,
+        argument: naga::Handle<naga::Expression>,
+    ) -> Option<naga::Handle<naga::GlobalVariable>> {
+        match self.source.expressions[argument] {
+            naga::Expression::GlobalVariable(global) => Some(global),
+            naga::Expression::FunctionArgument(index) => {
+                self.resource_arguments.get(&index).copied()
+            }
+            _ => None,
+        }
+    }
+
+    fn call_resource_arguments(
+        &self,
+        function: naga::Handle<naga::Function>,
+        arguments: &[naga::Handle<naga::Expression>],
+    ) -> HashMap<u32, naga::Handle<naga::GlobalVariable>> {
+        arguments
+            .iter()
+            .zip(&self.module.functions[function].arguments)
+            .enumerate()
+            .filter_map(|(index, (argument, parameter))| {
+                matches!(
+                    self.module.types[parameter.ty].inner,
+                    naga::TypeInner::Image { .. }
+                        | naga::TypeInner::Sampler { .. }
+                        | naga::TypeInner::BindingArray { .. }
+                )
+                .then(|| {
+                    u32::try_from(index)
+                        .ok()
+                        .zip(self.resource_argument(*argument))
+                })
+                .flatten()
+            })
+            .collect()
+    }
+
     fn block_is_single_break(block: &naga::Block) -> bool {
         let mut statements = block.iter();
         matches!(statements.next(), Some(naga::Statement::Break)) && statements.next().is_none()
+    }
+
+    fn continue_prefix(block: &naga::Block) -> Option<naga::Block> {
+        let continue_index = block
+            .iter()
+            .rposition(|statement| !matches!(statement, naga::Statement::Emit(_)))?;
+        matches!(block[continue_index], naga::Statement::Continue)
+            .then(|| naga::Block::from_vec(block[..continue_index].to_vec()))
     }
 
     fn block_return_value(block: &naga::Block) -> Option<naga::Handle<naga::Expression>> {
@@ -5809,7 +6202,7 @@ impl<'function> FunctionLowerer<'function> {
 
     #[allow(clippy::too_many_lines)]
     fn execute_statements(&mut self, body: &naga::Block) -> Result<Option<Value>, Error> {
-        for statement in body {
+        for (statement_index, statement) in body.iter().enumerate() {
             match statement {
                 naga::Statement::Return {
                     value: Some(handle),
@@ -5822,11 +6215,12 @@ impl<'function> FunctionLowerer<'function> {
                     arguments,
                     result: Some(call_result),
                 } => {
+                    let resource_arguments = self.call_resource_arguments(*function, arguments);
                     let arguments = arguments
                         .iter()
                         .map(|argument| self.call_argument(*argument))
                         .collect::<Result<Vec<_>, _>>()?;
-                    let value = self.inline_call(*function, arguments)?;
+                    let value = self.inline_call(*function, arguments, resource_arguments)?;
                     self.values.insert(*call_result, value);
                 }
                 naga::Statement::Call {
@@ -5834,11 +6228,13 @@ impl<'function> FunctionLowerer<'function> {
                     arguments,
                     result: None,
                 } => {
+                    let resource_arguments = self.call_resource_arguments(*function, arguments);
                     let argument_values = arguments
                         .iter()
                         .map(|argument| self.call_argument(*argument))
                         .collect::<Result<Vec<_>, _>>()?;
-                    let updated_arguments = self.inline_void_call(*function, argument_values)?;
+                    let updated_arguments =
+                        self.inline_void_call(*function, argument_values, resource_arguments)?;
                     for ((argument, parameter), value) in arguments
                         .iter()
                         .zip(&self.module.functions[*function].arguments)
@@ -5958,6 +6354,26 @@ impl<'function> FunctionLowerer<'function> {
                     reject,
                 } => {
                     let condition = self.expression(*condition)?;
+                    if !self.loops.is_empty()
+                        && reject.is_empty()
+                        && let Some(prefix) = Self::continue_prefix(accept)
+                    {
+                        let remainder = naga::Block::from_vec(body[statement_index + 1..].to_vec());
+                        if let Some(value) = self.conditional(&condition, &prefix, &remainder)? {
+                            return Ok(Some(self.finalize_return(value)?));
+                        }
+                        return Ok(None);
+                    }
+                    if !self.loops.is_empty()
+                        && accept.is_empty()
+                        && let Some(prefix) = Self::continue_prefix(reject)
+                    {
+                        let remainder = naga::Block::from_vec(body[statement_index + 1..].to_vec());
+                        if let Some(value) = self.conditional(&condition, &remainder, &prefix)? {
+                            return Ok(Some(self.finalize_return(value)?));
+                        }
+                        return Ok(None);
+                    }
                     if self.loops.len() > self.loop_base_depth && reject.is_empty() {
                         if let Some(value) = Self::block_return_value(accept) {
                             let value = self.expression(value)?;
@@ -6171,6 +6587,7 @@ impl<'function> FunctionLowerer<'function> {
         &mut self,
         function: naga::Handle<naga::Function>,
         arguments: Vec<Value>,
+        resource_arguments: HashMap<u32, naga::Handle<naga::GlobalVariable>>,
     ) -> Result<Value, Error> {
         let target = std::mem::replace(&mut self.target, Function::single_block(Vec::new()));
         let loop_base_depth = self.loops.len();
@@ -6188,6 +6605,7 @@ impl<'function> FunctionLowerer<'function> {
             values: HashMap::new(),
             locals: HashMap::new(),
             arguments,
+            resource_arguments,
             early_returns: Vec::new(),
         };
         let result = callee.return_value().map_err(|error| match error {
@@ -6210,6 +6628,7 @@ impl<'function> FunctionLowerer<'function> {
         &mut self,
         function: naga::Handle<naga::Function>,
         arguments: Vec<Value>,
+        resource_arguments: HashMap<u32, naga::Handle<naga::GlobalVariable>>,
     ) -> Result<Vec<Value>, Error> {
         let target = std::mem::replace(&mut self.target, Function::single_block(Vec::new()));
         let loop_base_depth = self.loops.len();
@@ -6227,6 +6646,7 @@ impl<'function> FunctionLowerer<'function> {
             values: HashMap::new(),
             locals: HashMap::new(),
             arguments,
+            resource_arguments,
             early_returns: Vec::new(),
         };
         let body = callee.source.body.clone();
@@ -6354,7 +6774,7 @@ fn module_image_type(
     module: &naga::Module,
     global: naga::Handle<naga::GlobalVariable>,
 ) -> Result<(naga::ImageDimension, bool, naga::ScalarKind), Error> {
-    let (ty, _) = binding_resource_type(module, global)?;
+    let ty = binding_resource_base_type(module, global);
     let naga::TypeInner::Image {
         dim,
         arrayed,

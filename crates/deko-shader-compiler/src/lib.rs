@@ -54,6 +54,21 @@ pub enum Robustness {
     PreLowered,
 }
 
+/// Concrete descriptor count for a runtime-sized WGSL resource binding array.
+///
+/// WGSL deliberately omits the size of `binding_array<T>`. The size is supplied by the
+/// pipeline's bind-group layout, so callers compiling such a module must forward that layout
+/// information here.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct BindingArraySize {
+    /// Bind-group index.
+    pub group: u32,
+    /// Binding index within the group.
+    pub binding: u32,
+    /// Number of descriptors in the binding array.
+    pub count: u32,
+}
+
 /// Options that affect generated native code and therefore the cache key.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Options {
@@ -65,6 +80,8 @@ pub struct Options {
     pub multiview_mask: Option<u32>,
     /// Whether workgroup-scoped memory must be initialized to zero.
     pub zero_initialize_workgroup_memory: bool,
+    /// Pipeline-layout sizes for runtime-sized resource binding arrays.
+    pub binding_array_sizes: Vec<BindingArraySize>,
 }
 
 impl Default for Options {
@@ -74,6 +91,7 @@ impl Default for Options {
             robustness: Robustness::Robust,
             multiview_mask: None,
             zero_initialize_workgroup_memory: true,
+            binding_array_sizes: Vec::new(),
         }
     }
 }
@@ -249,7 +267,7 @@ impl Compiler {
         }
 
         let sm = deko_nak::ir::ShaderModelInfo::new(53, 64);
-        let lowered = lower::lower_entry_point(&module, entry, &sm)?;
+        let lowered = lower::lower_entry_point(&module, entry, &sm, &request.options)?;
         let binary = deko_nak::compile_ir(lowered.shader, None)?;
 
         let (program_type, entrypoint, payload, code) = match request.stage {
@@ -1061,7 +1079,21 @@ mod tests {
                 Stage::Fragment,
                 "main",
                 &PipelineConstants::new(),
-                Options::default(),
+                Options {
+                    binding_array_sizes: vec![
+                        BindingArraySize {
+                            group: 0,
+                            binding: 0,
+                            count: 16,
+                        },
+                        BindingArraySize {
+                            group: 0,
+                            binding: 1,
+                            count: 16,
+                        },
+                    ],
+                    ..Options::default()
+                },
             )
             .unwrap();
         assert_eq!(
@@ -1382,6 +1414,84 @@ mod tests {
         assert_eq!(container.bindings, artifact.bindings);
         assert!(container.program.num_gprs >= 4);
         assert!(container.code[0x80..].iter().any(|byte| *byte != 0));
+    }
+
+    #[test]
+    fn resource_arguments_texture_queries_and_exact_offsets_compile() {
+        let source = r"
+            @group(0) @binding(0) var image: texture_2d<f32>;
+            @group(0) @binding(1) var image_sampler: sampler;
+            @group(0) @binding(2) var multisampled: texture_multisampled_2d<f32>;
+
+            fn dimensions(value: texture_2d<f32>) -> vec2<u32> {
+                return textureDimensions(value, 0);
+            }
+
+            @fragment
+            fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+                let size = dimensions(image);
+                let samples = textureNumSamples(multisampled);
+                let color = textureSampleLevel(image, image_sampler, uv, 0.0, vec2<i32>(1, 0));
+                return color + vec4<f32>(f32(size.x + samples));
+            }
+        ";
+        Compiler
+            .compile_wgsl(
+                source,
+                Stage::Fragment,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn atan_float_modulo_and_screen_derivatives_compile() {
+        let source = r"
+            @fragment
+            fn main(@location(0) value: vec2<f32>) -> @location(0) vec4<f32> {
+                let angle = atan2(value.y, value.x) + atan(value.x);
+                let derivatives = vec3<f32>(dpdx(value.x), dpdy(value.y), fwidth(value.x));
+                return vec4<f32>(derivatives % vec3<f32>(2.0), angle);
+            }
+        ";
+        Compiler
+            .compile_wgsl(
+                source,
+                Stage::Fragment,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn conditional_continue_with_remaining_loop_body_compiles() {
+        let source = r"
+            @compute @workgroup_size(1)
+            fn main() {
+                var total = 0u;
+                for (var index = 0u; index < 8u; index += 1u) {
+                    if (index & 1u) == 0u {
+                        total += index;
+                        continue;
+                    }
+                    total += index * 2u;
+                }
+                if total == 0xffffffffu { return; }
+            }
+        ";
+        Compiler
+            .compile_wgsl(
+                source,
+                Stage::Compute,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap();
     }
 
     #[test]
