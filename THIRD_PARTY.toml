@@ -9,5 +9,13 @@ status = "extraction-pending"
 source_root = "src/nouveau/compiler/nak"
 notice = "Every imported file must retain its original copyright and SPDX header."
 
-files = []
-
+files = [
+    { upstream = "src/compiler/rust/as_slice.rs", local = "crates/deko-compiler-utils/src/as_slice.rs", modified = false },
+    { upstream = "src/compiler/rust/bitset.rs", local = "crates/deko-compiler-utils/src/bitset.rs", modified = false },
+    { upstream = "src/compiler/rust/cfg.rs", local = "crates/deko-compiler-utils/src/cfg.rs", modified = false },
+    { upstream = "src/compiler/rust/dataflow.rs", local = "crates/deko-compiler-utils/src/dataflow.rs", modified = false },
+    { upstream = "src/compiler/rust/depth_first_search.rs", local = "crates/deko-compiler-utils/src/depth_first_search.rs", modified = false },
+    { upstream = "src/compiler/rust/enum_as_u8.rs", local = "crates/deko-compiler-utils/src/enum_as_u8.rs", modified = false },
+    { upstream = "src/compiler/rust/smallvec.rs", local = "crates/deko-compiler-utils/src/smallvec.rs", modified = false },
+    { upstream = "src/compiler/rust/vec_pair.rs", local = "crates/deko-compiler-utils/src/vec_pair.rs", modified = false },
+]

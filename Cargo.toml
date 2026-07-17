@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/deko-compiler-utils",
     "crates/deko-dksh",
     "crates/deko-nak",
     "crates/deko-shader-compiler",
@@ -17,6 +18,7 @@ homepage = "https://github.com/sharifhsn/deko-shader-compiler"
 authors = ["Sharif Shamsi"]
 
 [workspace.dependencies]
+deko-compiler-utils = { version = "0.1.0", path = "crates/deko-compiler-utils" }
 deko-dksh = { version = "0.1.0", path = "crates/deko-dksh" }
 deko-nak = { version = "0.1.0", path = "crates/deko-nak" }
 naga = { version = "29.0.0", default-features = false, features = ["wgsl-in"] }
