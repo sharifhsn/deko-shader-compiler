@@ -98,6 +98,8 @@ pub struct ShaderBinary {
     pub per_warp_scratch_size: u32,
     /// Local-memory bytes required per invocation.
     pub local_memory_size: u32,
+    /// Shared-memory bytes required per compute workgroup.
+    pub shared_memory_size: u32,
     /// Call/return stack bytes required by the program.
     pub crs_size: u32,
     /// Number of hardware control barriers used.

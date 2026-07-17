@@ -1,13 +1,14 @@
 use deko_nak::ir::{
-    BasicBlock, CBuf, CBufRef, ChannelMask, Dst, FRndMode, FloatCmpOp, FloatType, Function,
-    HasRegFile, Instr, IntCmpOp, IntCmpType, IntType, InterpFreq, InterpLoc, Label, LabelAllocator,
-    LdcMode, LogicOp2, MemAccess, MemAddrType, MemEvictionPriority, MemOrder, MemScope, MemSpace,
-    MemType, MuFuOp, OffsetStride, OpALd, OpASt, OpBrk, OpCont, OpExit, OpF2I, OpFAdd, OpFMnMx,
-    OpFMul, OpFSetP, OpI2F, OpIAdd2, OpIAdd2X, OpIMad, OpIMnMx, OpIMul, OpISetP, OpIpa, OpLd,
-    OpLdc, OpLop2, OpMov, OpMuFu, OpPBk, OpPCnt, OpPSetP, OpPhiDsts, OpPhiSrcs, OpRegOut, OpS2R,
-    OpSel, OpShl, OpShr, OpSt, OpTex, OpTxq, Phi, Pred, PredRef, PredSetOp, RegFile, SSARef,
-    SSAValue, Shader, ShaderInfo, ShaderIoInfo, ShaderModelInfo, Src, SrcMod, SrcRef, SrcSwizzle,
-    TexDerivMode, TexDim, TexLodMode, TexOffsetMode, TexQuery, TexRef,
+    AtomCmpSrc, AtomOp, AtomType, BasicBlock, CBuf, CBufRef, ChannelMask, Dst, FRndMode,
+    FloatCmpOp, FloatType, Function, HasRegFile, Instr, IntCmpOp, IntCmpType, IntType, InterpFreq,
+    InterpLoc, Label, LabelAllocator, LdcMode, LogicOp2, MemAccess, MemAddrType,
+    MemEvictionPriority, MemOrder, MemScope, MemSpace, MemType, MuFuOp, OffsetStride, OpALd, OpASt,
+    OpAtom, OpBar, OpBrk, OpCont, OpExit, OpF2I, OpFAdd, OpFMnMx, OpFMul, OpFSetP, OpI2F, OpIAdd2,
+    OpIAdd2X, OpIMad, OpIMnMx, OpIMul, OpISetP, OpIpa, OpLd, OpLdc, OpLop2, OpMemBar, OpMov,
+    OpMuFu, OpPBk, OpPCnt, OpPSetP, OpPhiDsts, OpPhiSrcs, OpRegOut, OpS2R, OpSel, OpShl, OpShr,
+    OpSt, OpTex, OpTxq, Phi, Pred, PredRef, PredSetOp, RegFile, SSARef, SSAValue, Shader,
+    ShaderInfo, ShaderIoInfo, ShaderModelInfo, Src, SrcMod, SrcRef, SrcSwizzle, TexDerivMode,
+    TexDim, TexLodMode, TexOffsetMode, TexQuery, TexRef,
 };
 use deko_nak::sph::PixelImap;
 use std::collections::HashMap;
@@ -24,6 +25,8 @@ struct ResourceMap {
     uniforms: HashMap<naga::Handle<naga::GlobalVariable>, u8>,
     storages: HashMap<naga::Handle<naga::GlobalVariable>, u8>,
     storage_descriptor_base: u16,
+    workgroups: HashMap<naga::Handle<naga::GlobalVariable>, u32>,
+    workgroup_memory_size: u32,
     textures: HashMap<naga::Handle<naga::GlobalVariable>, u16>,
     samplers: HashMap<naga::Handle<naga::GlobalVariable>, u16>,
     bindings: Vec<deko_dksh::Binding>,
@@ -76,6 +79,27 @@ fn resource_map(module: &naga::Module, stage: naga::ShaderStage) -> Result<Resou
         storage_descriptor_base,
         ..ResourceMap::default()
     };
+    let mut layouter = naga::proc::Layouter::default();
+    layouter
+        .update(module.to_ctx())
+        .map_err(|error| Error::UnsupportedFeature(format!("workgroup memory layout: {error}")))?;
+    for (handle, variable) in module.global_variables.iter() {
+        if variable.space != naga::AddressSpace::WorkGroup {
+            continue;
+        }
+        let layout = layouter[variable.ty];
+        resources.workgroup_memory_size =
+            layout.alignment.round_up(resources.workgroup_memory_size);
+        resources
+            .workgroups
+            .insert(handle, resources.workgroup_memory_size);
+        resources.workgroup_memory_size = resources
+            .workgroup_memory_size
+            .checked_add(layout.size)
+            .ok_or_else(|| {
+                Error::UnsupportedFeature("workgroup memory size overflow".to_owned())
+            })?;
+    }
     let mut uniforms = module
         .global_variables
         .iter()
@@ -221,6 +245,9 @@ fn lower_compute<'sm>(
             .map_err(|_| Error::UnsupportedFeature("workgroup dimension exceeds u16".to_owned()))
     };
     let local_size = [dimension(x)?, dimension(y)?, dimension(z)?];
+    let shared_memory_size = u16::try_from(resources.workgroup_memory_size).map_err(|_| {
+        Error::UnsupportedFeature("workgroup memory exceeds Maxwell limit".to_owned())
+    })?;
 
     let mut lowerer = FunctionLowerer::new(module, &entry.function, resources, Vec::new());
     bind_compute_arguments(module, &mut lowerer, entry.workgroup_size)?;
@@ -232,7 +259,7 @@ fn lower_compute<'sm>(
     }
     Ok(Shader {
         sm,
-        info: ShaderInfo::compute(local_size, 0),
+        info: ShaderInfo::compute(local_size, shared_memory_size),
         functions: vec![lowerer.finish()],
     })
 }
@@ -396,6 +423,13 @@ type StoragePointer = (
     naga::Handle<naga::GlobalVariable>,
     naga::Handle<naga::Type>,
     naga::StorageAccess,
+    u32,
+    Option<Src>,
+);
+
+type WorkgroupPointer = (
+    naga::Handle<naga::GlobalVariable>,
+    naga::Handle<naga::Type>,
     u32,
     Option<Src>,
 );
@@ -566,10 +600,13 @@ impl<'function> FunctionLowerer<'function> {
                     self.load_local_pointer(*pointer)?
                 } else if self.pointer_is_storage(*pointer) {
                     self.load_storage(*pointer)?
+                } else if self.pointer_is_workgroup(*pointer) {
+                    self.load_workgroup(*pointer)?
                 } else {
                     self.load_uniform(*pointer)?
                 }
             }
+            naga::Expression::ArrayLength(pointer) => self.storage_array_length(*pointer)?,
             naga::Expression::Splat { size, value } => self.splat(*size, *value)?,
             naga::Expression::Swizzle {
                 size,
@@ -2264,6 +2301,271 @@ impl<'function> FunctionLowerer<'function> {
         Ok(address)
     }
 
+    fn storage_buffer_size(
+        &mut self,
+        global: naga::Handle<naga::GlobalVariable>,
+    ) -> Result<Src, Error> {
+        let target = *self.resources.storages.get(&global).ok_or_else(|| {
+            Error::UnsupportedFeature("storage buffer has no allocated Deko slot".to_owned())
+        })?;
+        let offset = self
+            .resources
+            .storage_descriptor_base
+            .checked_add(u16::from(target) * 0x10 + 8)
+            .ok_or_else(|| Error::UnsupportedFeature("storage descriptor overflow".to_owned()))?;
+        let dst = self.target.ssa_alloc.alloc(RegFile::GPR);
+        self.emit(Instr::new(OpLdc {
+            dst: Dst::from(dst),
+            cb: Src::from(CBufRef {
+                buf: CBuf::Binding(0),
+                offset,
+            }),
+            offset: Src::ZERO,
+            mode: LdcMode::Indexed,
+            mem_type: MemType::B32,
+        }));
+        Ok(Src::from(dst))
+    }
+
+    fn storage_array_length(
+        &mut self,
+        pointer: naga::Handle<naga::Expression>,
+    ) -> Result<Value, Error> {
+        let (global, ty, _, base_offset, dynamic_offset) = self.storage_pointer(pointer)?;
+        let naga::TypeInner::Array {
+            size: naga::ArraySize::Dynamic,
+            stride,
+            ..
+        } = self.module.types[ty].inner
+        else {
+            return Err(Error::UnsupportedFeature(
+                "arrayLength pointer does not reference a runtime array".to_owned(),
+            ));
+        };
+        if !stride.is_power_of_two() {
+            return Err(Error::UnsupportedFeature(format!(
+                "runtime array stride {stride} is not a power of two"
+            )));
+        }
+        let mut bytes = self.storage_buffer_size(global)?;
+        if base_offset != 0 {
+            let dst = self.target.ssa_alloc.alloc(RegFile::GPR);
+            self.emit(Instr::new(OpIAdd2 {
+                dst: Dst::from(dst),
+                carry_out: Dst::None,
+                srcs: [bytes, Src::from(base_offset).ineg()],
+            }));
+            bytes = Src::from(dst);
+        }
+        if let Some(dynamic_offset) = dynamic_offset {
+            let dst = self.target.ssa_alloc.alloc(RegFile::GPR);
+            self.emit(Instr::new(OpIAdd2 {
+                dst: Dst::from(dst),
+                carry_out: Dst::None,
+                srcs: [bytes, dynamic_offset.ineg()],
+            }));
+            bytes = Src::from(dst);
+        }
+        let dst = self.target.ssa_alloc.alloc(RegFile::GPR);
+        self.emit(Instr::new(OpShr {
+            dst: Dst::from(dst),
+            src: bytes,
+            shift: Src::from(stride.trailing_zeros()),
+            wrap: true,
+            signed: false,
+        }));
+        Ok(Value {
+            components: vec![Src::from(dst)],
+            kind: naga::ScalarKind::Uint,
+        })
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn workgroup_pointer(
+        &mut self,
+        handle: naga::Handle<naga::Expression>,
+    ) -> Result<WorkgroupPointer, Error> {
+        match self.source.expressions[handle] {
+            naga::Expression::GlobalVariable(global) => {
+                let variable = &self.module.global_variables[global];
+                if variable.space != naga::AddressSpace::WorkGroup {
+                    return Err(Error::UnsupportedFeature(format!(
+                        "workgroup pointer rooted in {:?} address space",
+                        variable.space
+                    )));
+                }
+                Ok((global, variable.ty, 0, None))
+            }
+            naga::Expression::Access { base, index } => {
+                let (global, ty, offset, dynamic_offset) = self.workgroup_pointer(base)?;
+                let (element, stride) = match self.module.types[ty].inner {
+                    naga::TypeInner::Array {
+                        base: element,
+                        stride,
+                        ..
+                    } => (element, stride),
+                    naga::TypeInner::Vector { scalar, .. } => {
+                        (self.scalar_type(scalar)?, u32::from(scalar.width))
+                    }
+                    ref inner => {
+                        return Err(Error::UnsupportedFeature(format!(
+                            "dynamic workgroup access into {inner:?}"
+                        )));
+                    }
+                };
+                let index = self.expression(index)?;
+                if index.components.len() != 1
+                    || !matches!(index.kind, naga::ScalarKind::Sint | naga::ScalarKind::Uint)
+                {
+                    return Err(Error::UnsupportedFeature(
+                        "workgroup array index must be an integer scalar".to_owned(),
+                    ));
+                }
+                let scaled = self.target.ssa_alloc.alloc(RegFile::GPR);
+                self.emit(Instr::new(OpIMad {
+                    dst: Dst::from(scaled),
+                    srcs: [
+                        index.components[0].clone(),
+                        Src::from(stride),
+                        dynamic_offset.unwrap_or(Src::ZERO),
+                    ],
+                    signed: false,
+                }));
+                Ok((global, element, offset, Some(Src::from(scaled))))
+            }
+            naga::Expression::AccessIndex { base, index } => {
+                let (global, ty, offset, dynamic_offset) = self.workgroup_pointer(base)?;
+                let (element, field_offset) = match self.module.types[ty].inner {
+                    naga::TypeInner::Struct { ref members, .. } => {
+                        let member = members.get(index as usize).ok_or_else(|| {
+                            Error::UnsupportedFeature(
+                                "workgroup member index out of bounds".to_owned(),
+                            )
+                        })?;
+                        (member.ty, member.offset)
+                    }
+                    naga::TypeInner::Array {
+                        base: element,
+                        stride,
+                        size,
+                    } => {
+                        if let naga::ArraySize::Constant(count) = size
+                            && index >= count.get()
+                        {
+                            return Err(Error::UnsupportedFeature(
+                                "workgroup array index out of bounds".to_owned(),
+                            ));
+                        }
+                        (
+                            element,
+                            index.checked_mul(stride).ok_or_else(|| {
+                                Error::UnsupportedFeature(
+                                    "workgroup array offset overflow".to_owned(),
+                                )
+                            })?,
+                        )
+                    }
+                    naga::TypeInner::Vector { size, scalar } => {
+                        if index as usize >= vector_size(size) {
+                            return Err(Error::UnsupportedFeature(
+                                "workgroup vector index out of bounds".to_owned(),
+                            ));
+                        }
+                        (self.scalar_type(scalar)?, index * u32::from(scalar.width))
+                    }
+                    ref inner => {
+                        return Err(Error::UnsupportedFeature(format!(
+                            "workgroup access into {inner:?}"
+                        )));
+                    }
+                };
+                let offset = offset.checked_add(field_offset).ok_or_else(|| {
+                    Error::UnsupportedFeature("workgroup offset overflow".to_owned())
+                })?;
+                Ok((global, element, offset, dynamic_offset))
+            }
+            ref pointer => Err(Error::UnsupportedFeature(format!(
+                "workgroup pointer {pointer:?}"
+            ))),
+        }
+    }
+
+    fn load_workgroup(&mut self, pointer: naga::Handle<naga::Expression>) -> Result<Value, Error> {
+        let (global, ty, base_offset, dynamic_offset) = self.workgroup_pointer(pointer)?;
+        let global_offset = *self.resources.workgroups.get(&global).ok_or_else(|| {
+            Error::UnsupportedFeature("workgroup global has no shared-memory offset".to_owned())
+        })?;
+        let base_offset = global_offset.checked_add(base_offset).ok_or_else(|| {
+            Error::UnsupportedFeature("workgroup load offset overflow".to_owned())
+        })?;
+        let (offsets, kind) = uniform_component_offsets(self.module, ty, base_offset)?;
+        let mut components = Vec::with_capacity(offsets.len());
+        for offset in offsets {
+            let offset = i32::try_from(offset).map_err(|_| {
+                Error::UnsupportedFeature("workgroup load offset exceeds Maxwell range".to_owned())
+            })?;
+            let dst = self.target.ssa_alloc.alloc(RegFile::GPR);
+            self.emit(Instr::new(OpLd {
+                dst: Dst::from(dst),
+                addr: dynamic_offset.clone().unwrap_or(Src::ZERO),
+                uniform_addr: Src::ZERO,
+                pred: Src::new_imm_bool(true),
+                offset,
+                stride: OffsetStride::X1,
+                access: MemAccess {
+                    mem_type: MemType::B32,
+                    space: MemSpace::Shared,
+                    order: MemOrder::Strong(MemScope::CTA),
+                    eviction_priority: MemEvictionPriority::Normal,
+                },
+            }));
+            components.push(Src::from(dst));
+        }
+        Ok(self.decode_aggregate_value(components, kind))
+    }
+
+    fn store_workgroup(
+        &mut self,
+        pointer: naga::Handle<naga::Expression>,
+        value: &Value,
+    ) -> Result<(), Error> {
+        let (global, ty, base_offset, dynamic_offset) = self.workgroup_pointer(pointer)?;
+        let global_offset = *self.resources.workgroups.get(&global).ok_or_else(|| {
+            Error::UnsupportedFeature("workgroup global has no shared-memory offset".to_owned())
+        })?;
+        let base_offset = global_offset.checked_add(base_offset).ok_or_else(|| {
+            Error::UnsupportedFeature("workgroup store offset overflow".to_owned())
+        })?;
+        let (offsets, _) = uniform_component_offsets(self.module, ty, base_offset)?;
+        if value.components.len() != offsets.len() {
+            return Err(Error::UnsupportedFeature(format!(
+                "workgroup store shape mismatch: expected {}, got {}",
+                offsets.len(),
+                value.components.len()
+            )));
+        }
+        let data = self.materialize_loop_components(value)?;
+        for (offset, data) in offsets.into_iter().zip(data) {
+            let offset = i32::try_from(offset).map_err(|_| {
+                Error::UnsupportedFeature("workgroup store offset exceeds Maxwell range".to_owned())
+            })?;
+            self.emit(Instr::new(OpSt {
+                addr: dynamic_offset.clone().unwrap_or(Src::ZERO),
+                data: Src::from(data),
+                uniform_addr: Src::ZERO,
+                offset,
+                stride: OffsetStride::X1,
+                access: MemAccess {
+                    mem_type: MemType::B32,
+                    space: MemSpace::Shared,
+                    order: MemOrder::Strong(MemScope::CTA),
+                    eviction_priority: MemEvictionPriority::Normal,
+                },
+            }));
+        }
+        Ok(())
+    }
+
     fn storage_access(mem_type: MemType) -> MemAccess {
         MemAccess {
             mem_type,
@@ -2339,6 +2641,196 @@ impl<'function> FunctionLowerer<'function> {
         Ok(())
     }
 
+    fn storage_atomic(
+        &mut self,
+        pointer: naga::Handle<naga::Expression>,
+        fun: naga::AtomicFunction,
+        value: naga::Handle<naga::Expression>,
+        result: Option<naga::Handle<naga::Expression>>,
+    ) -> Result<(), Error> {
+        let (global, ty, access, base_offset, dynamic_offset) = self.storage_pointer(pointer)?;
+        if !access.intersects(naga::StorageAccess::STORE | naga::StorageAccess::ATOMIC) {
+            return Err(Error::UnsupportedFeature(
+                "atomic operation on non-atomic storage binding".to_owned(),
+            ));
+        }
+        let naga::TypeInner::Atomic(scalar) = self.module.types[ty].inner else {
+            return Err(Error::UnsupportedFeature(format!(
+                "atomic operation on {:?}",
+                self.module.types[ty].inner
+            )));
+        };
+        if scalar.width != 4
+            || !matches!(scalar.kind, naga::ScalarKind::Sint | naga::ScalarKind::Uint)
+        {
+            return Err(Error::UnsupportedFeature(format!(
+                "atomic scalar {scalar:?}"
+            )));
+        }
+        let mut value = self.expression(value)?;
+        if value.components.len() != 1 || value.kind != scalar.kind {
+            return Err(Error::UnsupportedFeature(
+                "atomic value type mismatch".to_owned(),
+            ));
+        }
+        let mut compare = Src::ZERO;
+        let atom_op = match fun {
+            naga::AtomicFunction::Add => AtomOp::Add,
+            naga::AtomicFunction::Subtract => {
+                value.components[0] = value.components[0].clone().ineg();
+                AtomOp::Add
+            }
+            naga::AtomicFunction::And => AtomOp::And,
+            naga::AtomicFunction::ExclusiveOr => AtomOp::Xor,
+            naga::AtomicFunction::InclusiveOr => AtomOp::Or,
+            naga::AtomicFunction::Min => AtomOp::Min,
+            naga::AtomicFunction::Max => AtomOp::Max,
+            naga::AtomicFunction::Exchange { compare: None } => AtomOp::Exch,
+            naga::AtomicFunction::Exchange {
+                compare: Some(handle),
+            } => {
+                let comparison = self.expression(handle)?;
+                if comparison.components.len() != 1 || comparison.kind != scalar.kind {
+                    return Err(Error::UnsupportedFeature(
+                        "atomic compare-exchange comparison type mismatch".to_owned(),
+                    ));
+                }
+                compare = comparison.components[0].clone();
+                AtomOp::CmpExch(AtomCmpSrc::Separate)
+            }
+        };
+        let data = self.materialize_loop_components(&value)?;
+        let address = self.storage_address(global, dynamic_offset)?;
+        let destination = result.map(|_| self.target.ssa_alloc.alloc(RegFile::GPR));
+        let offset = i32::try_from(base_offset).map_err(|_| {
+            Error::UnsupportedFeature("storage atomic offset exceeds Maxwell range".to_owned())
+        })?;
+        self.emit(Instr::new(OpAtom {
+            dst: Dst::from(destination),
+            addr: Src::from(address),
+            uniform_address: Src::ZERO,
+            cmpr: compare,
+            data: Src::from(data[0]),
+            atom_op,
+            atom_type: if scalar.kind == naga::ScalarKind::Uint {
+                AtomType::U32
+            } else {
+                AtomType::I32
+            },
+            addr_offset: offset,
+            addr_stride: OffsetStride::X1,
+            mem_space: MemSpace::Global(MemAddrType::A64),
+            mem_order: MemOrder::Strong(MemScope::GPU),
+            mem_eviction_priority: MemEvictionPriority::Normal,
+        }));
+        if let (Some(handle), Some(destination)) = (result, destination) {
+            self.values.insert(
+                handle,
+                Value {
+                    components: vec![Src::from(destination)],
+                    kind: scalar.kind,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    fn workgroup_atomic(
+        &mut self,
+        pointer: naga::Handle<naga::Expression>,
+        fun: naga::AtomicFunction,
+        value: naga::Handle<naga::Expression>,
+        result: Option<naga::Handle<naga::Expression>>,
+    ) -> Result<(), Error> {
+        let (global, ty, base_offset, dynamic_offset) = self.workgroup_pointer(pointer)?;
+        let naga::TypeInner::Atomic(scalar) = self.module.types[ty].inner else {
+            return Err(Error::UnsupportedFeature(format!(
+                "workgroup atomic operation on {:?}",
+                self.module.types[ty].inner
+            )));
+        };
+        if scalar.width != 4
+            || !matches!(scalar.kind, naga::ScalarKind::Sint | naga::ScalarKind::Uint)
+        {
+            return Err(Error::UnsupportedFeature(format!(
+                "workgroup atomic scalar {scalar:?}"
+            )));
+        }
+        let mut value = self.expression(value)?;
+        if value.components.len() != 1 || value.kind != scalar.kind {
+            return Err(Error::UnsupportedFeature(
+                "workgroup atomic value type mismatch".to_owned(),
+            ));
+        }
+        let mut compare = Src::ZERO;
+        let atom_op = match fun {
+            naga::AtomicFunction::Add => AtomOp::Add,
+            naga::AtomicFunction::Subtract => {
+                value.components[0] = value.components[0].clone().ineg();
+                AtomOp::Add
+            }
+            naga::AtomicFunction::And => AtomOp::And,
+            naga::AtomicFunction::ExclusiveOr => AtomOp::Xor,
+            naga::AtomicFunction::InclusiveOr => AtomOp::Or,
+            naga::AtomicFunction::Min => AtomOp::Min,
+            naga::AtomicFunction::Max => AtomOp::Max,
+            naga::AtomicFunction::Exchange { compare: None } => AtomOp::Exch,
+            naga::AtomicFunction::Exchange {
+                compare: Some(handle),
+            } => {
+                let comparison = self.expression(handle)?;
+                if comparison.components.len() != 1 || comparison.kind != scalar.kind {
+                    return Err(Error::UnsupportedFeature(
+                        "workgroup atomic comparison type mismatch".to_owned(),
+                    ));
+                }
+                compare = comparison.components[0].clone();
+                AtomOp::CmpExch(AtomCmpSrc::Separate)
+            }
+        };
+        let data = self.materialize_loop_components(&value)?;
+        let global_offset = *self.resources.workgroups.get(&global).ok_or_else(|| {
+            Error::UnsupportedFeature("workgroup global has no shared-memory offset".to_owned())
+        })?;
+        let offset = global_offset
+            .checked_add(base_offset)
+            .and_then(|offset| i32::try_from(offset).ok())
+            .ok_or_else(|| {
+                Error::UnsupportedFeature(
+                    "workgroup atomic offset exceeds Maxwell range".to_owned(),
+                )
+            })?;
+        let destination = result.map(|_| self.target.ssa_alloc.alloc(RegFile::GPR));
+        self.emit(Instr::new(OpAtom {
+            dst: Dst::from(destination),
+            addr: dynamic_offset.unwrap_or(Src::ZERO),
+            uniform_address: Src::ZERO,
+            cmpr: compare,
+            data: Src::from(data[0]),
+            atom_op,
+            atom_type: if scalar.kind == naga::ScalarKind::Uint {
+                AtomType::U32
+            } else {
+                AtomType::I32
+            },
+            addr_offset: offset,
+            addr_stride: OffsetStride::X1,
+            mem_space: MemSpace::Shared,
+            mem_order: MemOrder::Strong(MemScope::CTA),
+            mem_eviction_priority: MemEvictionPriority::Normal,
+        }));
+        if let (Some(handle), Some(destination)) = (result, destination) {
+            self.values.insert(
+                handle,
+                Value {
+                    components: vec![Src::from(destination)],
+                    kind: scalar.kind,
+                },
+            );
+        }
+        Ok(())
+    }
+
     fn local_value(&mut self, handle: naga::Handle<naga::LocalVariable>) -> Result<Value, Error> {
         if let Some(value) = self.locals.get(&handle) {
             return Ok(value.clone());
@@ -2368,6 +2860,18 @@ impl<'function> FunctionLowerer<'function> {
             ),
             naga::Expression::Access { base, .. } | naga::Expression::AccessIndex { base, .. } => {
                 self.pointer_is_storage(base)
+            }
+            _ => false,
+        }
+    }
+
+    fn pointer_is_workgroup(&self, handle: naga::Handle<naga::Expression>) -> bool {
+        match self.source.expressions[handle] {
+            naga::Expression::GlobalVariable(global) => {
+                self.module.global_variables[global].space == naga::AddressSpace::WorkGroup
+            }
+            naga::Expression::Access { base, .. } | naga::Expression::AccessIndex { base, .. } => {
+                self.pointer_is_workgroup(base)
             }
             _ => false,
         }
@@ -3439,10 +3943,46 @@ impl<'function> FunctionLowerer<'function> {
                     let value = self.inline_call(*function, arguments)?;
                     self.values.insert(*call_result, value);
                 }
+                naga::Statement::ControlBarrier(flags) => {
+                    if flags.contains(naga::Barrier::SUB_GROUP) {
+                        return Err(Error::UnsupportedFeature(
+                            "subgroup control barrier".to_owned(),
+                        ));
+                    }
+                    if flags.intersects(naga::Barrier::STORAGE | naga::Barrier::TEXTURE) {
+                        self.emit(Instr::new(OpMemBar {
+                            scope: MemScope::GPU,
+                        }));
+                    } else if flags.contains(naga::Barrier::WORK_GROUP) {
+                        self.emit(Instr::new(OpMemBar {
+                            scope: MemScope::CTA,
+                        }));
+                    }
+                    self.emit(Instr::new(OpBar {}));
+                }
+                naga::Statement::MemoryBarrier(flags) => {
+                    if flags.contains(naga::Barrier::SUB_GROUP) {
+                        return Err(Error::UnsupportedFeature(
+                            "subgroup memory barrier".to_owned(),
+                        ));
+                    }
+                    let scope = if flags.intersects(naga::Barrier::STORAGE | naga::Barrier::TEXTURE)
+                    {
+                        MemScope::GPU
+                    } else {
+                        MemScope::CTA
+                    };
+                    self.emit(Instr::new(OpMemBar { scope }));
+                }
                 naga::Statement::Store { pointer, value } => {
                     if self.pointer_is_storage(*pointer) {
                         let value = self.expression(*value)?;
                         self.store_storage(*pointer, &value)?;
+                        continue;
+                    }
+                    if self.pointer_is_workgroup(*pointer) {
+                        let value = self.expression(*value)?;
+                        self.store_workgroup(*pointer, &value)?;
                         continue;
                     }
                     if !self.pointer_is_local(*pointer) {
@@ -3474,6 +4014,23 @@ impl<'function> FunctionLowerer<'function> {
                     let end = offset + expected;
                     local_value.components[offset..end].clone_from_slice(&value.components);
                     self.locals.insert(local, local_value);
+                }
+                naga::Statement::Atomic {
+                    pointer,
+                    fun,
+                    value,
+                    result,
+                } => {
+                    if self.pointer_is_storage(*pointer) {
+                        self.storage_atomic(*pointer, *fun, *value, *result)?;
+                    } else if self.pointer_is_workgroup(*pointer) {
+                        self.workgroup_atomic(*pointer, *fun, *value, *result)?;
+                    } else {
+                        return Err(Error::UnsupportedFeature(format!(
+                            "atomic pointer {:?}",
+                            self.source.expressions[*pointer]
+                        )));
+                    }
                 }
                 naga::Statement::Block(block) => {
                     if let Some(value) = self.execute_statements(block)? {
@@ -3944,7 +4501,9 @@ fn uniform_component_offsets(
     base: u32,
 ) -> Result<(Vec<u32>, naga::ScalarKind), Error> {
     match module.types[ty].inner {
-        naga::TypeInner::Scalar(scalar) if scalar.width == 4 => Ok((vec![base], scalar.kind)),
+        naga::TypeInner::Scalar(scalar) | naga::TypeInner::Atomic(scalar) if scalar.width == 4 => {
+            Ok((vec![base], scalar.kind))
+        }
         naga::TypeInner::Vector { size, scalar } if scalar.width == 4 => Ok((
             (0..vector_size(size))
                 .map(|component| base + u32::try_from(component * 4).expect("vector is small"))

@@ -47,6 +47,10 @@ pub fn compile_ir(mut shader: Shader<'_>, fs_key: Option<&FsKey>) -> Result<Shad
 
     let crs_size = sm.crs_size(shader.info.max_crs_depth);
     let is_compute = matches!(shader.info.stage, ShaderStageInfo::Compute(_));
+    let shared_memory_size = match shader.info.stage {
+        ShaderStageInfo::Compute(ref info) => u32::from(info.smem_size),
+        _ => 0,
+    };
     let per_warp_scratch_size = if is_compute {
         shader
             .info
@@ -63,6 +67,7 @@ pub fn compile_ir(mut shader: Shader<'_>, fs_key: Option<&FsKey>) -> Result<Shad
         num_gprs: (u32::from(shader.info.num_gprs) + sm.hw_reserved_gprs()).max(4),
         per_warp_scratch_size,
         local_memory_size: shader.info.slm_size,
+        shared_memory_size,
         crs_size: if is_compute {
             crs_size.max(0x800)
         } else {

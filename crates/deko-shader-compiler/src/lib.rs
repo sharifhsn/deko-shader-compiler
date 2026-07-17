@@ -216,7 +216,7 @@ impl Compiler {
                     0,
                     deko_dksh::StagePayload::Compute {
                         block_dimensions,
-                        shared_memory_size: 0,
+                        shared_memory_size: binary.shared_memory_size,
                         local_positive_memory_size: binary.local_memory_size,
                         local_negative_memory_size: 0,
                         crs_size: binary.crs_size,
@@ -434,6 +434,108 @@ mod tests {
         let container = deko_dksh::parse(&artifact.dksh).unwrap();
         assert_eq!(container.bindings, artifact.bindings);
         assert!(container.code.iter().any(|byte| *byte != 0));
+    }
+
+    #[test]
+    fn compute_storage_atomics_compile() {
+        let source = r"
+            struct Counters {
+                values: array<atomic<u32>, 4>,
+            }
+
+            @group(0) @binding(0)
+            var<storage, read_write> counters: Counters;
+
+            @compute @workgroup_size(4)
+            fn main(@builtin(local_invocation_index) index: u32) {
+                let previous = atomicAdd(&counters.values[index], 1u);
+                atomicMax(&counters.values[0], previous);
+                storageBarrier();
+                workgroupBarrier();
+            }
+        ";
+        let artifact = Compiler
+            .compile_wgsl(
+                source,
+                Stage::Compute,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap();
+        assert_eq!(artifact.bindings[0].kind, deko_dksh::BindingKind::Storage);
+        assert!(deko_dksh::parse(&artifact.dksh).is_ok());
+    }
+
+    #[test]
+    fn compute_workgroup_memory_and_barriers_compile() {
+        let source = r"
+            @group(0) @binding(0)
+            var<storage, read_write> output: array<u32, 4>;
+            var<workgroup> scratch: array<u32, 4>;
+            var<workgroup> counter: atomic<u32>;
+
+            @compute @workgroup_size(4)
+            fn main(@builtin(local_invocation_index) index: u32) {
+                scratch[index] = index * 2u;
+                if index == 0u {
+                    atomicStore(&counter, 0u);
+                }
+                workgroupBarrier();
+                let previous = atomicAdd(&counter, 1u);
+                output[index] = scratch[3u - index] + previous;
+            }
+        ";
+        let artifact = Compiler
+            .compile_wgsl(
+                source,
+                Stage::Compute,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap();
+        let container = deko_dksh::parse(&artifact.dksh).unwrap();
+        assert_eq!(
+            container.program.payload,
+            deko_dksh::StagePayload::Compute {
+                block_dimensions: [4, 1, 1],
+                shared_memory_size: 20,
+                local_positive_memory_size: 0,
+                local_negative_memory_size: 0,
+                crs_size: 0x800,
+                num_barriers: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn runtime_storage_array_length_compiles() {
+        let source = r"
+            struct Input {
+                header: u32,
+                values: array<u32>,
+            }
+
+            @group(0) @binding(0) var<storage, read> input: Input;
+            @group(0) @binding(1) var<storage, read_write> output: array<u32, 1>;
+
+            @compute @workgroup_size(1)
+            fn main() {
+                output[0] = arrayLength(&input.values);
+            }
+        ";
+        let artifact = Compiler
+            .compile_wgsl(
+                source,
+                Stage::Compute,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap();
+        assert_eq!(artifact.bindings.len(), 2);
+        assert!(deko_dksh::parse(&artifact.dksh).is_ok());
     }
 
     #[test]
