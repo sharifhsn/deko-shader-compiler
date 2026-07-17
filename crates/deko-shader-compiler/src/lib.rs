@@ -487,6 +487,25 @@ mod tests {
     }
 
     #[test]
+    fn splat_swizzle_zero_and_negate_lower_componentwise() {
+        let artifact = Compiler
+            .compile_wgsl(
+                "@fragment fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> { let z = vec4<f32>(); return -z + vec4<f32>(uv.yx + vec2<f32>(uv[1], uv[0]), 0.5, 1.0); }",
+                Stage::Fragment,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap();
+        let container = deko_dksh::parse(&artifact.dksh).unwrap();
+        assert_eq!(
+            container.program.program_type,
+            deko_dksh::ProgramType::Fragment
+        );
+        assert!(container.code[0x80..].iter().any(|byte| *byte != 0));
+    }
+
+    #[test]
     fn unsupported_pipeline_options_fail_instead_of_changing_semantics() {
         let mut constants = PipelineConstants::new();
         constants.insert("scale".to_owned(), 2.0);

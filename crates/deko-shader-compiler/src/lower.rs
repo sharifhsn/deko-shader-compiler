@@ -79,6 +79,7 @@ struct Value {
 }
 
 struct FunctionLowerer<'function> {
+    module: &'function naga::Module,
     source: &'function naga::Function,
     target: Function,
     values: HashMap<naga::Handle<naga::Expression>, Value>,
@@ -86,8 +87,13 @@ struct FunctionLowerer<'function> {
 }
 
 impl<'function> FunctionLowerer<'function> {
-    fn new(source: &'function naga::Function, arguments: Vec<Value>) -> Self {
+    fn new(
+        module: &'function naga::Module,
+        source: &'function naga::Function,
+        arguments: Vec<Value>,
+    ) -> Self {
         Self {
+            module,
             source,
             target: Function::single_block(Vec::new()),
             values: HashMap::new(),
@@ -104,6 +110,7 @@ impl<'function> FunctionLowerer<'function> {
                 components: vec![literal_source(*literal)?],
                 kind: literal_kind(*literal)?,
             },
+            naga::Expression::ZeroValue(ty) => zero_value(self.module, *ty)?,
             naga::Expression::Compose { components, .. } => {
                 let mut flattened = Vec::new();
                 let mut kind = None;
@@ -128,6 +135,22 @@ impl<'function> FunctionLowerer<'function> {
                 .get(*index as usize)
                 .cloned()
                 .ok_or_else(|| Error::UnsupportedFeature(format!("argument {index}")))?,
+            naga::Expression::Splat { size, value } => self.splat(*size, *value)?,
+            naga::Expression::Swizzle {
+                size,
+                vector,
+                pattern,
+            } => self.swizzle(*size, *vector, *pattern)?,
+            naga::Expression::AccessIndex { base, index } if self.expression_is_vector(*base) => {
+                let base = self.expression(*base)?;
+                Value {
+                    components: vec![base.components.get(*index as usize).cloned().ok_or_else(
+                        || Error::UnsupportedFeature("vector index out of bounds".to_owned()),
+                    )?],
+                    kind: base.kind,
+                }
+            }
+            naga::Expression::Unary { op, expr } => self.unary(*op, *expr)?,
             naga::Expression::Binary { op, left, right } => {
                 let left = self.expression(*left)?;
                 let right = self.expression(*right)?;
@@ -141,6 +164,88 @@ impl<'function> FunctionLowerer<'function> {
         };
         self.values.insert(handle, value.clone());
         Ok(value)
+    }
+
+    fn splat(
+        &mut self,
+        size: naga::VectorSize,
+        handle: naga::Handle<naga::Expression>,
+    ) -> Result<Value, Error> {
+        let value = self.expression(handle)?;
+        if value.components.len() != 1 {
+            return Err(Error::UnsupportedFeature(
+                "splat of a non-scalar value".to_owned(),
+            ));
+        }
+        Ok(Value {
+            components: vec![value.components[0].clone(); vector_size(size)],
+            kind: value.kind,
+        })
+    }
+
+    fn swizzle(
+        &mut self,
+        size: naga::VectorSize,
+        handle: naga::Handle<naga::Expression>,
+        pattern: [naga::SwizzleComponent; 4],
+    ) -> Result<Value, Error> {
+        let vector = self.expression(handle)?;
+        let mut components = Vec::with_capacity(vector_size(size));
+        for component in &pattern[..vector_size(size)] {
+            let index = match component {
+                naga::SwizzleComponent::X => 0,
+                naga::SwizzleComponent::Y => 1,
+                naga::SwizzleComponent::Z => 2,
+                naga::SwizzleComponent::W => 3,
+            };
+            components.push(vector.components.get(index).cloned().ok_or_else(|| {
+                Error::UnsupportedFeature("swizzle component out of bounds".to_owned())
+            })?);
+        }
+        Ok(Value {
+            components,
+            kind: vector.kind,
+        })
+    }
+
+    fn unary(
+        &mut self,
+        op: naga::UnaryOperator,
+        handle: naga::Handle<naga::Expression>,
+    ) -> Result<Value, Error> {
+        let mut value = self.expression(handle)?;
+        if op == naga::UnaryOperator::Negate && value.kind == naga::ScalarKind::Float {
+            for component in &mut value.components {
+                *component = component.clone().fneg();
+            }
+            return Ok(value);
+        }
+        Err(Error::UnsupportedFeature(format!(
+            "unary operator {op:?} for {:?}",
+            value.kind
+        )))
+    }
+
+    fn expression_is_vector(&self, handle: naga::Handle<naga::Expression>) -> bool {
+        match &self.source.expressions[handle] {
+            naga::Expression::FunctionArgument(index) => self
+                .source
+                .arguments
+                .get(*index as usize)
+                .is_some_and(|argument| {
+                    matches!(
+                        self.module.types[argument.ty].inner,
+                        naga::TypeInner::Vector { .. }
+                    )
+                }),
+            naga::Expression::Compose { ty, .. } | naga::Expression::ZeroValue(ty) => {
+                matches!(self.module.types[*ty].inner, naga::TypeInner::Vector { .. })
+            }
+            naga::Expression::Splat { .. } | naga::Expression::Swizzle { .. } => true,
+            naga::Expression::Binary { left, .. } => self.expression_is_vector(*left),
+            naga::Expression::Unary { expr, .. } => self.expression_is_vector(*expr),
+            _ => false,
+        }
     }
 
     fn binary(
@@ -269,6 +374,32 @@ fn literal_kind(literal: naga::Literal) -> Result<naga::ScalarKind, Error> {
         naga::Literal::Bool(_) => Ok(naga::ScalarKind::Bool),
         other => Err(Error::UnsupportedFeature(format!("literal {other:?}"))),
     }
+}
+
+fn vector_size(size: naga::VectorSize) -> usize {
+    match size {
+        naga::VectorSize::Bi => 2,
+        naga::VectorSize::Tri => 3,
+        naga::VectorSize::Quad => 4,
+    }
+}
+
+fn zero_value(module: &naga::Module, ty: naga::Handle<naga::Type>) -> Result<Value, Error> {
+    let (components, kind) = type_shape(module, ty)?;
+    let source = match kind {
+        naga::ScalarKind::Float => Src::from(0.0_f32),
+        naga::ScalarKind::Sint | naga::ScalarKind::Uint => Src::ZERO,
+        naga::ScalarKind::Bool => Src::new_imm_bool(false),
+        other => {
+            return Err(Error::UnsupportedFeature(format!(
+                "zero value scalar kind {other:?}"
+            )));
+        }
+    };
+    Ok(Value {
+        components: vec![source; usize::from(components)],
+        kind,
+    })
 }
 
 fn type_shape(
@@ -460,7 +591,7 @@ fn lower_vertex<'sm>(
         Error::UnsupportedFeature("vertex entry point without a result".to_owned())
     })?;
     let mut info = ShaderInfo::vertex();
-    let mut lowerer = FunctionLowerer::new(&entry.function, Vec::new());
+    let mut lowerer = FunctionLowerer::new(module, &entry.function, Vec::new());
     bind_vertex_arguments(module, &mut lowerer, &mut info)?;
     let value = lowerer.return_value()?;
     let mut wrote_position = false;
@@ -527,7 +658,7 @@ fn lower_fragment<'sm>(
         Error::UnsupportedFeature("fragment entry point without a result".to_owned())
     })?;
     let mut info = ShaderInfo::fragment(entry.early_depth_test.is_some(), false, false);
-    let mut lowerer = FunctionLowerer::new(&entry.function, Vec::new());
+    let mut lowerer = FunctionLowerer::new(module, &entry.function, Vec::new());
     bind_fragment_arguments(module, &mut lowerer, &mut info)?;
     let value = lowerer.return_value()?;
     let mut outputs = Vec::new();
