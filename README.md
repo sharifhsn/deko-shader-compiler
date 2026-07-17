@@ -6,9 +6,10 @@ Switch's GM20B GPU.
 
 The project is under active development. It compiles validated WGSL
 vertex, fragment, and compute entry points through a Rust extraction of Mesa NAK's SM50 backend
-and packages the resulting GM20B machine code as DKSH. The complete 110-entry captured Bevy 0.19
-UI, mesh, PBR, image-processing, and compute corpus is an end-to-end regression suite. Compute
-shaders support the core invocation built-ins,
+and packages the resulting GM20B machine code as DKSH. The host suite covers representative
+Bevy UI, mesh, PBR, image-processing, and compute shader families; the application-level
+Ryujinx probe currently exercises 29 distinct runtime-compiled artifacts. Compute shaders
+support the core invocation built-ins,
 read/write storage buffers with static or dynamically indexed host-shareable data, storage and
 workgroup atomics, barriers, workgroup memory, and runtime storage-array lengths. Unsupported
 features return a typed error instead of silently changing shader semantics.
@@ -53,6 +54,9 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo run -p deko-shader-compiler --example compile_wgsl
 cargo package --workspace --no-verify --list
+cargo +nightly fuzz run dksh -- -max_total_time=30
+cargo +nightly fuzz run wgsl -- -max_total_time=30
+cargo +nightly fuzz run lowering -- -max_total_time=30
 ```
 
 `cargo package --workspace --no-verify --list` verifies the exact contents of all
@@ -63,6 +67,10 @@ full registry-backed package verification.
 The public support boundary is the operations exercised by the tests and Bevy corpus,
 not all of WGSL. Multiview is currently rejected explicitly. Native execution and
 performance claims require physical Switch evidence.
+
+The three fuzz targets cover the untrusted DKSH parser, arbitrary WGSL bytes at the
+Naga boundary, and a valid generated vertex/fragment/compute family that reaches the
+Naga-to-NAK lowering and native encoder.
 
 ## License
 

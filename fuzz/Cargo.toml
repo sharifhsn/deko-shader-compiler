@@ -1,0 +1,34 @@
+[package]
+name = "deko-shader-compiler-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+deko-dksh = { path = "../crates/deko-dksh" }
+deko-shader-compiler = { path = "../crates/deko-shader-compiler" }
+libfuzzer-sys = "0.4"
+
+[[bin]]
+name = "dksh"
+path = "fuzz_targets/dksh.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wgsl"
+path = "fuzz_targets/wgsl.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lowering"
+path = "fuzz_targets/lowering.rs"
+test = false
+doc = false
+bench = false
