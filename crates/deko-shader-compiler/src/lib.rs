@@ -1012,6 +1012,107 @@ mod tests {
     }
 
     #[test]
+    fn shared_cross_group_sampler_emits_one_record_per_native_pair() {
+        let source = r"
+            @group(0) @binding(5) var first: texture_2d<f32>;
+            @group(0) @binding(1) var second: texture_2d<f32>;
+            @group(2) @binding(7) var shared_sampler: sampler;
+
+            @fragment
+            fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+                return textureSample(first, shared_sampler, uv) + textureSample(second, shared_sampler, uv);
+            }
+        ";
+        let artifact = Compiler
+            .compile_wgsl(
+                source,
+                Stage::Fragment,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap();
+        assert_eq!(artifact.bindings.len(), 4);
+        assert_eq!(
+            artifact
+                .bindings
+                .iter()
+                .filter(|binding| binding.kind == deko_dksh::BindingKind::Sampler)
+                .map(|binding| (binding.group, binding.binding, binding.target))
+                .collect::<Vec<_>>(),
+            vec![(2, 7, 0), (2, 7, 1)]
+        );
+    }
+
+    #[test]
+    fn bevy_mip_compute_primitives_compile_together() {
+        let source = r"
+            @group(0) @binding(0)
+            var mip: texture_storage_2d_array<rgba16float, read_write>;
+
+            fn write_mip(index: u32, value: vec4<f32>) {
+                var values: array<vec4<f32>, 4>;
+                values[index & 3u] = value;
+                let selected = values[index & 3u];
+                switch index & 1u {
+                    case 0u: { textureStore(mip, vec2<u32>(index, 0u), 0u, selected); }
+                    default: { textureStore(mip, vec2<u32>(0u, index), 0u, selected); }
+                }
+            }
+
+            @compute @workgroup_size(4)
+            fn main(@builtin(local_invocation_index) index: u32) {
+                let loaded = textureLoad(mip, vec2<u32>(0u), 0u);
+                let shuffled = quadSwapX(loaded);
+                let bits = insertBits(extractBits(index, 1u, 3u), index, 0u, 1u);
+                let unsigned_math = (bits / 3u) + (bits % 3u);
+                let signed = i32(index) - 2;
+                let signed_math = (signed / 3) + (signed % 3);
+                write_mip(index, shuffled + vec4<f32>(f32(unsigned_math + u32(signed_math + 3))));
+            }
+        ";
+        let artifact = Compiler
+            .compile_wgsl(
+                source,
+                Stage::Compute,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap();
+        assert_eq!(artifact.bindings.len(), 1);
+        assert_eq!(
+            artifact.bindings[0].kind,
+            deko_dksh::BindingKind::StorageTexture
+        );
+        assert!(deko_dksh::parse(&artifact.dksh).unwrap().code.len() > 0x80);
+    }
+
+    #[test]
+    fn void_helpers_and_fragment_discard_compile() {
+        let source = r"
+            fn reject_negative(value: f32) {
+                if value < 0.0 { discard; }
+            }
+
+            @fragment
+            fn main(@location(0) value: f32) -> @location(0) vec4<f32> {
+                reject_negative(value);
+                return vec4<f32>(value);
+            }
+        ";
+        Compiler
+            .compile_wgsl(
+                source,
+                Stage::Fragment,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap();
+    }
+
+    #[test]
     fn bevy_style_dynamic_uniform_vertex_features_compile() {
         let source = r"
             struct Mesh { world_from_local: mat3x4<f32> }
