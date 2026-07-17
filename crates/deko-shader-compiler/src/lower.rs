@@ -1,9 +1,10 @@
 use deko_nak::ir::{
     CBuf, CBufRef, ChannelMask, Dst, FRndMode, FloatCmpOp, FloatType, Function, Instr, IntCmpOp,
-    IntCmpType, InterpFreq, InterpLoc, LdcMode, LogicOp2, MemEvictionPriority, MemType, MuFuOp,
-    OpALd, OpASt, OpExit, OpFAdd, OpFMnMx, OpFMul, OpFSetP, OpISetP, OpIpa, OpLdc, OpLop2, OpMov,
-    OpMuFu, OpPSetP, OpRegOut, OpSel, OpTex, PredSetOp, RegFile, SSARef, Shader, ShaderInfo,
-    ShaderIoInfo, ShaderModelInfo, Src, TexDerivMode, TexDim, TexLodMode, TexOffsetMode, TexRef,
+    IntCmpType, IntType, InterpFreq, InterpLoc, LdcMode, LogicOp2, MemEvictionPriority, MemType,
+    MuFuOp, OpALd, OpASt, OpExit, OpF2I, OpFAdd, OpFMnMx, OpFMul, OpFSetP, OpI2F, OpIAdd2, OpIMad,
+    OpIMnMx, OpIMul, OpISetP, OpIpa, OpLdc, OpLop2, OpMov, OpMuFu, OpPSetP, OpRegOut, OpSel, OpShl,
+    OpShr, OpTex, PredSetOp, RegFile, SSARef, Shader, ShaderInfo, ShaderIoInfo, ShaderModelInfo,
+    Src, TexDerivMode, TexDim, TexLodMode, TexOffsetMode, TexRef,
 };
 use deko_nak::sph::PixelImap;
 use std::collections::HashMap;
@@ -192,6 +193,13 @@ struct Value {
     kind: naga::ScalarKind,
 }
 
+type UniformPointer = (
+    naga::Handle<naga::GlobalVariable>,
+    naga::Handle<naga::Type>,
+    u32,
+    Option<Src>,
+);
+
 struct FunctionLowerer<'function> {
     module: &'function naga::Module,
     source: &'function naga::Function,
@@ -319,6 +327,12 @@ impl<'function> FunctionLowerer<'function> {
                 arg2,
                 arg3,
             } => self.math(*fun, *arg, *arg1, *arg2, *arg3)?,
+            naga::Expression::Relational { fun, argument } => self.relational(*fun, *argument)?,
+            naga::Expression::As {
+                expr,
+                kind,
+                convert,
+            } => self.cast(*expr, *kind, *convert)?,
             expression => {
                 return Err(Error::UnsupportedFeature(format!(
                     "expression {expression:?}"
@@ -409,11 +423,14 @@ impl<'function> FunctionLowerer<'function> {
             || offset.is_some()
             || depth_ref.is_some()
             || clamp_to_edge
-            || level != naga::SampleLevel::Auto
+            || matches!(level, naga::SampleLevel::Gradient { .. })
         {
-            return Err(Error::UnsupportedFeature(
-                "non-basic texture sample".to_owned(),
-            ));
+            return Err(Error::UnsupportedFeature(format!(
+                "texture sample options gather={gather:?} array={} offset={} level={level:?} depth={} clamp={clamp_to_edge}",
+                array_index.is_some(),
+                offset.is_some(),
+                depth_ref.is_some()
+            )));
         }
         let image = self.global_expression(image, "texture")?;
         let sampler = self.global_expression(sampler, "sampler")?;
@@ -441,7 +458,7 @@ impl<'function> FunctionLowerer<'function> {
                 "sampled texture scalar kind {kind:?}"
             )));
         }
-        let coordinate = self.expression(coordinate)?;
+        let mut coordinate = self.expression(coordinate)?;
         let expected = match dim {
             TexDim::_1D => 1,
             TexDim::_2D => 2,
@@ -453,6 +470,31 @@ impl<'function> FunctionLowerer<'function> {
                 "texture coordinate shape mismatch".to_owned(),
             ));
         }
+        let lod_mode = match level {
+            naga::SampleLevel::Auto => TexLodMode::Auto,
+            naga::SampleLevel::Zero => TexLodMode::Zero,
+            naga::SampleLevel::Bias(level) => {
+                let level = self.expression(level)?;
+                if level.kind != naga::ScalarKind::Float || level.components.len() != 1 {
+                    return Err(Error::UnsupportedFeature(
+                        "texture bias must be a float scalar".to_owned(),
+                    ));
+                }
+                coordinate.components.extend(level.components);
+                TexLodMode::Bias
+            }
+            naga::SampleLevel::Exact(level) => {
+                let level = self.expression(level)?;
+                if level.kind != naga::ScalarKind::Float || level.components.len() != 1 {
+                    return Err(Error::UnsupportedFeature(
+                        "texture LOD must be a float scalar".to_owned(),
+                    ));
+                }
+                coordinate.components.extend(level.components);
+                TexLodMode::Lod
+            }
+            naga::SampleLevel::Gradient { .. } => unreachable!("rejected above"),
+        };
         let coordinate = self.materialize(coordinate)?;
         let dst = self.target.ssa_alloc.alloc_vec(RegFile::GPR, 4);
         self.target.blocks[0].instrs.push(Instr::new(OpTex {
@@ -461,7 +503,7 @@ impl<'function> FunctionLowerer<'function> {
             tex: TexRef::Bound(target),
             srcs: [Src::from(coordinate), Src::ZERO],
             dim,
-            lod_mode: TexLodMode::Auto,
+            lod_mode,
             deriv_mode: TexDerivMode::Auto,
             z_cmpr: false,
             offset_mode: TexOffsetMode::None,
@@ -489,6 +531,7 @@ impl<'function> FunctionLowerer<'function> {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn math(
         &mut self,
         fun: naga::MathFunction,
@@ -502,6 +545,7 @@ impl<'function> FunctionLowerer<'function> {
                 "four-argument math function {fun:?}"
             )));
         }
+        let matrix_shape = self.expression_matrix_shape(arg);
         let value = self.expression(arg)?;
         match fun {
             naga::MathFunction::Abs if value.kind == naga::ScalarKind::Float => Ok(Value {
@@ -510,13 +554,29 @@ impl<'function> FunctionLowerer<'function> {
             }),
             naga::MathFunction::Min | naga::MathFunction::Max => {
                 let other = self.math_argument(fun, arg1, 1)?;
-                self.float_minmax(&value, &other, fun == naga::MathFunction::Min)
+                if value.kind == naga::ScalarKind::Float {
+                    self.float_minmax(&value, &other, fun == naga::MathFunction::Min)
+                } else {
+                    self.integer_minmax(&value, &other, fun == naga::MathFunction::Min)
+                }
             }
             naga::MathFunction::Clamp => {
                 let low = self.math_argument(fun, arg1, 1)?;
                 let high = self.math_argument(fun, arg2, 2)?;
                 let value = self.float_minmax(&value, &low, false)?;
                 self.float_minmax(&value, &high, true)
+            }
+            naga::MathFunction::Mix => {
+                let other = self.math_argument(fun, arg1, 1)?;
+                let factor = self.math_argument(fun, arg2, 2)?;
+                let one = Value {
+                    components: vec![Src::from(1.0_f32)],
+                    kind: naga::ScalarKind::Float,
+                };
+                let inverse = self.binary(naga::BinaryOperator::Subtract, &one, &factor, None)?;
+                let left = self.binary(naga::BinaryOperator::Multiply, &value, &inverse, None)?;
+                let right = self.binary(naga::BinaryOperator::Multiply, &other, &factor, None)?;
+                self.binary(naga::BinaryOperator::Add, &left, &right, None)
             }
             naga::MathFunction::Saturate => {
                 let zero = Value {
@@ -531,12 +591,231 @@ impl<'function> FunctionLowerer<'function> {
                 self.float_minmax(&value, &one, true)
             }
             naga::MathFunction::Length => self.float_length(value),
+            naga::MathFunction::Dot => {
+                let other = self.math_argument(fun, arg1, 1)?;
+                self.float_dot(&value, &other)
+            }
+            naga::MathFunction::Floor => self.float_round(value, FRndMode::NegInf),
+            naga::MathFunction::Fract => {
+                let floor = self.float_round(value.clone(), FRndMode::NegInf)?;
+                self.binary(naga::BinaryOperator::Subtract, &value, &floor, None)
+            }
+            naga::MathFunction::Ceil => self.float_round(value, FRndMode::PosInf),
+            naga::MathFunction::Round => self.float_round(value, FRndMode::NearestEven),
+            naga::MathFunction::Trunc => self.float_round(value, FRndMode::Zero),
+            naga::MathFunction::Sqrt => self.float_mufu(value, MuFuOp::Sqrt),
+            naga::MathFunction::InverseSqrt => self.float_mufu(value, MuFuOp::Rsq),
+            naga::MathFunction::Sin => self.float_mufu(value, MuFuOp::Sin),
+            naga::MathFunction::Cos => self.float_mufu(value, MuFuOp::Cos),
+            naga::MathFunction::Exp2 => self.float_mufu(value, MuFuOp::Exp2),
+            naga::MathFunction::Log2 => self.float_mufu(value, MuFuOp::Log2),
+            naga::MathFunction::Exp => {
+                let scale = Value {
+                    components: vec![Src::from(std::f32::consts::LOG2_E)],
+                    kind: naga::ScalarKind::Float,
+                };
+                let exponent = self.binary(naga::BinaryOperator::Multiply, &value, &scale, None)?;
+                self.float_mufu(exponent, MuFuOp::Exp2)
+            }
+            naga::MathFunction::Log => {
+                let logarithm = self.float_mufu(value, MuFuOp::Log2)?;
+                let scale = Value {
+                    components: vec![Src::from(std::f32::consts::LN_2)],
+                    kind: naga::ScalarKind::Float,
+                };
+                self.binary(naga::BinaryOperator::Multiply, &logarithm, &scale, None)
+            }
+            naga::MathFunction::Pow => {
+                let exponent = self.math_argument(fun, arg1, 1)?;
+                let logarithm = self.float_mufu(value, MuFuOp::Log2)?;
+                let product =
+                    self.binary(naga::BinaryOperator::Multiply, &logarithm, &exponent, None)?;
+                self.float_mufu(product, MuFuOp::Exp2)
+            }
+            naga::MathFunction::Normalize => {
+                let length = self.float_length(value.clone())?;
+                self.binary(naga::BinaryOperator::Divide, &value, &length, None)
+            }
+            naga::MathFunction::Reflect => {
+                let normal = self.math_argument(fun, arg1, 1)?;
+                let dot = self.float_dot(&normal, &value)?;
+                let two = Value {
+                    components: vec![Src::from(2.0_f32)],
+                    kind: naga::ScalarKind::Float,
+                };
+                let scale = self.binary(naga::BinaryOperator::Multiply, &two, &dot, None)?;
+                let projection =
+                    self.binary(naga::BinaryOperator::Multiply, &normal, &scale, None)?;
+                self.binary(naga::BinaryOperator::Subtract, &value, &projection, None)
+            }
             naga::MathFunction::Step => {
                 let x = self.math_argument(fun, arg1, 1)?;
                 self.float_step(&value, &x)
             }
+            naga::MathFunction::SmoothStep => {
+                let edge1 = self.math_argument(fun, arg1, 1)?;
+                let x = self.math_argument(fun, arg2, 2)?;
+                let numerator = self.binary(naga::BinaryOperator::Subtract, &x, &value, None)?;
+                let denominator =
+                    self.binary(naga::BinaryOperator::Subtract, &edge1, &value, None)?;
+                let t =
+                    self.binary(naga::BinaryOperator::Divide, &numerator, &denominator, None)?;
+                let zero = Value {
+                    components: vec![Src::from(0.0_f32)],
+                    kind: naga::ScalarKind::Float,
+                };
+                let one = Value {
+                    components: vec![Src::from(1.0_f32)],
+                    kind: naga::ScalarKind::Float,
+                };
+                let t = self.float_minmax(&t, &zero, false)?;
+                let t = self.float_minmax(&t, &one, true)?;
+                let square = self.binary(naga::BinaryOperator::Multiply, &t, &t, None)?;
+                let two = Value {
+                    components: vec![Src::from(2.0_f32)],
+                    kind: naga::ScalarKind::Float,
+                };
+                let three = Value {
+                    components: vec![Src::from(3.0_f32)],
+                    kind: naga::ScalarKind::Float,
+                };
+                let twice = self.binary(naga::BinaryOperator::Multiply, &two, &t, None)?;
+                let curve = self.binary(naga::BinaryOperator::Subtract, &three, &twice, None)?;
+                self.binary(naga::BinaryOperator::Multiply, &square, &curve, None)
+            }
+            naga::MathFunction::Transpose => {
+                let (columns, rows) = matrix_shape.ok_or_else(|| {
+                    Error::UnsupportedFeature("transpose of a non-matrix value".to_owned())
+                })?;
+                let mut components = Vec::with_capacity(columns * rows);
+                for output_column in 0..rows {
+                    for output_row in 0..columns {
+                        components
+                            .push(value.components[output_row * rows + output_column].clone());
+                    }
+                }
+                Ok(Value {
+                    components,
+                    kind: value.kind,
+                })
+            }
             _ => Err(Error::UnsupportedFeature(format!("math function {fun:?}"))),
         }
+    }
+
+    fn relational(
+        &mut self,
+        fun: naga::RelationalFunction,
+        argument: naga::Handle<naga::Expression>,
+    ) -> Result<Value, Error> {
+        let argument = self.expression(argument)?;
+        if argument.kind != naga::ScalarKind::Bool || argument.components.is_empty() {
+            return Err(Error::UnsupportedFeature(format!(
+                "relational function {fun:?} on a non-boolean value"
+            )));
+        }
+        if !matches!(
+            fun,
+            naga::RelationalFunction::Any | naga::RelationalFunction::All
+        ) {
+            return Err(Error::UnsupportedFeature(format!(
+                "relational function {fun:?}"
+            )));
+        }
+        let mut components = argument.components.into_iter();
+        let mut result = components.next().expect("argument is non-empty");
+        for component in components {
+            let dst = self.target.ssa_alloc.alloc(RegFile::Pred);
+            let (second, third) = if fun == naga::RelationalFunction::All {
+                (component, false.into())
+            } else {
+                (true.into(), component)
+            };
+            self.target.blocks[0].instrs.push(Instr::new(OpPSetP {
+                dsts: [Dst::from(dst), Dst::None],
+                ops: [PredSetOp::And, PredSetOp::Or],
+                srcs: [result, second, third],
+            }));
+            result = Src::from(dst);
+        }
+        Ok(Value {
+            components: vec![result],
+            kind: naga::ScalarKind::Bool,
+        })
+    }
+
+    fn cast(
+        &mut self,
+        expression: naga::Handle<naga::Expression>,
+        kind: naga::ScalarKind,
+        convert: Option<naga::Bytes>,
+    ) -> Result<Value, Error> {
+        let value = self.expression(expression)?;
+        if convert.is_none() {
+            return Ok(Value {
+                components: value.components,
+                kind,
+            });
+        }
+        if convert != Some(4) {
+            return Err(Error::UnsupportedFeature(format!(
+                "conversion to {kind:?} with width {convert:?}"
+            )));
+        }
+        let mut components = Vec::with_capacity(value.components.len());
+        for source in value.components {
+            let dst = self.target.ssa_alloc.alloc(RegFile::GPR);
+            let instruction = match (value.kind, kind) {
+                (naga::ScalarKind::Uint, naga::ScalarKind::Float) => Instr::new(OpI2F {
+                    dst: Dst::from(dst),
+                    src: source,
+                    dst_type: FloatType::F32,
+                    src_type: IntType::U32,
+                    rnd_mode: FRndMode::NearestEven,
+                }),
+                (naga::ScalarKind::Sint, naga::ScalarKind::Float) => Instr::new(OpI2F {
+                    dst: Dst::from(dst),
+                    src: source,
+                    dst_type: FloatType::F32,
+                    src_type: IntType::I32,
+                    rnd_mode: FRndMode::NearestEven,
+                }),
+                (naga::ScalarKind::Bool, naga::ScalarKind::Float) => Instr::new(OpSel {
+                    dst: Dst::from(dst),
+                    cond: source,
+                    srcs: [Src::from(1.0_f32), Src::from(0.0_f32)],
+                }),
+                (naga::ScalarKind::Float, naga::ScalarKind::Uint) => Instr::new(OpF2I {
+                    dst: Dst::from(dst),
+                    src: source,
+                    src_type: FloatType::F32,
+                    dst_type: IntType::U32,
+                    rnd_mode: FRndMode::Zero,
+                    ftz: false,
+                }),
+                (naga::ScalarKind::Float, naga::ScalarKind::Sint) => Instr::new(OpF2I {
+                    dst: Dst::from(dst),
+                    src: source,
+                    src_type: FloatType::F32,
+                    dst_type: IntType::I32,
+                    rnd_mode: FRndMode::Zero,
+                    ftz: false,
+                }),
+                (source_kind, target_kind) if source_kind == target_kind => Instr::new(OpMov {
+                    dst: Dst::from(dst),
+                    src: source,
+                    quad_lanes: 0xf,
+                }),
+                (source_kind, target_kind) => {
+                    return Err(Error::UnsupportedFeature(format!(
+                        "conversion from {source_kind:?} to {target_kind:?}"
+                    )));
+                }
+            };
+            self.target.blocks[0].instrs.push(instruction);
+            components.push(Src::from(dst));
+        }
+        Ok(Value { components, kind })
     }
 
     fn math_argument(
@@ -587,6 +866,51 @@ impl<'function> FunctionLowerer<'function> {
         })
     }
 
+    fn integer_minmax(&mut self, left: &Value, right: &Value, min: bool) -> Result<Value, Error> {
+        if left.kind != right.kind
+            || !matches!(left.kind, naga::ScalarKind::Uint | naga::ScalarKind::Sint)
+        {
+            return Err(Error::UnsupportedFeature(
+                "non-integer integer min/max".to_owned(),
+            ));
+        }
+        let width = left.components.len().max(right.components.len());
+        if (left.components.len() != 1 && left.components.len() != width)
+            || (right.components.len() != 1 && right.components.len() != width)
+        {
+            return Err(Error::UnsupportedFeature(
+                "integer min/max operands with incompatible widths".to_owned(),
+            ));
+        }
+        let cmp_type = if left.kind == naga::ScalarKind::Uint {
+            IntCmpType::U32
+        } else {
+            IntCmpType::I32
+        };
+        let mut components = Vec::with_capacity(width);
+        for index in 0..width {
+            let left = left.components[if left.components.len() == 1 { 0 } else { index }].clone();
+            let right = right.components[if right.components.len() == 1 {
+                0
+            } else {
+                index
+            }]
+            .clone();
+            let dst = self.target.ssa_alloc.alloc(RegFile::GPR);
+            self.target.blocks[0].instrs.push(Instr::new(OpIMnMx {
+                dst: Dst::from(dst),
+                cmp_type,
+                srcs: [left, right],
+                min: min.into(),
+            }));
+            components.push(Src::from(dst));
+        }
+        Ok(Value {
+            components,
+            kind: left.kind,
+        })
+    }
+
     fn float_length(&mut self, value: Value) -> Result<Value, Error> {
         if value.kind != naga::ScalarKind::Float || value.components.is_empty() {
             return Err(Error::UnsupportedFeature("non-float length".to_owned()));
@@ -626,6 +950,104 @@ impl<'function> FunctionLowerer<'function> {
         }));
         Ok(Value {
             components: vec![Src::from(dst)],
+            kind: naga::ScalarKind::Float,
+        })
+    }
+
+    fn float_dot(&mut self, left: &Value, right: &Value) -> Result<Value, Error> {
+        if left.kind != naga::ScalarKind::Float
+            || right.kind != naga::ScalarKind::Float
+            || left.components.is_empty()
+            || left.components.len() != right.components.len()
+        {
+            return Err(Error::UnsupportedFeature(
+                "dot operands must be equally-sized float vectors".to_owned(),
+            ));
+        }
+        let mut sum = None;
+        for (left, right) in left.components.iter().zip(&right.components) {
+            let product = self.target.ssa_alloc.alloc(RegFile::GPR);
+            self.target.blocks[0].instrs.push(Instr::new(OpFMul {
+                dst: Dst::from(product),
+                srcs: [left.clone(), right.clone()],
+                saturate: false,
+                rnd_mode: FRndMode::NearestEven,
+                ftz: false,
+                dnz: false,
+            }));
+            sum = Some(match sum {
+                None => Src::from(product),
+                Some(previous) => {
+                    let dst = self.target.ssa_alloc.alloc(RegFile::GPR);
+                    self.target.blocks[0].instrs.push(Instr::new(OpFAdd {
+                        dst: Dst::from(dst),
+                        srcs: [previous, Src::from(product)],
+                        saturate: false,
+                        rnd_mode: FRndMode::NearestEven,
+                        ftz: false,
+                    }));
+                    Src::from(dst)
+                }
+            });
+        }
+        Ok(Value {
+            components: vec![sum.expect("dot operands are non-empty")],
+            kind: naga::ScalarKind::Float,
+        })
+    }
+
+    fn float_round(&mut self, value: Value, rnd_mode: FRndMode) -> Result<Value, Error> {
+        if value.kind != naga::ScalarKind::Float {
+            return Err(Error::UnsupportedFeature(
+                "rounding a non-float value".to_owned(),
+            ));
+        }
+        let mut components = Vec::with_capacity(value.components.len());
+        for source in value.components {
+            let integer = self.target.ssa_alloc.alloc(RegFile::GPR);
+            self.target.blocks[0].instrs.push(Instr::new(OpF2I {
+                dst: Dst::from(integer),
+                src: source,
+                src_type: FloatType::F32,
+                dst_type: IntType::I32,
+                rnd_mode,
+                ftz: false,
+            }));
+            let dst = self.target.ssa_alloc.alloc(RegFile::GPR);
+            self.target.blocks[0].instrs.push(Instr::new(OpI2F {
+                dst: Dst::from(dst),
+                src: Src::from(integer),
+                dst_type: FloatType::F32,
+                src_type: IntType::I32,
+                rnd_mode: FRndMode::NearestEven,
+            }));
+            components.push(Src::from(dst));
+        }
+        Ok(Value {
+            components,
+            kind: naga::ScalarKind::Float,
+        })
+    }
+
+    fn float_mufu(&mut self, value: Value, op: MuFuOp) -> Result<Value, Error> {
+        if value.kind != naga::ScalarKind::Float {
+            return Err(Error::UnsupportedFeature(
+                "transcendental operation on a non-float value".to_owned(),
+            ));
+        }
+        let mut components = Vec::with_capacity(value.components.len());
+        for source in value.components {
+            let dst = self.target.ssa_alloc.alloc(RegFile::GPR);
+            self.target.blocks[0].instrs.push(Instr::new(OpMuFu {
+                dst: Dst::from(dst),
+                op,
+                src: source,
+                op_type: FloatType::F32,
+            }));
+            components.push(Src::from(dst));
+        }
+        Ok(Value {
+            components,
             kind: naga::ScalarKind::Float,
         })
     }
@@ -674,14 +1096,91 @@ impl<'function> FunctionLowerer<'function> {
                 .arguments
                 .get(index as usize)
                 .map(|argument| argument.ty),
+            naga::Expression::CallResult(function) => self.module.functions[function]
+                .result
+                .as_ref()
+                .map(|result| result.ty),
+            naga::Expression::AccessIndex { base, index } => {
+                let base = self.expression_type(base)?;
+                match self.module.types[base].inner {
+                    naga::TypeInner::Struct { ref members, .. } => {
+                        members.get(index as usize).map(|member| member.ty)
+                    }
+                    naga::TypeInner::Array { base, .. } => Some(base),
+                    naga::TypeInner::Matrix { rows, scalar, .. } => {
+                        self.vector_type_handle(rows, scalar)
+                    }
+                    naga::TypeInner::Vector { scalar, .. } => self.scalar_type_handle(scalar),
+                    _ => None,
+                }
+            }
             naga::Expression::Load { pointer } if self.pointer_is_local(pointer) => {
                 self.local_pointer(pointer).ok().map(|(_, ty, _)| ty)
             }
-            naga::Expression::Load { pointer } => {
-                self.uniform_pointer(pointer).ok().map(|(_, ty, _)| ty)
+            naga::Expression::Load { pointer } => self.pointer_type(pointer),
+            _ => None,
+        }
+    }
+
+    fn pointer_type(
+        &self,
+        handle: naga::Handle<naga::Expression>,
+    ) -> Option<naga::Handle<naga::Type>> {
+        match self.source.expressions[handle] {
+            naga::Expression::GlobalVariable(global) => {
+                Some(self.module.global_variables[global].ty)
+            }
+            naga::Expression::LocalVariable(local) => Some(self.source.local_variables[local].ty),
+            naga::Expression::Access { base, .. } => {
+                let base = self.pointer_type(base)?;
+                match self.module.types[base].inner {
+                    naga::TypeInner::Array { base, .. } => Some(base),
+                    _ => None,
+                }
+            }
+            naga::Expression::AccessIndex { base, index } => {
+                let base = self.pointer_type(base)?;
+                match self.module.types[base].inner {
+                    naga::TypeInner::Struct { ref members, .. } => {
+                        members.get(index as usize).map(|member| member.ty)
+                    }
+                    naga::TypeInner::Array { base, .. } => Some(base),
+                    naga::TypeInner::Matrix { rows, scalar, .. } => {
+                        self.vector_type_handle(rows, scalar)
+                    }
+                    naga::TypeInner::Vector { scalar, .. } => self.scalar_type_handle(scalar),
+                    _ => None,
+                }
             }
             _ => None,
         }
+    }
+
+    fn vector_type_handle(
+        &self,
+        size: naga::VectorSize,
+        scalar: naga::Scalar,
+    ) -> Option<naga::Handle<naga::Type>> {
+        self.module.types.iter().find_map(|(handle, candidate)| {
+            matches!(
+                candidate.inner,
+                naga::TypeInner::Vector {
+                    size: candidate_size,
+                    scalar: candidate_scalar,
+                } if candidate_size == size && candidate_scalar == scalar
+            )
+            .then_some(handle)
+        })
+    }
+
+    fn scalar_type_handle(&self, scalar: naga::Scalar) -> Option<naga::Handle<naga::Type>> {
+        self.module.types.iter().find_map(|(handle, candidate)| {
+            matches!(
+                candidate.inner,
+                naga::TypeInner::Scalar(candidate_scalar) if candidate_scalar == scalar
+            )
+            .then_some(handle)
+        })
     }
 
     fn access_index(
@@ -800,31 +1299,27 @@ impl<'function> FunctionLowerer<'function> {
         &self,
         handle: naga::Handle<naga::Expression>,
     ) -> Option<(usize, usize)> {
-        let ty = match self.source.expressions[handle] {
-            naga::Expression::Compose { ty, .. } | naga::Expression::ZeroValue(ty) => ty,
-            naga::Expression::FunctionArgument(index) => {
-                self.source.arguments.get(index as usize)?.ty
-            }
-            naga::Expression::Load { pointer } => self.uniform_pointer(pointer).ok()?.1,
-            _ => return None,
-        };
+        if let naga::Expression::Math {
+            fun: naga::MathFunction::Transpose,
+            arg,
+            ..
+        } = self.source.expressions[handle]
+        {
+            let (columns, rows) = self.expression_matrix_shape(arg)?;
+            return Some((rows, columns));
+        }
+        let ty = self.expression_type(handle)?;
         let naga::TypeInner::Matrix { columns, rows, .. } = self.module.types[ty].inner else {
             return None;
         };
         Some((vector_size(columns), vector_size(rows)))
     }
 
+    #[allow(clippy::too_many_lines)]
     fn uniform_pointer(
-        &self,
+        &mut self,
         handle: naga::Handle<naga::Expression>,
-    ) -> Result<
-        (
-            naga::Handle<naga::GlobalVariable>,
-            naga::Handle<naga::Type>,
-            u32,
-        ),
-        Error,
-    > {
+    ) -> Result<UniformPointer, Error> {
         match self.source.expressions[handle] {
             naga::Expression::GlobalVariable(global) => {
                 let variable = &self.module.global_variables[global];
@@ -834,23 +1329,130 @@ impl<'function> FunctionLowerer<'function> {
                         variable.space
                     )));
                 }
-                Ok((global, variable.ty, 0))
+                Ok((global, variable.ty, 0, None))
+            }
+            naga::Expression::Access { base, index } => {
+                let (global, ty, offset, dynamic_offset) = self.uniform_pointer(base)?;
+                let (element, stride) = match self.module.types[ty].inner {
+                    naga::TypeInner::Array {
+                        base: element,
+                        stride,
+                        ..
+                    } => (element, stride),
+                    naga::TypeInner::Vector { scalar, .. } => (
+                        self.scalar_type_handle(scalar).ok_or_else(|| {
+                            Error::UnsupportedFeature(
+                                "dynamic uniform vector scalar type is absent".to_owned(),
+                            )
+                        })?,
+                        u32::from(scalar.width),
+                    ),
+                    naga::TypeInner::Matrix { rows, scalar, .. } => {
+                        let row_bytes = u32::from(scalar.width)
+                            * u32::try_from(vector_size(rows))
+                                .expect("vectors have at most 4 rows");
+                        let alignment = if rows == naga::VectorSize::Bi { 8 } else { 16 };
+                        (
+                            self.vector_type_handle(rows, scalar).ok_or_else(|| {
+                                Error::UnsupportedFeature(
+                                    "dynamic uniform matrix column type is absent".to_owned(),
+                                )
+                            })?,
+                            row_bytes.div_ceil(alignment) * alignment,
+                        )
+                    }
+                    ref inner => {
+                        return Err(Error::UnsupportedFeature(format!(
+                            "dynamic uniform access into {inner:?}"
+                        )));
+                    }
+                };
+                let index = self.expression(index)?;
+                if index.components.len() != 1
+                    || !matches!(index.kind, naga::ScalarKind::Sint | naga::ScalarKind::Uint)
+                {
+                    return Err(Error::UnsupportedFeature(
+                        "uniform array index must be an integer scalar".to_owned(),
+                    ));
+                }
+                let scaled = self.target.ssa_alloc.alloc(RegFile::GPR);
+                self.target.blocks[0].instrs.push(Instr::new(OpIMad {
+                    dst: Dst::from(scaled),
+                    srcs: [
+                        index.components[0].clone(),
+                        Src::from(stride),
+                        dynamic_offset.unwrap_or(Src::ZERO),
+                    ],
+                    signed: false,
+                }));
+                Ok((global, element, offset, Some(Src::from(scaled))))
             }
             naga::Expression::AccessIndex { base, index } => {
-                let (global, ty, offset) = self.uniform_pointer(base)?;
-                let naga::TypeInner::Struct { ref members, .. } = self.module.types[ty].inner
-                else {
-                    return Err(Error::UnsupportedFeature(
-                        "uniform access into a non-struct value".to_owned(),
-                    ));
+                let (global, ty, offset, dynamic_offset) = self.uniform_pointer(base)?;
+                let (element, field_offset) = match self.module.types[ty].inner {
+                    naga::TypeInner::Struct { ref members, .. } => {
+                        let member = members.get(index as usize).ok_or_else(|| {
+                            Error::UnsupportedFeature(
+                                "uniform member index out of bounds".to_owned(),
+                            )
+                        })?;
+                        (member.ty, member.offset)
+                    }
+                    naga::TypeInner::Array {
+                        base: element,
+                        stride,
+                        ..
+                    } => (
+                        element,
+                        index.checked_mul(stride).ok_or_else(|| {
+                            Error::UnsupportedFeature("uniform array offset overflow".to_owned())
+                        })?,
+                    ),
+                    naga::TypeInner::Matrix {
+                        columns,
+                        rows,
+                        scalar,
+                    } => {
+                        if index as usize >= vector_size(columns) {
+                            return Err(Error::UnsupportedFeature(
+                                "uniform matrix column index out of bounds".to_owned(),
+                            ));
+                        }
+                        let row_bytes = u32::from(scalar.width)
+                            * u32::try_from(vector_size(rows))
+                                .expect("vectors have at most 4 rows");
+                        let alignment = if rows == naga::VectorSize::Bi { 8 } else { 16 };
+                        let stride = row_bytes.div_ceil(alignment) * alignment;
+                        let element = self.vector_type_handle(rows, scalar).ok_or_else(|| {
+                            Error::UnsupportedFeature(
+                                "uniform matrix column type is absent".to_owned(),
+                            )
+                        })?;
+                        (element, index * stride)
+                    }
+                    naga::TypeInner::Vector { size, scalar } => {
+                        if index as usize >= vector_size(size) {
+                            return Err(Error::UnsupportedFeature(
+                                "uniform vector index out of bounds".to_owned(),
+                            ));
+                        }
+                        let element = self.scalar_type_handle(scalar).ok_or_else(|| {
+                            Error::UnsupportedFeature(
+                                "uniform vector scalar type is absent".to_owned(),
+                            )
+                        })?;
+                        (element, index * u32::from(scalar.width))
+                    }
+                    ref inner => {
+                        return Err(Error::UnsupportedFeature(format!(
+                            "uniform access into {inner:?}"
+                        )));
+                    }
                 };
-                let member = members.get(index as usize).ok_or_else(|| {
-                    Error::UnsupportedFeature("uniform member index out of bounds".to_owned())
-                })?;
-                let offset = offset.checked_add(member.offset).ok_or_else(|| {
+                let offset = offset.checked_add(field_offset).ok_or_else(|| {
                     Error::UnsupportedFeature("uniform offset overflow".to_owned())
                 })?;
-                Ok((global, member.ty, offset))
+                Ok((global, element, offset, dynamic_offset))
             }
             ref pointer => Err(Error::UnsupportedFeature(format!(
                 "load pointer {pointer:?}"
@@ -859,7 +1461,7 @@ impl<'function> FunctionLowerer<'function> {
     }
 
     fn load_uniform(&mut self, pointer: naga::Handle<naga::Expression>) -> Result<Value, Error> {
-        let (global, ty, base_offset) = self.uniform_pointer(pointer)?;
+        let (global, ty, base_offset, dynamic_offset) = self.uniform_pointer(pointer)?;
         let target = *self.resources.uniforms.get(&global).ok_or_else(|| {
             Error::UnsupportedFeature("uniform has no allocated Deko slot".to_owned())
         })?;
@@ -875,10 +1477,11 @@ impl<'function> FunctionLowerer<'function> {
             self.target.blocks[0].instrs.push(Instr::new(OpLdc {
                 dst: Dst::from(dst),
                 cb: Src::from(CBufRef {
-                    buf: CBuf::Binding(target),
+                    // Deko reserves c0 and c1 for driver state. User uniform target zero is c2.
+                    buf: CBuf::Binding(target + 2),
                     offset,
                 }),
-                offset: Src::ZERO,
+                offset: dynamic_offset.clone().unwrap_or(Src::ZERO),
                 mode: LdcMode::Indexed,
                 mem_type: MemType::B32,
             }));
@@ -951,6 +1554,28 @@ impl<'function> FunctionLowerer<'function> {
                         let scalar_ty = self.scalar_type(scalar)?;
                         Ok((local, scalar_ty, component_offset + index as usize))
                     }
+                    naga::TypeInner::Array {
+                        base: element,
+                        size,
+                        ..
+                    } => {
+                        if let naga::ArraySize::Constant(count) = size {
+                            if index >= count.get() {
+                                return Err(Error::UnsupportedFeature(
+                                    "local array index out of bounds".to_owned(),
+                                ));
+                            }
+                        }
+                        let element_components = flat_type_components(self.module, element)?;
+                        let preceding = (index as usize)
+                            .checked_mul(element_components)
+                            .ok_or_else(|| {
+                                Error::UnsupportedFeature(
+                                    "local array component offset overflow".to_owned(),
+                                )
+                            })?;
+                        Ok((local, element, component_offset + preceding))
+                    }
                     ref inner => Err(Error::UnsupportedFeature(format!(
                         "local access into {inner:?}"
                     ))),
@@ -1015,9 +1640,11 @@ impl<'function> FunctionLowerer<'function> {
         if (left.components.len() != 1 && left.components.len() != width)
             || (right.components.len() != 1 && right.components.len() != width)
         {
-            return Err(Error::UnsupportedFeature(
-                "binary operands with incompatible widths".to_owned(),
-            ));
+            return Err(Error::UnsupportedFeature(format!(
+                "{op:?} operands with incompatible widths {} and {} (left matrix {left_matrix:?})",
+                left.components.len(),
+                right.components.len()
+            )));
         }
         let mut components = Vec::with_capacity(width);
         for index in 0..width {
@@ -1048,6 +1675,7 @@ impl<'function> FunctionLowerer<'function> {
         Ok(Value { components, kind })
     }
 
+    #[allow(clippy::too_many_lines)]
     fn binary_component(
         &mut self,
         op: naga::BinaryOperator,
@@ -1105,6 +1733,46 @@ impl<'function> FunctionLowerer<'function> {
                 | naga::BinaryOperator::Greater
                 | naga::BinaryOperator::GreaterEqual,
             ) => return self.float_comparison(op, lhs, rhs),
+            (
+                naga::ScalarKind::Uint | naga::ScalarKind::Sint,
+                naga::BinaryOperator::Add | naga::BinaryOperator::Subtract,
+            ) => Instr::new(OpIAdd2 {
+                dst: Dst::from(dst),
+                carry_out: Dst::None,
+                srcs: [
+                    lhs,
+                    if op == naga::BinaryOperator::Subtract {
+                        rhs.ineg()
+                    } else {
+                        rhs
+                    },
+                ],
+            }),
+            (naga::ScalarKind::Uint | naga::ScalarKind::Sint, naga::BinaryOperator::Multiply) => {
+                Instr::new(OpIMul {
+                    dst: Dst::from(dst),
+                    srcs: [lhs, rhs],
+                    signed: [kind == naga::ScalarKind::Sint; 2],
+                    high: false,
+                })
+            }
+            (naga::ScalarKind::Uint | naga::ScalarKind::Sint, naga::BinaryOperator::ShiftLeft) => {
+                Instr::new(OpShl {
+                    dst: Dst::from(dst),
+                    src: lhs,
+                    shift: rhs,
+                    wrap: true,
+                })
+            }
+            (naga::ScalarKind::Uint | naga::ScalarKind::Sint, naga::BinaryOperator::ShiftRight) => {
+                Instr::new(OpShr {
+                    dst: Dst::from(dst),
+                    src: lhs,
+                    shift: rhs,
+                    wrap: true,
+                    signed: kind == naga::ScalarKind::Sint,
+                })
+            }
             (
                 naga::ScalarKind::Uint | naga::ScalarKind::Sint,
                 naga::BinaryOperator::And
@@ -1308,9 +1976,11 @@ impl<'function> FunctionLowerer<'function> {
                     let value = self.expression(*value)?;
                     let expected = flat_type_components(self.module, ty)?;
                     if value.components.len() != expected {
-                        return Err(Error::UnsupportedFeature(
-                            "local store shape mismatch".to_owned(),
-                        ));
+                        return Err(Error::UnsupportedFeature(format!(
+                            "local store shape mismatch: expected {expected}, got {} for pointer {:?}",
+                            value.components.len(),
+                            self.source.expressions[*pointer]
+                        )));
                     }
                     let mut local_value = self.local_value(local)?;
                     let end = offset + expected;
@@ -1428,7 +2098,13 @@ impl<'function> FunctionLowerer<'function> {
             arguments,
             early_returns: Vec::new(),
         };
-        let result = callee.return_value();
+        let result = callee.return_value().map_err(|error| match error {
+            Error::UnsupportedFeature(message) => Error::UnsupportedFeature(format!(
+                "in function {}: {message}",
+                callee.source.name.as_deref().unwrap_or("<unnamed>")
+            )),
+            error => error,
+        });
         self.target = callee.target;
         result
     }
@@ -1741,41 +2417,93 @@ fn bind_vertex_arguments(
     lowerer: &mut FunctionLowerer<'_>,
     info: &mut ShaderInfo,
 ) -> Result<(), Error> {
-    for argument in &lowerer.source.arguments {
-        let Some(naga::Binding::Location { location, .. }) = argument.binding.as_ref() else {
-            return Err(Error::UnsupportedFeature(format!(
-                "vertex argument binding {:?}",
-                argument.binding
-            )));
-        };
-        let (components, kind) = type_shape(module, argument.ty)?;
-        if kind == naga::ScalarKind::Bool {
+    let arguments = lowerer.source.arguments.clone();
+    for argument in &arguments {
+        let fields = if let Some(binding) = &argument.binding {
+            vec![(binding.clone(), argument.ty)]
+        } else if let naga::TypeInner::Struct { ref members, .. } = module.types[argument.ty].inner
+        {
+            members
+                .iter()
+                .map(|member| {
+                    Ok((
+                        member.binding.clone().ok_or_else(|| {
+                            Error::UnsupportedFeature(
+                                "unbound vertex input struct member".to_owned(),
+                            )
+                        })?,
+                        member.ty,
+                    ))
+                })
+                .collect::<Result<Vec<_>, Error>>()?
+        } else {
             return Err(Error::UnsupportedFeature(
-                "boolean vertex attributes".to_owned(),
+                "unbound non-struct vertex argument".to_owned(),
             ));
-        }
-        let addr = location_address(*location)?;
-        let ssa = lowerer.target.ssa_alloc.alloc_vec(RegFile::GPR, components);
-        lowerer.target.blocks[0].instrs.push(Instr::new(OpALd {
-            dst: Dst::from(ssa.clone()),
-            vtx: Src::ZERO,
-            offset: Src::ZERO,
-            addr,
-            comps: components,
-            patch: false,
-            output: false,
-            phys: false,
-        }));
-        lowerer.arguments.push(Value {
-            components: ssa.iter().copied().map(Src::from).collect(),
-            kind,
-        });
-        let ShaderIoInfo::Vtg(io) = &mut info.io else {
-            unreachable!();
         };
-        io.mark_attrs_read(addr..addr + u16::from(components) * 4);
+        let mut value = Vec::new();
+        let mut kinds = Vec::new();
+        for (binding, ty) in fields {
+            let field = bind_vertex_field(module, lowerer, info, &binding, ty)?;
+            kinds.push(field.kind);
+            value.extend(field.components);
+        }
+        let kind = kinds
+            .first()
+            .copied()
+            .ok_or_else(|| Error::UnsupportedFeature("empty vertex input struct".to_owned()))?;
+        lowerer.arguments.push(Value {
+            components: value,
+            kind: if kinds.iter().all(|candidate| *candidate == kind) {
+                kind
+            } else {
+                naga::ScalarKind::Float
+            },
+        });
     }
     Ok(())
+}
+
+fn bind_vertex_field(
+    module: &naga::Module,
+    lowerer: &mut FunctionLowerer<'_>,
+    info: &mut ShaderInfo,
+    binding: &naga::Binding,
+    ty: naga::Handle<naga::Type>,
+) -> Result<Value, Error> {
+    let (components, kind) = type_shape(module, ty)?;
+    if kind == naga::ScalarKind::Bool {
+        return Err(Error::UnsupportedFeature("boolean vertex input".to_owned()));
+    }
+    let addr = match binding {
+        naga::Binding::Location { location, .. } => location_address(*location)?,
+        naga::Binding::BuiltIn(naga::BuiltIn::InstanceIndex) if components == 1 => 0x2f8,
+        naga::Binding::BuiltIn(naga::BuiltIn::VertexIndex) if components == 1 => 0x2fc,
+        binding @ naga::Binding::BuiltIn(_) => {
+            return Err(Error::UnsupportedFeature(format!(
+                "vertex input binding {binding:?}"
+            )));
+        }
+    };
+    let ssa = lowerer.target.ssa_alloc.alloc_vec(RegFile::GPR, components);
+    lowerer.target.blocks[0].instrs.push(Instr::new(OpALd {
+        dst: Dst::from(ssa.clone()),
+        vtx: Src::ZERO,
+        offset: Src::ZERO,
+        addr,
+        comps: components,
+        patch: false,
+        output: false,
+        phys: false,
+    }));
+    let ShaderIoInfo::Vtg(io) = &mut info.io else {
+        unreachable!();
+    };
+    io.mark_attrs_read(addr..addr + u16::from(components) * 4);
+    Ok(Value {
+        components: ssa.iter().copied().map(Src::from).collect(),
+        kind,
+    })
 }
 
 fn bind_fragment_arguments(
@@ -1844,6 +2572,78 @@ fn argument_member_used(source: &naga::Function, argument: usize, member: usize)
     })
 }
 
+fn bind_fragment_builtin(
+    lowerer: &mut FunctionLowerer<'_>,
+    info: &mut ShaderInfo,
+    builtin: naga::BuiltIn,
+    components: u8,
+    kind: naga::ScalarKind,
+    used: bool,
+) -> Result<Value, Error> {
+    if matches!(builtin, naga::BuiltIn::FrontFacing)
+        && components == 1
+        && kind == naga::ScalarKind::Bool
+    {
+        let raw = lowerer.target.ssa_alloc.alloc(RegFile::GPR);
+        lowerer.target.blocks[0].instrs.push(Instr::new(OpIpa {
+            dst: Dst::from(raw),
+            addr: 0x3fc,
+            freq: InterpFreq::Constant,
+            loc: InterpLoc::Default,
+            inv_w: Src::ZERO,
+            offset: Src::ZERO,
+        }));
+        let predicate = lowerer.target.ssa_alloc.alloc(RegFile::Pred);
+        lowerer.target.blocks[0].instrs.push(Instr::new(OpISetP {
+            dst: Dst::from(predicate),
+            set_op: PredSetOp::And,
+            cmp_op: IntCmpOp::Ne,
+            cmp_type: IntCmpType::U32,
+            ex: false,
+            srcs: [Src::from(raw), Src::ZERO],
+            accum: true.into(),
+            low_cmp: true.into(),
+        }));
+        return Ok(Value {
+            components: vec![Src::from(predicate)],
+            kind,
+        });
+    }
+    if matches!(builtin, naga::BuiltIn::Position { .. }) && components == 4 {
+        if !used {
+            return Ok(Value {
+                components: vec![Src::ZERO; 4],
+                kind,
+            });
+        }
+        let mut value = Vec::with_capacity(4);
+        for component in 0..4_u16 {
+            let addr = 0x70 + component * 4;
+            let ssa = lowerer.target.ssa_alloc.alloc(RegFile::GPR);
+            lowerer.target.blocks[0].instrs.push(Instr::new(OpIpa {
+                dst: Dst::from(ssa),
+                addr,
+                freq: InterpFreq::Pass,
+                loc: InterpLoc::Default,
+                inv_w: Src::ZERO,
+                offset: Src::ZERO,
+            }));
+            value.push(Src::from(ssa));
+            let ShaderIoInfo::Fragment(io) = &mut info.io else {
+                unreachable!();
+            };
+            io.mark_attr_read(addr, PixelImap::ScreenLinear);
+        }
+        return Ok(Value {
+            components: value,
+            kind,
+        });
+    }
+    Err(Error::UnsupportedFeature(format!(
+        "fragment input builtin {builtin:?}"
+    )))
+}
+
 fn bind_fragment_field(
     module: &naga::Module,
     lowerer: &mut FunctionLowerer<'_>,
@@ -1853,6 +2653,9 @@ fn bind_fragment_field(
     used: bool,
 ) -> Result<Value, Error> {
     let (components, kind) = type_shape(module, ty)?;
+    if let naga::Binding::BuiltIn(builtin) = binding {
+        return bind_fragment_builtin(lowerer, info, *builtin, components, kind, used);
+    }
     let naga::Binding::Location {
         location,
         interpolation,
@@ -1860,19 +2663,7 @@ fn bind_fragment_field(
         ..
     } = binding
     else {
-        if matches!(
-            binding,
-            naga::Binding::BuiltIn(naga::BuiltIn::Position { .. })
-        ) && !used
-        {
-            return Ok(Value {
-                components: vec![Src::ZERO; usize::from(components)],
-                kind,
-            });
-        }
-        return Err(Error::UnsupportedFeature(format!(
-            "fragment input binding {binding:?}"
-        )));
+        unreachable!("builtins returned above");
     };
     if kind != naga::ScalarKind::Float && *interpolation != Some(naga::Interpolation::Flat) {
         return Err(Error::UnsupportedFeature(

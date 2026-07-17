@@ -733,6 +733,82 @@ mod tests {
     }
 
     #[test]
+    fn bevy_style_dynamic_uniform_vertex_features_compile() {
+        let source = r"
+            struct Mesh { world_from_local: mat3x4<f32> }
+            struct VertexIn {
+                @builtin(instance_index) instance: u32,
+                @builtin(vertex_index) vertex: u32,
+                @location(0) position: vec3<f32>,
+                @location(1) normal: vec3<f32>,
+            }
+            @group(2) @binding(0) var<uniform> meshes: array<Mesh, 8>;
+
+            @vertex
+            fn main(input: VertexIn) -> @builtin(position) vec4<f32> {
+                let transform = meshes[input.instance].world_from_local;
+                let transformed_normal = normalize((transpose(transform) * vec4<f32>(input.normal, 0.0)).xyz);
+                let nonzero = any(transformed_normal != vec3<f32>());
+                return vec4<f32>(input.position + transformed_normal * f32(nonzero), 1.0 + f32(input.vertex & 0u));
+            }
+        ";
+        let artifact = Compiler
+            .compile_wgsl(
+                source,
+                Stage::Vertex,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            artifact.bindings,
+            vec![deko_dksh::Binding {
+                group: 2,
+                binding: 0,
+                target: 0,
+                kind: deko_dksh::BindingKind::Uniform,
+            }]
+        );
+        let container = deko_dksh::parse(&artifact.dksh).unwrap();
+        assert_eq!(container.bindings, artifact.bindings);
+        assert!(container.code[0x80..].iter().any(|byte| *byte != 0));
+    }
+
+    #[test]
+    fn bevy_style_fragment_builtins_bias_sampling_and_math_compile() {
+        let source = r"
+            @group(1) @binding(0) var image: texture_2d<f32>;
+            @group(1) @binding(1) var image_sampler: sampler;
+
+            @fragment
+            fn main(
+                @builtin(position) position: vec4<f32>,
+                @builtin(front_facing) front: bool,
+                @location(0) uv: vec2<f32>,
+            ) -> @location(0) vec4<f32> {
+                let sampled = textureSampleBias(image, image_sampler, uv, fract(position.x) - 0.5);
+                let facing = f32(front);
+                let shaped = smoothstep(vec3<f32>(0.0), vec3<f32>(1.0), normalize(sampled.xyz));
+                return vec4<f32>(mix(sampled.xyz, shaped, facing), 1.0);
+            }
+        ";
+        let artifact = Compiler
+            .compile_wgsl(
+                source,
+                Stage::Fragment,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap();
+        assert_eq!(artifact.bindings.len(), 2);
+        let container = deko_dksh::parse(&artifact.dksh).unwrap();
+        assert_eq!(container.bindings, artifact.bindings);
+        assert!(container.code[0x80..].iter().any(|byte| *byte != 0));
+    }
+
+    #[test]
     fn pipeline_overrides_are_resolved_and_multiview_fails_explicitly() {
         let source = "override scale: f32 = 1.0; @fragment fn main() -> @location(0) vec4<f32> { return vec4<f32>(scale, 0.0, 0.0, 1.0); }";
         let compile = |scale| {
