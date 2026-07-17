@@ -14,6 +14,8 @@
   indexed binding arrays, and the packed Maxwell bindless handle ABI.
 - Add native Maxwell TXD lowering for explicit 1D/2D texture gradients, including
   array-layer and offset operand packing.
+- Add derivative-to-LOD lowering for explicit 3D and cube texture gradients, including
+  the cube-face selection and quotient-rule calculation used by Mesa NIR.
 - Add a safe deterministic DKSH encoder/parser with typed stage payloads and
   versioned binding metadata consumed by wgpu-hal.
 - Add the explicit GM20B target descriptor, register allocation, scheduling, SPH

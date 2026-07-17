@@ -356,6 +356,14 @@ mod tests {
         fn main() {}
     ";
 
+    fn lowered_ir(source: &str, stage: naga::ShaderStage, entry_point: &str) -> String {
+        let module = naga::front::wgsl::parse_str(source).unwrap();
+        let entry = lower::entry_point(&module, stage, entry_point).unwrap();
+        let sm = deko_nak::ir::ShaderModelInfo::new(53, 64);
+        let lowered = lower::lower_entry_point(&module, entry, &sm, &Options::default()).unwrap();
+        lowered.shader.to_string()
+    }
+
     #[test]
     fn invalid_wgsl_is_a_parse_error() {
         let error = Compiler
@@ -1577,7 +1585,8 @@ mod tests {
     }
 
     #[test]
-    fn gradient_sampling_compiles_and_remaining_limits_fail_explicitly() {
+    #[allow(clippy::too_many_lines)]
+    fn gradient_sampling_compiles_and_subgroup_barriers_fail_explicitly() {
         let gradient_shader = Compiler
             .compile_wgsl(
                 r"
@@ -1625,7 +1634,7 @@ mod tests {
             )
             .unwrap();
 
-        let gradient_3d_error = Compiler
+        let gradient_3d_shader = Compiler
             .compile_wgsl(
                 r"
                     @group(0) @binding(0) var image: texture_3d<f32>;
@@ -1637,6 +1646,7 @@ mod tests {
                             vec3<f32>(0.5),
                             vec3<f32>(1.0, 0.0, 0.0),
                             vec3<f32>(0.0, 1.0, 0.0),
+                            vec3<i32>(1, 0, -1),
                         );
                     }
                 ",
@@ -1645,11 +1655,54 @@ mod tests {
                 &PipelineConstants::new(),
                 Options::default(),
             )
-            .unwrap_err();
-        assert!(matches!(
-            gradient_3d_error,
-            Error::UnsupportedFeature(ref feature) if feature.contains("3D/cube TXD rewrite")
-        ));
+            .unwrap();
+        assert!(gradient_3d_shader.dksh.starts_with(b"DKSH"));
+
+        let gradient_cube_shader = Compiler
+            .compile_wgsl(
+                r"
+                    @group(0) @binding(0) var image: texture_cube<f32>;
+                    @group(0) @binding(1) var image_sampler: sampler;
+                    @fragment fn main() -> @location(0) vec4<f32> {
+                        return textureSampleGrad(
+                            image,
+                            image_sampler,
+                            normalize(vec3<f32>(0.5, 0.25, 1.0)),
+                            vec3<f32>(1.0, 0.0, 0.0),
+                            vec3<f32>(0.0, 1.0, 0.0),
+                        );
+                    }
+                ",
+                Stage::Fragment,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap();
+        assert!(gradient_cube_shader.dksh.starts_with(b"DKSH"));
+
+        Compiler
+            .compile_wgsl(
+                r"
+                    @group(0) @binding(0) var image: texture_cube_array<f32>;
+                    @group(0) @binding(1) var image_sampler: sampler;
+                    @fragment fn main() -> @location(0) vec4<f32> {
+                        return textureSampleGrad(
+                            image,
+                            image_sampler,
+                            normalize(vec3<f32>(0.5, 0.25, 1.0)),
+                            2,
+                            vec3<f32>(1.0, 0.0, 0.0),
+                            vec3<f32>(0.0, 1.0, 0.0),
+                        );
+                    }
+                ",
+                Stage::Fragment,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap();
 
         let subgroup_error = Compiler
             .compile_wgsl(
@@ -1664,6 +1717,55 @@ mod tests {
             subgroup_error,
             Error::UnsupportedFeature(ref feature) if feature == "subgroup control barrier"
         ));
+    }
+
+    #[test]
+    fn gradient_lowering_selects_native_and_rewritten_paths() {
+        let two_dimensional = lowered_ir(
+            r"
+                @group(0) @binding(0) var image: texture_2d<f32>;
+                @group(0) @binding(1) var image_sampler: sampler;
+                @fragment fn main() -> @location(0) vec4<f32> {
+                    return textureSampleGrad(image, image_sampler, vec2<f32>(0.5),
+                        vec2<f32>(1.0, 0.0), vec2<f32>(0.0, 1.0));
+                }
+            ",
+            naga::ShaderStage::Fragment,
+            "main",
+        );
+        assert!(two_dimensional.contains("txd"), "{two_dimensional}");
+
+        let three_dimensional = lowered_ir(
+            r"
+                @group(0) @binding(0) var image: texture_3d<f32>;
+                @group(0) @binding(1) var image_sampler: sampler;
+                @fragment fn main() -> @location(0) vec4<f32> {
+                    return textureSampleGrad(image, image_sampler, vec3<f32>(0.5),
+                        vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0));
+                }
+            ",
+            naga::ShaderStage::Fragment,
+            "main",
+        );
+        assert!(three_dimensional.contains("txq"), "{three_dimensional}");
+        assert!(three_dimensional.contains(".ll"), "{three_dimensional}");
+        assert!(!three_dimensional.contains("txd"), "{three_dimensional}");
+
+        let cube = lowered_ir(
+            r"
+                @group(0) @binding(0) var image: texture_cube<f32>;
+                @group(0) @binding(1) var image_sampler: sampler;
+                @fragment fn main() -> @location(0) vec4<f32> {
+                    return textureSampleGrad(image, image_sampler, vec3<f32>(0.5, 0.25, 1.0),
+                        vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0));
+                }
+            ",
+            naga::ShaderStage::Fragment,
+            "main",
+        );
+        assert!(cube.contains("txq"), "{cube}");
+        assert!(cube.contains(".ll"), "{cube}");
+        assert!(!cube.contains("txd"), "{cube}");
     }
 
     #[test]

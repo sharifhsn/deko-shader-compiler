@@ -1565,6 +1565,7 @@ impl<'function> FunctionLowerer<'function> {
         depth_ref: Option<naga::Handle<naga::Expression>>,
         clamp_to_edge: bool,
     ) -> Result<Value, Error> {
+        let image_expression = image;
         if clamp_to_edge || (gather.is_some() && !matches!(level, naga::SampleLevel::Zero)) {
             return Err(Error::UnsupportedFeature(format!(
                 "texture sample options gather={gather:?} array={} offset={} level={level:?} depth={} clamp={clamp_to_edge}",
@@ -1664,44 +1665,11 @@ impl<'function> FunctionLowerer<'function> {
         } else {
             None
         };
+        let mut rewritten_gradient_lod = None;
         if let naga::SampleLevel::Gradient { x, y } = level {
-            if expected > 2 {
-                return Err(Error::UnsupportedFeature(format!(
-                    "explicit gradients for {dim} textures require the 3D/cube TXD rewrite"
-                )));
-            }
             if depth_reference.is_some() {
                 return Err(Error::UnsupportedFeature(
                     "explicit-gradient depth comparison sampling".to_owned(),
-                ));
-            }
-
-            // SM50 TXD has a different source contract from TEX. Mesa's NAK lowering
-            // packs the bindless handle and coordinates into source zero, then interleaves
-            // the explicit derivatives in source one. Array indices occupy the final
-            // source-zero component; when an offset is present, PRMT combines the low
-            // 16-bit array index with the packed offset in the high half.
-            let mut primary = bindless_handle.into_iter().collect::<Vec<_>>();
-            primary.extend(coordinate.components);
-            let offset_mode = if let Some(offset) = offset {
-                let packed_offset = self.pack_texture_offset(offset)?;
-                let packed_array_offset = self.target.ssa_alloc.alloc(RegFile::GPR);
-                self.emit(Instr::new(OpPrmt {
-                    dst: Dst::from(packed_array_offset),
-                    srcs: [packed_offset, array_index.clone().unwrap_or(Src::ZERO)],
-                    sel: Src::from(0x1054_u32),
-                    mode: PrmtMode::Index,
-                }));
-                primary.push(Src::from(packed_array_offset));
-                TexOffsetMode::AddOffI
-            } else {
-                primary.extend(array_index);
-                TexOffsetMode::None
-            };
-            if primary.len() > 4 {
-                return Err(Error::UnsupportedFeature(
-                    "explicit-gradient texture source exceeds the SM50 TXD register tuple"
-                        .to_owned(),
                 ));
             }
 
@@ -1716,42 +1684,82 @@ impl<'function> FunctionLowerer<'function> {
                     "texture gradients must match the floating-point coordinate shape".to_owned(),
                 ));
             }
-            let mut derivatives = Vec::with_capacity(expected * 2);
-            for (dx, dy) in derivative_x
-                .components
-                .into_iter()
-                .zip(derivative_y.components)
-            {
-                derivatives.push(dx);
-                derivatives.push(dy);
-            }
 
-            let sources = [
-                Src::from(self.materialize(Value {
-                    components: primary,
-                    kind: naga::ScalarKind::Uint,
-                })?),
-                Src::from(self.materialize(Value {
-                    components: derivatives,
-                    kind: naga::ScalarKind::Float,
-                })?),
-            ];
-            let destination = self.target.ssa_alloc.alloc_vec(RegFile::GPR, 4);
-            self.emit(Instr::new(OpTxd {
-                dsts: [Dst::from(destination.clone()), Dst::None],
-                fault: Dst::None,
-                tex: texture_reference,
-                srcs: sources,
-                dim,
-                offset_mode,
-                mem_eviction_priority: MemEvictionPriority::Normal,
-                nodep: false,
-                channel_mask: ChannelMask::for_comps(4),
-            }));
-            return Ok(Value {
-                components: destination.iter().copied().map(Src::from).collect(),
-                kind,
-            });
+            if expected > 2 {
+                rewritten_gradient_lod = Some(self.explicit_gradient_lod(
+                    image_expression,
+                    dim,
+                    &coordinate,
+                    &derivative_x,
+                    &derivative_y,
+                )?);
+            } else {
+                // SM50 TXD has a different source contract from TEX. Mesa's NAK lowering
+                // packs the bindless handle and coordinates into source zero, then interleaves
+                // the explicit derivatives in source one. Array indices occupy the final
+                // source-zero component; when an offset is present, PRMT combines the low
+                // 16-bit array index with the packed offset in the high half.
+                let mut primary = bindless_handle.into_iter().collect::<Vec<_>>();
+                primary.extend(coordinate.components);
+                let offset_mode = if let Some(offset) = offset {
+                    let packed_offset = self.pack_texture_offset(offset)?;
+                    let packed_array_offset = self.target.ssa_alloc.alloc(RegFile::GPR);
+                    self.emit(Instr::new(OpPrmt {
+                        dst: Dst::from(packed_array_offset),
+                        srcs: [packed_offset, array_index.clone().unwrap_or(Src::ZERO)],
+                        sel: Src::from(0x1054_u32),
+                        mode: PrmtMode::Index,
+                    }));
+                    primary.push(Src::from(packed_array_offset));
+                    TexOffsetMode::AddOffI
+                } else {
+                    primary.extend(array_index);
+                    TexOffsetMode::None
+                };
+                if primary.len() > 4 {
+                    return Err(Error::UnsupportedFeature(
+                        "explicit-gradient texture source exceeds the SM50 TXD register tuple"
+                            .to_owned(),
+                    ));
+                }
+
+                let mut derivatives = Vec::with_capacity(expected * 2);
+                for (dx, dy) in derivative_x
+                    .components
+                    .into_iter()
+                    .zip(derivative_y.components)
+                {
+                    derivatives.push(dx);
+                    derivatives.push(dy);
+                }
+
+                let sources = [
+                    Src::from(self.materialize(Value {
+                        components: primary,
+                        kind: naga::ScalarKind::Uint,
+                    })?),
+                    Src::from(self.materialize(Value {
+                        components: derivatives,
+                        kind: naga::ScalarKind::Float,
+                    })?),
+                ];
+                let destination = self.target.ssa_alloc.alloc_vec(RegFile::GPR, 4);
+                self.emit(Instr::new(OpTxd {
+                    dsts: [Dst::from(destination.clone()), Dst::None],
+                    fault: Dst::None,
+                    tex: texture_reference,
+                    srcs: sources,
+                    dim,
+                    offset_mode,
+                    mem_eviction_priority: MemEvictionPriority::Normal,
+                    nodep: false,
+                    channel_mask: ChannelMask::for_comps(4),
+                }));
+                return Ok(Value {
+                    components: destination.iter().copied().map(Src::from).collect(),
+                    kind,
+                });
+            }
         }
 
         if let Some(array_index) = array_index {
@@ -1813,7 +1821,14 @@ impl<'function> FunctionLowerer<'function> {
                 auxiliary.extend(level.components);
                 TexLodMode::Lod
             }
-            naga::SampleLevel::Gradient { .. } => unreachable!("handled above"),
+            naga::SampleLevel::Gradient { .. } => {
+                auxiliary.extend(
+                    rewritten_gradient_lod
+                        .expect("3D/cube gradients are rewritten above")
+                        .components,
+                );
+                TexLodMode::Lod
+            }
         };
         let offset_mode = if let Some(offset) = offset {
             auxiliary.push(self.pack_texture_offset(offset)?);
@@ -1846,6 +1861,176 @@ impl<'function> FunctionLowerer<'function> {
         Ok(Value {
             components: dst.iter().copied().map(Src::from).collect(),
             kind,
+        })
+    }
+
+    fn explicit_gradient_lod(
+        &mut self,
+        image: naga::Handle<naga::Expression>,
+        dim: TexDim,
+        coordinate: &Value,
+        derivative_x: &Value,
+        derivative_y: &Value,
+    ) -> Result<Value, Error> {
+        let size = self.image_query(image, naga::ImageQuery::Size { level: None })?;
+        let size = self.uint_to_float(size)?;
+        if matches!(dim, TexDim::Cube | TexDim::ArrayCube) {
+            return self.cube_gradient_lod(coordinate, derivative_x, derivative_y, &size);
+        }
+
+        if dim != TexDim::_3D || size.components.len() != 3 {
+            return Err(Error::UnsupportedFeature(format!(
+                "gradient-to-LOD rewrite for texture dimension {dim}"
+            )));
+        }
+        let scaled_x = self.binary(naga::BinaryOperator::Multiply, derivative_x, &size, None)?;
+        let scaled_y = self.binary(naga::BinaryOperator::Multiply, derivative_y, &size, None)?;
+        let length_x = self.float_length(scaled_x)?;
+        let length_y = self.float_length(scaled_y)?;
+        let rho = self.float_minmax(&length_x, &length_y, false)?;
+        self.float_mufu(rho, MuFuOp::Log2)
+    }
+
+    #[allow(clippy::too_many_lines, clippy::similar_names)]
+    fn cube_gradient_lod(
+        &mut self,
+        coordinate: &Value,
+        derivative_x: &Value,
+        derivative_y: &Value,
+        size: &Value,
+    ) -> Result<Value, Error> {
+        if coordinate.components.len() != 3
+            || derivative_x.components.len() != 3
+            || derivative_y.components.len() != 3
+            || size.components.len() != 2
+        {
+            return Err(Error::UnsupportedFeature(
+                "cube gradient-to-LOD operand shape mismatch".to_owned(),
+            ));
+        }
+
+        let swizzle = |value: &Value, indices: [usize; 3]| Value {
+            components: indices
+                .into_iter()
+                .map(|index| value.components[index].clone())
+                .collect(),
+            kind: value.kind,
+        };
+        let scalar = |value: &Value, index: usize| Value {
+            components: vec![value.components[index].clone()],
+            kind: value.kind,
+        };
+        let pair = |value: &Value| Value {
+            components: value.components[..2].to_vec(),
+            kind: value.kind,
+        };
+
+        let absolute = Value {
+            components: coordinate
+                .components
+                .iter()
+                .cloned()
+                .map(Src::fabs)
+                .collect(),
+            kind: naga::ScalarKind::Float,
+        };
+        let abs_x = scalar(&absolute, 0);
+        let abs_y = scalar(&absolute, 1);
+        let abs_z = scalar(&absolute, 2);
+        let max_xy = self.float_minmax(&abs_x, &abs_y, false)?;
+        let max_xz = self.float_minmax(&abs_x, &abs_z, false)?;
+        let condition_z = self.binary(naga::BinaryOperator::GreaterEqual, &abs_z, &max_xy, None)?;
+        let condition_y = self.binary(naga::BinaryOperator::GreaterEqual, &abs_y, &max_xz, None)?;
+
+        let choose_face = |this: &mut Self, value: &Value| -> Result<Value, Error> {
+            let y_face = swizzle(value, [0, 2, 1]);
+            let x_face = swizzle(value, [1, 2, 0]);
+            let not_z = this.select(&condition_y, y_face, x_face)?;
+            this.select(&condition_z, value.clone(), not_z)
+        };
+        let q = choose_face(self, coordinate)?;
+        let dqdx = choose_face(self, derivative_x)?;
+        let dqdy = choose_face(self, derivative_y)?;
+
+        let reciprocal = self.float_mufu(scalar(&q, 2), MuFuOp::Rcp)?;
+        let normalized_xy =
+            self.binary(naga::BinaryOperator::Multiply, &pair(&q), &reciprocal, None)?;
+        let quotient_derivative = |this: &mut Self, derivative: &Value| {
+            let scaled_normalized = this.binary(
+                naga::BinaryOperator::Multiply,
+                &normalized_xy,
+                &scalar(derivative, 2),
+                None,
+            )?;
+            let difference = this.binary(
+                naga::BinaryOperator::Subtract,
+                &pair(derivative),
+                &scaled_normalized,
+                None,
+            )?;
+            this.binary(
+                naga::BinaryOperator::Multiply,
+                &difference,
+                &reciprocal,
+                None,
+            )
+        };
+        let dx = quotient_derivative(self, &dqdx)?;
+        let dy = quotient_derivative(self, &dqdy)?;
+        let dx_squared = self.float_dot(&dx, &dx)?;
+        let dy_squared = self.float_dot(&dy, &dy)?;
+        let magnitude_squared = self.float_minmax(&dx_squared, &dy_squared, false)?;
+
+        let edge = scalar(size, 0);
+        let edge_squared = self.binary(naga::BinaryOperator::Multiply, &edge, &edge, None)?;
+        let scaled_magnitude = self.binary(
+            naga::BinaryOperator::Multiply,
+            &edge_squared,
+            &magnitude_squared,
+            None,
+        )?;
+        let logarithm = self.float_mufu(scaled_magnitude, MuFuOp::Log2)?;
+        let half_logarithm = self.binary(
+            naga::BinaryOperator::Multiply,
+            &logarithm,
+            &Value {
+                components: vec![Src::from(0.5_f32)],
+                kind: naga::ScalarKind::Float,
+            },
+            None,
+        )?;
+        self.binary(
+            naga::BinaryOperator::Add,
+            &half_logarithm,
+            &Value {
+                components: vec![Src::from(-1.0_f32)],
+                kind: naga::ScalarKind::Float,
+            },
+            None,
+        )
+    }
+
+    fn uint_to_float(&mut self, value: Value) -> Result<Value, Error> {
+        if value.kind != naga::ScalarKind::Uint {
+            return Err(Error::UnsupportedFeature(
+                "texture dimensions are not unsigned integers".to_owned(),
+            ));
+        }
+        let mut components = Vec::with_capacity(value.components.len());
+        for source in value.components {
+            let destination = self.target.ssa_alloc.alloc(RegFile::GPR);
+            self.emit(Instr::new(OpI2F {
+                dst: Dst::from(destination),
+                src: source,
+                dst_type: FloatType::F32,
+                src_type: IntType::U32,
+                rnd_mode: FRndMode::NearestEven,
+            }));
+            components.push(Src::from(destination));
+        }
+        Ok(Value {
+            components,
+            kind: naga::ScalarKind::Float,
         })
     }
 
