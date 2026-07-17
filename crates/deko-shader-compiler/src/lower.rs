@@ -1855,21 +1855,14 @@ impl<'function> FunctionLowerer<'function> {
                 auxiliary.push(self.pack_texture_offset(offset)?);
             }
             auxiliary.extend(depth_reference.iter().cloned());
-            let coordinate = self.materialize(coordinate)?;
-            let auxiliary = if auxiliary.is_empty() {
-                Src::ZERO
-            } else {
-                Src::from(self.materialize(Value {
-                    components: auxiliary,
-                    kind: naga::ScalarKind::Uint,
-                })?)
-            };
+            let sources =
+                self.texture_instruction_sources(texture_reference, coordinate, auxiliary)?;
             let destination = self.target.ssa_alloc.alloc_vec(RegFile::GPR, 4);
             self.emit(Instr::new(OpTld4 {
                 dsts: [Dst::from(destination.clone()), Dst::None],
                 fault: Dst::None,
                 tex: texture_reference,
-                srcs: [Src::from(coordinate), auxiliary],
+                srcs: sources,
                 dim,
                 comp: component,
                 offset_mode: TexOffsetMode::None,
@@ -1916,15 +1909,7 @@ impl<'function> FunctionLowerer<'function> {
             TexOffsetMode::None
         };
         auxiliary.extend(depth_reference);
-        let coordinate = self.materialize(coordinate)?;
-        let auxiliary = if auxiliary.is_empty() {
-            Src::ZERO
-        } else {
-            Src::from(self.materialize(Value {
-                components: auxiliary,
-                kind: naga::ScalarKind::Uint,
-            })?)
-        };
+        let sources = self.texture_instruction_sources(texture_reference, coordinate, auxiliary)?;
         let output_components = if depth_ref.is_some() { 1 } else { 4 };
         let dst = self
             .target
@@ -1934,7 +1919,7 @@ impl<'function> FunctionLowerer<'function> {
             dsts: [Dst::from(dst.clone()), Dst::None],
             fault: Dst::None,
             tex: texture_reference,
-            srcs: [Src::from(coordinate), auxiliary],
+            srcs: sources,
             dim,
             lod_mode,
             deriv_mode: TexDerivMode::Auto,
@@ -1949,6 +1934,57 @@ impl<'function> FunctionLowerer<'function> {
             components: dst.iter().copied().map(Src::from).collect(),
             kind,
         })
+    }
+
+    fn texture_instruction_sources(
+        &mut self,
+        texture_reference: TexRef,
+        coordinate: Value,
+        mut auxiliary: Vec<Src>,
+    ) -> Result<[Src; 2], Error> {
+        if texture_reference != TexRef::Bindless {
+            let coordinate = Src::from(self.materialize(coordinate)?);
+            let auxiliary = if auxiliary.is_empty() {
+                Src::ZERO
+            } else {
+                Src::from(self.materialize(Value {
+                    components: auxiliary,
+                    kind: naga::ScalarKind::Uint,
+                })?)
+            };
+            return Ok([coordinate, auxiliary]);
+        }
+
+        // SM50 bindless texture instructions take one packed vec4/vec8 source. The resource
+        // handle is component zero, followed by array index/coordinates and then LOD/offset.
+        let handle = auxiliary.first().cloned().ok_or_else(|| {
+            Error::UnsupportedFeature("bindless texture instruction without a handle".to_owned())
+        })?;
+        auxiliary.remove(0);
+        let mut components = Vec::with_capacity(1 + coordinate.components.len() + auxiliary.len());
+        components.push(handle);
+        components.extend(coordinate.components);
+        components.extend(auxiliary);
+        if components.len() > 8 {
+            return Err(Error::UnsupportedFeature(
+                "bindless texture instruction uses more than eight source components".to_owned(),
+            ));
+        }
+        let padded_components = if components.len() <= 4 { 4 } else { 8 };
+        components.resize(padded_components, Src::ZERO);
+        let first = Src::from(self.materialize(Value {
+            components: components[..4].to_vec(),
+            kind: naga::ScalarKind::Float,
+        })?);
+        let second = if padded_components == 8 {
+            Src::from(self.materialize(Value {
+                components: components[4..].to_vec(),
+                kind: naga::ScalarKind::Float,
+            })?)
+        } else {
+            Src::ZERO
+        };
+        Ok([first, second])
     }
 
     fn pack_texture_offset(
