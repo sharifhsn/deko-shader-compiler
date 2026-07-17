@@ -50,6 +50,7 @@ deko-shaderc shader.wgsl shader.dksh fragment main 0:3=16 0:4=16
 
 ```sh
 cargo fmt --all --check
+python3 tools/check_provenance.py
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo run -p deko-shader-compiler --example compile_wgsl
@@ -74,4 +75,4 @@ Naga-to-NAK lowering and native encoder.
 
 ## License
 
-MIT. See `LICENSE` and `THIRD_PARTY.toml`.
+MIT. See `LICENSE`, `THIRD_PARTY.toml`, and `THIRD_PARTY_NOTICES.md`.
