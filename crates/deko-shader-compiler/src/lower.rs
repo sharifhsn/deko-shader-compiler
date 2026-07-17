@@ -6,7 +6,7 @@ use deko_nak::ir::{
     OpAtom, OpBar, OpBrk, OpCont, OpExit, OpF2I, OpFAdd, OpFMnMx, OpFMul, OpFSetP, OpI2F, OpIAdd2,
     OpIAdd2X, OpIMad, OpIMnMx, OpIMul, OpISetP, OpIpa, OpLd, OpLdc, OpLop2, OpMemBar, OpMov,
     OpMuFu, OpPBk, OpPCnt, OpPSetP, OpPhiDsts, OpPhiSrcs, OpRegOut, OpS2R, OpSel, OpShl, OpShr,
-    OpSt, OpTex, OpTxq, Phi, Pred, PredRef, PredSetOp, RegFile, SSARef, SSAValue, Shader,
+    OpSt, OpTex, OpTld, OpTxq, Phi, Pred, PredRef, PredSetOp, RegFile, SSARef, SSAValue, Shader,
     ShaderInfo, ShaderIoInfo, ShaderModelInfo, Src, SrcMod, SrcRef, SrcSwizzle, TexDerivMode,
     TexDim, TexLodMode, TexOffsetMode, TexQuery, TexRef,
 };
@@ -168,25 +168,36 @@ fn resource_map(module: &naga::Module, stage: naga::ShaderStage) -> Result<Resou
         })
         .collect::<Vec<_>>();
     textures.sort_by_key(|(_, binding)| binding.map(|binding| (binding.group, binding.binding)));
-    for (target, (handle, binding)) in textures.into_iter().enumerate() {
+    let mut texture_targets = HashMap::new();
+    for (handle, binding) in textures {
         let binding = binding.ok_or_else(|| {
             Error::UnsupportedFeature("texture global without a resource binding".to_owned())
         })?;
-        let target = u16::try_from(target)
+        let key = (binding.group, binding.binding);
+        let next_target = u16::try_from(texture_targets.len())
             .map_err(|_| Error::UnsupportedFeature("too many sampled textures".to_owned()))?;
-        if target >= 64 {
+        if next_target >= 64 {
             return Err(Error::UnsupportedFeature(
                 "more than 64 sampled textures".to_owned(),
             ));
         }
+        let (target, first_alias) = if let Some(target) = texture_targets.get(&key) {
+            (*target, false)
+        } else {
+            texture_targets.insert(key, next_target);
+            (next_target, true)
+        };
         resources.textures.insert(handle, target);
-        resources.bindings.push(deko_dksh::Binding {
-            group: binding.group,
-            binding: binding.binding,
-            target: u32::from(target),
-            kind: deko_dksh::BindingKind::Texture,
-        });
+        if first_alias {
+            resources.bindings.push(deko_dksh::Binding {
+                group: binding.group,
+                binding: binding.binding,
+                target: u32::from(target),
+                kind: deko_dksh::BindingKind::Texture,
+            });
+        }
     }
+    let mut sampler_targets = HashMap::new();
     for (handle, variable) in module.global_variables.iter() {
         if !matches!(
             module.types[variable.ty].inner,
@@ -197,28 +208,28 @@ fn resource_map(module: &naga::Module, stage: naga::ShaderStage) -> Result<Resou
         let binding = variable.binding.as_ref().ok_or_else(|| {
             Error::UnsupportedFeature("sampler global without a resource binding".to_owned())
         })?;
-        let target = resources
-            .textures
-            .iter()
-            .find_map(|(texture, target)| {
-                let texture_binding = module.global_variables[*texture].binding.as_ref()?;
-                (texture_binding.group == binding.group
-                    && texture_binding.binding.checked_add(1) == Some(binding.binding))
-                .then_some(*target)
-            })
-            .ok_or_else(|| {
-                Error::UnsupportedFeature(format!(
-                    "sampler @group({}) @binding({}) is not paired after a texture",
-                    binding.group, binding.binding
-                ))
-            })?;
+        let texture_key = (
+            binding.group,
+            binding.binding.checked_sub(1).unwrap_or(u32::MAX),
+        );
+        let target = texture_targets.get(&texture_key).copied().ok_or_else(|| {
+            Error::UnsupportedFeature(format!(
+                "sampler @group({}) @binding({}) is not paired after a texture",
+                binding.group, binding.binding
+            ))
+        })?;
         resources.samplers.insert(handle, target);
-        resources.bindings.push(deko_dksh::Binding {
-            group: binding.group,
-            binding: binding.binding,
-            target: u32::from(target),
-            kind: deko_dksh::BindingKind::Sampler,
-        });
+        if sampler_targets
+            .insert((binding.group, binding.binding), target)
+            .is_none()
+        {
+            resources.bindings.push(deko_dksh::Binding {
+                group: binding.group,
+                binding: binding.binding,
+                target: u32::from(target),
+                kind: deko_dksh::BindingKind::Sampler,
+            });
+        }
     }
     Ok(resources)
 }
@@ -654,6 +665,13 @@ impl<'function> FunctionLowerer<'function> {
                 *depth_ref,
                 *clamp_to_edge,
             )?,
+            naga::Expression::ImageLoad {
+                image,
+                coordinate,
+                array_index,
+                sample,
+                level,
+            } => self.image_load(*image, *coordinate, *array_index, *sample, *level)?,
             naga::Expression::ImageQuery { image, query } => self.image_query(*image, *query)?,
             naga::Expression::Math {
                 fun,
@@ -839,6 +857,131 @@ impl<'function> FunctionLowerer<'function> {
         Ok(Value {
             components: destination.iter().copied().map(Src::from).collect(),
             kind: naga::ScalarKind::Uint,
+        })
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn image_load(
+        &mut self,
+        image: naga::Handle<naga::Expression>,
+        coordinate: naga::Handle<naga::Expression>,
+        array_index: Option<naga::Handle<naga::Expression>>,
+        sample: Option<naga::Handle<naga::Expression>>,
+        level: Option<naga::Handle<naga::Expression>>,
+    ) -> Result<Value, Error> {
+        let image = self.global_expression(image, "texture load")?;
+        let target = *self.resources.textures.get(&image).ok_or_else(|| {
+            Error::UnsupportedFeature("loaded texture has no Deko target".to_owned())
+        })?;
+        let variable = &self.module.global_variables[image];
+        let naga::TypeInner::Image {
+            dim,
+            arrayed,
+            class,
+        } = self.module.types[variable.ty].inner
+        else {
+            return Err(Error::UnsupportedFeature(
+                "texture load resource is not an image".to_owned(),
+            ));
+        };
+        let (kind, output_components, multisampled) = match class {
+            naga::ImageClass::Sampled { kind, multi } => (kind, 4, multi),
+            naga::ImageClass::Depth { multi } => (naga::ScalarKind::Float, 1, multi),
+            other => {
+                return Err(Error::UnsupportedFeature(format!(
+                    "texture load image class {other:?}"
+                )));
+            }
+        };
+        let tex_dim = match (dim, arrayed) {
+            (naga::ImageDimension::D1, false) => TexDim::_1D,
+            (naga::ImageDimension::D1, true) => TexDim::Array1D,
+            (naga::ImageDimension::D2, false) => TexDim::_2D,
+            (naga::ImageDimension::D2, true) => TexDim::Array2D,
+            (naga::ImageDimension::D3, false) => TexDim::_3D,
+            (naga::ImageDimension::Cube, false) => TexDim::Cube,
+            (naga::ImageDimension::Cube, true) => TexDim::ArrayCube,
+            (naga::ImageDimension::D3, true) => {
+                return Err(Error::UnsupportedFeature(
+                    "arrayed 3D texture load".to_owned(),
+                ));
+            }
+        };
+        let expected_coordinates = match dim {
+            naga::ImageDimension::D1 => 1,
+            naga::ImageDimension::D2 => 2,
+            naga::ImageDimension::D3 | naga::ImageDimension::Cube => 3,
+        };
+        let mut source = self.expression(coordinate)?;
+        if !matches!(source.kind, naga::ScalarKind::Sint | naga::ScalarKind::Uint)
+            || source.components.len() != expected_coordinates
+        {
+            return Err(Error::UnsupportedFeature(
+                "texture load coordinate shape mismatch".to_owned(),
+            ));
+        }
+        if arrayed != array_index.is_some() {
+            return Err(Error::UnsupportedFeature(
+                "texture load array index mismatch".to_owned(),
+            ));
+        }
+        if let Some(array_index) = array_index {
+            let array_index = self.expression(array_index)?;
+            if !matches!(
+                array_index.kind,
+                naga::ScalarKind::Sint | naga::ScalarKind::Uint
+            ) || array_index.components.len() != 1
+            {
+                return Err(Error::UnsupportedFeature(
+                    "texture load array index must be an integer scalar".to_owned(),
+                ));
+            }
+            source.components.extend(array_index.components);
+        }
+        let extra = match (multisampled, sample, level) {
+            (true, Some(sample), None) => sample,
+            (false, None, Some(level)) => level,
+            _ => {
+                return Err(Error::UnsupportedFeature(
+                    "texture load sample/level mismatch".to_owned(),
+                ));
+            }
+        };
+        let extra = self.expression(extra)?;
+        if !matches!(extra.kind, naga::ScalarKind::Sint | naga::ScalarKind::Uint)
+            || extra.components.len() != 1
+        {
+            return Err(Error::UnsupportedFeature(
+                "texture load sample or level must be an integer scalar".to_owned(),
+            ));
+        }
+        source.components.extend(extra.components);
+        let source = self.materialize(source)?;
+        let destination = self
+            .target
+            .ssa_alloc
+            .alloc_vec(RegFile::GPR, output_components);
+        self.emit(Instr::new(OpTld {
+            dsts: [Dst::from(destination.clone()), Dst::None],
+            fault: Dst::None,
+            tex: TexRef::Bound(target),
+            srcs: [Src::from(source), Src::ZERO],
+            dim: tex_dim,
+            is_ms: multisampled,
+            lod_mode: if multisampled {
+                TexLodMode::Zero
+            } else {
+                TexLodMode::Lod
+            },
+            offset_mode: TexOffsetMode::None,
+            mem_eviction_priority: MemEvictionPriority::Normal,
+            nodep: false,
+            channel_mask: ChannelMask::for_comps(output_components),
+            scalar: false,
+        }));
+        Ok(Value {
+            components: destination.iter().copied().map(Src::from).collect(),
+            kind,
         })
     }
 
@@ -4964,7 +5107,7 @@ fn lower_vertex<'sm>(
             naga::Binding::Location { location, .. } if components <= 4 => {
                 location_address(location)?
             }
-            binding => {
+            binding @ (naga::Binding::BuiltIn(_) | naga::Binding::Location { .. }) => {
                 return Err(Error::UnsupportedFeature(format!(
                     "vertex result binding {binding:?}"
                 )));
@@ -5018,33 +5161,61 @@ fn lower_fragment<'sm>(
     let value = lowerer.return_value()?;
     let mut outputs = Vec::new();
     let mut writes_color = 0_u32;
+    let mut depth = None;
     for field in output_fields(module, result)? {
-        let naga::Binding::Location { location, .. } = field.binding else {
-            return Err(Error::UnsupportedFeature(format!(
-                "fragment result binding {:?}",
-                field.binding
-            )));
-        };
-        if location >= 8 || field.range.len() > 4 || field.range.end > value.components.len() {
+        if field.range.end > value.components.len() {
             return Err(Error::UnsupportedFeature(
-                "fragment color output shape".to_owned(),
+                "fragment output shape".to_owned(),
             ));
         }
         let field_value = Value {
             components: value.components[field.range].to_vec(),
             kind: value.kind,
         };
-        let ssa = lowerer.materialize(field_value)?;
-        let mut target = ssa.iter().copied().map(Src::from).collect::<Vec<_>>();
-        writes_color |= ((1_u32 << target.len()) - 1) << (location * 4);
-        target.resize(4, Src::ZERO);
-        outputs.extend(target);
+        match field.binding {
+            naga::Binding::Location { location, .. } => {
+                if location >= 8 || field_value.components.len() > 4 {
+                    return Err(Error::UnsupportedFeature(
+                        "fragment color output shape".to_owned(),
+                    ));
+                }
+                let ssa = lowerer.materialize(field_value)?;
+                let mut target = ssa.iter().copied().map(Src::from).collect::<Vec<_>>();
+                writes_color |= ((1_u32 << target.len()) - 1) << (location * 4);
+                target.resize(4, Src::ZERO);
+                outputs.extend(target);
+            }
+            naga::Binding::BuiltIn(naga::BuiltIn::FragDepth) => {
+                if field_value.kind != naga::ScalarKind::Float
+                    || field_value.components.len() != 1
+                    || depth.is_some()
+                {
+                    return Err(Error::UnsupportedFeature(
+                        "fragment depth output shape".to_owned(),
+                    ));
+                }
+                depth = Some(Src::from(lowerer.materialize(field_value)?));
+            }
+            binding @ naga::Binding::BuiltIn(_) => {
+                return Err(Error::UnsupportedFeature(format!(
+                    "fragment result binding {binding:?}"
+                )));
+            }
+        }
+    }
+    let writes_depth = depth.is_some();
+    if let Some(depth) = depth {
+        // Maxwell places the sample mask and depth after the packed color outputs. The two ABI
+        // slots travel together even when only depth is written.
+        outputs.push(Src::ZERO);
+        outputs.push(depth);
     }
     lowerer.emit(Instr::new(OpRegOut { srcs: outputs }));
     let ShaderIoInfo::Fragment(io) = &mut info.io else {
         unreachable!();
     };
     io.writes_color = writes_color;
+    io.writes_depth = writes_depth;
     Ok(Shader {
         sm,
         info,

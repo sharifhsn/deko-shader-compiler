@@ -938,6 +938,80 @@ mod tests {
     }
 
     #[test]
+    fn texture_load_and_fragment_depth_compile() {
+        let source = r"
+            struct FragmentOutput {
+                @builtin(frag_depth) depth: f32,
+            }
+
+            @group(0) @binding(0) var image: texture_2d<u32>;
+
+            @fragment
+            fn fragment(@builtin(position) position: vec4<f32>) -> FragmentOutput {
+                let texel = textureLoad(image, vec2<i32>(position.xy), 0);
+                return FragmentOutput(f32(texel.x) / 255.0);
+            }
+        ";
+        let artifact = Compiler
+            .compile_wgsl(
+                source,
+                Stage::Fragment,
+                "fragment",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap();
+        assert_eq!(artifact.bindings.len(), 1);
+        let container = deko_dksh::parse(&artifact.dksh).unwrap();
+        assert_eq!(
+            container.program.program_type,
+            deko_dksh::ProgramType::Fragment
+        );
+        assert!(container.code[0x80..].iter().any(|byte| *byte != 0));
+    }
+
+    #[test]
+    fn duplicate_resource_aliases_share_one_deko_target() {
+        let source = r"
+            @group(0) @binding(0) var image_alias: texture_2d<f32>;
+            @group(0) @binding(1) var sampler_alias: sampler;
+            @group(0) @binding(0) var image: texture_2d<f32>;
+            @group(0) @binding(1) var image_sampler: sampler;
+
+            @fragment
+            fn fragment(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+                return textureSample(image, image_sampler, uv);
+            }
+        ";
+        let artifact = Compiler
+            .compile_wgsl(
+                source,
+                Stage::Fragment,
+                "fragment",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            artifact.bindings,
+            vec![
+                deko_dksh::Binding {
+                    group: 0,
+                    binding: 0,
+                    target: 0,
+                    kind: deko_dksh::BindingKind::Texture,
+                },
+                deko_dksh::Binding {
+                    group: 0,
+                    binding: 1,
+                    target: 0,
+                    kind: deko_dksh::BindingKind::Sampler,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn bevy_style_dynamic_uniform_vertex_features_compile() {
         let source = r"
             struct Mesh { world_from_local: mat3x4<f32> }
