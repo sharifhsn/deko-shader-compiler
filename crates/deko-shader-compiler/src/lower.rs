@@ -316,12 +316,25 @@ impl<'function> FunctionLowerer<'function> {
 
     fn return_value(&mut self) -> Result<Value, Error> {
         let mut result = None;
-        for statement in &self.source.body {
+        let body = self.source.body.clone();
+        for statement in &body {
             match statement {
                 naga::Statement::Return {
                     value: Some(handle),
                 } if result.is_none() => {
                     result = Some(self.expression(*handle)?);
+                }
+                naga::Statement::Call {
+                    function,
+                    arguments,
+                    result: Some(call_result),
+                } => {
+                    let arguments = arguments
+                        .iter()
+                        .map(|argument| self.expression(*argument))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let value = self.inline_call(*function, arguments)?;
+                    self.values.insert(*call_result, value);
                 }
                 naga::Statement::Emit(_) | naga::Statement::Return { value: None } => {}
                 other => {
@@ -330,6 +343,24 @@ impl<'function> FunctionLowerer<'function> {
             }
         }
         result.ok_or_else(|| Error::UnsupportedFeature("missing return value".to_owned()))
+    }
+
+    fn inline_call(
+        &mut self,
+        function: naga::Handle<naga::Function>,
+        arguments: Vec<Value>,
+    ) -> Result<Value, Error> {
+        let target = std::mem::replace(&mut self.target, Function::single_block(Vec::new()));
+        let mut callee = Self {
+            module: self.module,
+            source: &self.module.functions[function],
+            target,
+            values: HashMap::new(),
+            arguments,
+        };
+        let result = callee.return_value();
+        self.target = callee.target;
+        result
     }
 
     fn materialize(&mut self, value: Value) -> Result<SSARef, Error> {

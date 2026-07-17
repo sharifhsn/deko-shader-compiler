@@ -506,6 +506,34 @@ mod tests {
     }
 
     #[test]
+    fn pure_helper_functions_are_inlined() {
+        let source = r"
+            fn tint(value: vec4<f32>, factor: f32) -> vec4<f32> {
+                return value * factor + vec4<f32>(0.1, 0.0, 0.0, 0.0);
+            }
+            @fragment
+            fn main(@location(0) color: vec4<f32>) -> @location(0) vec4<f32> {
+                return tint(color, 0.5);
+            }
+        ";
+        let artifact = Compiler
+            .compile_wgsl(
+                source,
+                Stage::Fragment,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap();
+        let container = deko_dksh::parse(&artifact.dksh).unwrap();
+        assert_eq!(
+            container.program.program_type,
+            deko_dksh::ProgramType::Fragment
+        );
+        assert!(container.code[0x80..].iter().any(|byte| *byte != 0));
+    }
+
+    #[test]
     fn unsupported_pipeline_options_fail_instead_of_changing_semantics() {
         let mut constants = PipelineConstants::new();
         constants.insert("scale".to_owned(), 2.0);
