@@ -5,6 +5,7 @@ use std::{
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use sha2::{Digest, Sha256};
@@ -131,6 +132,26 @@ pub struct CompilerCache {
     persistent_directory: Option<Arc<PathBuf>>,
 }
 
+/// Where a successful compiler-cache lookup obtained its artifact.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CacheSource {
+    /// The artifact was already retained in this process.
+    Memory,
+    /// The artifact was loaded and validated from persistent storage.
+    Persistent,
+    /// The request was compiled because neither cache contained it.
+    Compiled,
+}
+
+/// Timing and cache-source information for one successful request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompileTelemetry {
+    /// Cache tier that produced the artifact.
+    pub source: CacheSource,
+    /// Wall-clock time spent resolving the complete request.
+    pub elapsed: Duration,
+}
+
 impl Default for CompilerCache {
     fn default() -> Self {
         Self::with_memory_limits(DEFAULT_MEMORY_CACHE_ENTRIES, DEFAULT_MEMORY_CACHE_BYTES)
@@ -189,20 +210,60 @@ impl CompilerCache {
         constants: &PipelineConstants,
         options: Options,
     ) -> Result<(CacheKey, Arc<Artifact>), Error> {
+        self.compile_wgsl_with_telemetry(source, stage, entry_point, constants, options)
+            .map(|(key, artifact, _)| (key, artifact))
+    }
+
+    /// Compile WGSL and report whether the artifact came from memory, disk, or code generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed error as [`Compiler::compile_wgsl`]. Failed compilations are not
+    /// cached.
+    pub fn compile_wgsl_with_telemetry(
+        &self,
+        source: &str,
+        stage: Stage,
+        entry_point: &str,
+        constants: &PipelineConstants,
+        options: Options,
+    ) -> Result<(CacheKey, Arc<Artifact>, CompileTelemetry), Error> {
+        let started = Instant::now();
         let key = CacheKey::new(source, stage, entry_point, constants, &options);
         if let Some(artifact) = self.memory_get(key) {
-            return Ok((key, artifact));
+            return Ok((
+                key,
+                artifact,
+                CompileTelemetry {
+                    source: CacheSource::Memory,
+                    elapsed: started.elapsed(),
+                },
+            ));
         }
         if let Some(artifact) = self.persistent_get(key) {
             let artifact = Arc::new(artifact);
             self.memory_insert(key, artifact.clone());
-            return Ok((key, artifact));
+            return Ok((
+                key,
+                artifact,
+                CompileTelemetry {
+                    source: CacheSource::Persistent,
+                    elapsed: started.elapsed(),
+                },
+            ));
         }
         let artifact =
             Arc::new(Compiler.compile_wgsl(source, stage, entry_point, constants, options)?);
         self.persistent_insert(key, &artifact);
         let artifact = self.memory_insert(key, artifact);
-        Ok((key, artifact))
+        Ok((
+            key,
+            artifact,
+            CompileTelemetry {
+                source: CacheSource::Compiled,
+                elapsed: started.elapsed(),
+            },
+        ))
     }
 
     /// Number of successfully compiled entries currently retained in RAM.
@@ -425,6 +486,52 @@ mod tests {
         let too_small = CompilerCache::with_memory_limits(8, artifact_size(&artifact) - 1);
         compile(&too_small, &source(4));
         assert!(too_small.is_empty());
+    }
+
+    #[test]
+    fn telemetry_distinguishes_compilation_memory_and_persistent_hits() {
+        let directory = test_directory("telemetry");
+        let source = source(6);
+        let writer = CompilerCache::new(1).with_persistent_directory(&directory);
+
+        let (key, expected, cold) = writer
+            .compile_wgsl_with_telemetry(
+                &source,
+                Stage::Compute,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap();
+        assert_eq!(cold.source, CacheSource::Compiled);
+
+        let (_, warm, memory) = writer
+            .compile_wgsl_with_telemetry(
+                &source,
+                Stage::Compute,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap();
+        assert_eq!(memory.source, CacheSource::Memory);
+        assert!(Arc::ptr_eq(&expected, &warm));
+
+        let reader = CompilerCache::new(1).with_persistent_directory(&directory);
+        let (loaded_key, loaded, persistent) = reader
+            .compile_wgsl_with_telemetry(
+                &source,
+                Stage::Compute,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap();
+        assert_eq!(persistent.source, CacheSource::Persistent);
+        assert_eq!(loaded_key, key);
+        assert_eq!(loaded.dksh, expected.dksh);
+
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

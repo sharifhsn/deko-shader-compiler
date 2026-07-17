@@ -11,8 +11,8 @@ mod cache;
 mod lower;
 
 pub use cache::{
-    BACKEND_ABI_VERSION, CACHE_KEY_VERSION, CacheKey, CompilerCache, DEFAULT_MEMORY_CACHE_BYTES,
-    DEFAULT_MEMORY_CACHE_ENTRIES,
+    BACKEND_ABI_VERSION, CACHE_KEY_VERSION, CacheKey, CacheSource, CompileTelemetry, CompilerCache,
+    DEFAULT_MEMORY_CACHE_BYTES, DEFAULT_MEMORY_CACHE_ENTRIES,
 };
 
 /// Pipeline override values after wgpu resolves their names.
@@ -1574,6 +1574,49 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(multiview_error, Error::UnsupportedFeature(_)));
+    }
+
+    #[test]
+    fn unsupported_gradient_sampling_and_subgroup_barriers_fail_explicitly() {
+        let gradient_error = Compiler
+            .compile_wgsl(
+                r"
+                    @group(0) @binding(0) var image: texture_2d<f32>;
+                    @group(0) @binding(1) var image_sampler: sampler;
+                    @fragment fn main() -> @location(0) vec4<f32> {
+                        return textureSampleGrad(
+                            image,
+                            image_sampler,
+                            vec2<f32>(0.5),
+                            vec2<f32>(1.0, 0.0),
+                            vec2<f32>(0.0, 1.0),
+                        );
+                    }
+                ",
+                Stage::Fragment,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            gradient_error,
+            Error::UnsupportedFeature(ref feature) if feature.contains("Gradient")
+        ));
+
+        let subgroup_error = Compiler
+            .compile_wgsl(
+                "@compute @workgroup_size(1) fn main() { subgroupBarrier(); }",
+                Stage::Compute,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            subgroup_error,
+            Error::UnsupportedFeature(ref feature) if feature == "subgroup control barrier"
+        ));
     }
 
     #[test]
