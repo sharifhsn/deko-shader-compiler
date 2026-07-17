@@ -122,9 +122,9 @@ impl<const MIN: u32> TryFrom<u32> for LowerBoundedU32<MIN> {
 /// able to guarantee two useful invariants:
 ///
 ///  1. All but the last element is non-zero.  If `MAX_ARR_IDX >= 1`, this
-///     allows the compiler to optimize Option<LowerBoundedU32Array>.  If
+///     allows the compiler to optimize `Option<LowerBoundedU32Array>`.  If
 ///     `MAX_ARR_IDX >= 3`, the compiler can also optimize enums where one
-///     variant is LowerBoundedU32Array and the other is Box<T>.
+///     variant is LowerBoundedU32Array and the other is `Box<T>`.
 ///
 /// 2. The array always takes the same amount of space as a static array of max
 ///    length.  The array size is hidden inside the array so we don't burn

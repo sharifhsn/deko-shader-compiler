@@ -6287,7 +6287,7 @@ pub struct OpSuLdGa {
     pub format: Src,
 
     /// This is not an address, but it's two registers that contain
-    /// [addr >> 8, addr & 0xff].
+    /// `[addr >> 8, addr & 0xff]`.
     /// This works because addr >> 8 is 32-bits (GOB-aligned) and the
     /// rest 8-bits are extracted by the bit-field
     /// It's useful since in block-linear mode the lower bits and the higher

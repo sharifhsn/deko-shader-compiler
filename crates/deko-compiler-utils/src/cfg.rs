@@ -480,7 +480,7 @@ impl<N> CFG<N> {
     ///     from N without going through H.
     ///
     /// This matches the definitions given in
-    /// https://www.cs.cornell.edu/courses/cs4120/2023sp/notes.html?id=cflow
+    /// <https://www.cs.cornell.edu/courses/cs4120/2023sp/notes.html?id=cflow>
     pub fn loop_header_index(&self, idx: usize) -> Option<usize> {
         let lph = self.nodes[idx].lph;
         if lph == usize::MAX {

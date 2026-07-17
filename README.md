@@ -13,6 +13,11 @@ read/write storage buffers with static or dynamically indexed host-shareable dat
 workgroup atomics, barriers, workgroup memory, and runtime storage-array lengths. Unsupported
 features return a typed error instead of silently changing shader semantics.
 
+The compiler is integrated into the Deko3D backend of the accompanying wgpu fork.
+An override-free Ryujinx run has compiled ordinary Bevy WGSL at runtime and rendered
+the Switch probe through frame 60 with three passing visual captures. Emulator proof
+does not replace the physical-Switch execution gate.
+
 The compiler does not require Nintendo's proprietary SDK, Mesa at runtime, or
 the host-side UAM executable. Mesa's MIT-licensed NAK compiler is the machine-backend
 foundation. Imported upstream source retains its original notices and is recorded in
@@ -43,8 +48,18 @@ deko-shaderc shader.wgsl shader.dksh fragment main 0:3=16 0:4=16
 cargo fmt --all --check
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
-cargo package -p deko-dksh --allow-dirty
+cargo run -p deko-shader-compiler --example compile_wgsl
+cargo package --workspace --no-verify --list
 ```
+
+`cargo package --workspace --no-verify --list` verifies the exact contents of all
+six unpublished workspace crates without requiring those path dependencies to exist
+on crates.io already. Publish dependency crates in topological order before running a
+full registry-backed package verification.
+
+The public support boundary is the operations exercised by the tests and Bevy corpus,
+not all of WGSL. Multiview is currently rejected explicitly. Native execution and
+performance claims require physical Switch evidence.
 
 ## License
 

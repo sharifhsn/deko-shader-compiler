@@ -8,7 +8,7 @@
 //! based on a single block, and a "join" function, which updates information
 //! along a control flow edge. See the wikipedia article for more information on
 //! this terminology.
-//! https://en.wikipedia.org/wiki/Data-flow_analysis#Basic_principles
+//! <https://en.wikipedia.org/wiki/Data-flow_analysis#Basic_principles>
 
 use crate::bitset::BitSet;
 use crate::cfg::CFG;
