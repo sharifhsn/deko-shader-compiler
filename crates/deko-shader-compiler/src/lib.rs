@@ -7,7 +7,10 @@ use std::collections::BTreeMap;
 
 use thiserror::Error;
 
+mod cache;
 mod lower;
+
+pub use cache::{BACKEND_ABI_VERSION, CACHE_KEY_VERSION, CacheKey, CompilerCache};
 
 /// Pipeline override values after wgpu resolves their names.
 pub type PipelineConstants = BTreeMap<String, f64>;
@@ -511,5 +514,60 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(multiview_error, Error::UnsupportedFeature(_)));
+    }
+
+    #[test]
+    fn cache_key_covers_every_codegen_input_and_cache_reuses_artifacts() {
+        let source = "@compute @workgroup_size(1) fn main() {}";
+        let constants = PipelineConstants::new();
+        let options = Options::default();
+        let base = CacheKey::new(source, Stage::Compute, "main", &constants, &options);
+        assert_eq!(base.to_hex().len(), 64);
+        assert_eq!(
+            base,
+            CacheKey::new(source, Stage::Compute, "main", &constants, &options)
+        );
+        assert_ne!(
+            base,
+            CacheKey::new(
+                " @compute @workgroup_size(1) fn main() {}",
+                Stage::Compute,
+                "main",
+                &constants,
+                &options,
+            )
+        );
+        assert_ne!(
+            base,
+            CacheKey::new(source, Stage::Vertex, "main", &constants, &options)
+        );
+        assert_ne!(
+            base,
+            CacheKey::new(source, Stage::Compute, "other", &constants, &options)
+        );
+        assert_ne!(
+            base,
+            CacheKey::new(
+                source,
+                Stage::Compute,
+                "main",
+                &constants,
+                &Options {
+                    zero_initialize_workgroup_memory: false,
+                    ..options.clone()
+                },
+            )
+        );
+
+        let cache = CompilerCache::default();
+        let (first_key, first) = cache
+            .compile_wgsl(source, Stage::Compute, "main", &constants, options.clone())
+            .unwrap();
+        let (second_key, second) = cache
+            .compile_wgsl(source, Stage::Compute, "main", &constants, options)
+            .unwrap();
+        assert_eq!(first_key, second_key);
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+        assert_eq!(cache.len(), 1);
     }
 }
