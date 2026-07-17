@@ -844,12 +844,22 @@ type WorkgroupPointer = (
 
 struct LoopContext {
     exit_label: Label,
+    continue_label: Label,
+    carried_locals: Vec<naga::Handle<naga::LocalVariable>>,
+    entry_locals: HashMap<naga::Handle<naga::LocalVariable>, Value>,
     break_edges: Vec<LoopBreakEdge>,
+    continue_edges: Vec<LoopContinueEdge>,
 }
 
 struct LoopBreakEdge {
     block: usize,
     returned: Option<Value>,
+}
+
+#[derive(Clone)]
+struct LoopContinueEdge {
+    block: usize,
+    locals: HashMap<naga::Handle<naga::LocalVariable>, Value>,
 }
 
 struct LoopPhi {
@@ -5964,6 +5974,9 @@ impl<'function> FunctionLowerer<'function> {
         if !break_when_true {
             predicate = predicate.bnot();
         }
+        if predicate.is_false() {
+            return Ok(());
+        }
         let branch_block = self.current_block;
         let mut instruction = Instr::new(OpBrk { target: exit_label });
         instruction.pred = predicate;
@@ -5984,6 +5997,50 @@ impl<'function> FunctionLowerer<'function> {
         Ok(())
     }
 
+    fn emit_conditional_continue(
+        &mut self,
+        condition: &Value,
+        continue_when_true: bool,
+    ) -> Result<(), Error> {
+        if condition.kind != naga::ScalarKind::Bool || condition.components.len() != 1 {
+            return Err(Error::UnsupportedFeature(
+                "loop continue condition is not a scalar boolean".to_owned(),
+            ));
+        }
+        let continue_label = self
+            .loops
+            .last()
+            .ok_or_else(|| Error::UnsupportedFeature("continue outside a loop".to_owned()))?
+            .continue_label;
+        let mut predicate = Self::predicate(&condition.components[0])?;
+        if !continue_when_true {
+            predicate = predicate.bnot();
+        }
+        if predicate.is_false() {
+            return Ok(());
+        }
+        let branch_block = self.current_block;
+        let mut instruction = Instr::new(OpCont {
+            target: continue_label,
+        });
+        instruction.pred = predicate;
+        self.emit(instruction);
+
+        let continuation_label = self.allocate_label();
+        let continuation = self.append_block(continuation_label);
+        self.add_edge(branch_block, continuation);
+        self.loops
+            .last_mut()
+            .expect("loop context checked above")
+            .continue_edges
+            .push(LoopContinueEdge {
+                block: branch_block,
+                locals: self.locals.clone(),
+            });
+        self.current_block = continuation;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_lines)]
     fn lower_loop(
         &mut self,
@@ -5992,19 +6049,20 @@ impl<'function> FunctionLowerer<'function> {
         break_if: Option<naga::Handle<naga::Expression>>,
     ) -> Result<(), Error> {
         let header_label = self.allocate_label();
+        let continue_label = self.allocate_label();
         let exit_label = self.allocate_label();
         let preheader = self.current_block;
 
-        let local_handles = self
-            .source
-            .local_variables
-            .iter()
-            .map(|(handle, _)| handle)
-            .collect::<Vec<_>>();
+        let mut written_locals = HashSet::new();
+        let mut carried_locals = HashSet::new();
+        self.collect_loop_carried_locals(body, &mut written_locals, &mut carried_locals);
+        self.collect_loop_carried_locals(continuing, &mut written_locals, &mut carried_locals);
+        let mut local_handles = carried_locals.into_iter().collect::<Vec<_>>();
+        local_handles.sort_by_key(|handle| handle.index());
         let mut preheader_sources = OpPhiSrcs::new();
         let mut header_destinations = OpPhiDsts::new();
         let mut loop_phis = Vec::new();
-        for local in local_handles {
+        for &local in &local_handles {
             let value = self.local_value(local)?;
             let materialized = self.materialize_loop_components(&value)?;
 
@@ -6039,7 +6097,7 @@ impl<'function> FunctionLowerer<'function> {
             self.emit(Instr::new(header_destinations));
         }
         self.emit(Instr::new(OpPCnt {
-            target: header_label,
+            target: continue_label,
         }));
         for phi in &mut loop_phis {
             if phi.header_value.kind == naga::ScalarKind::Bool {
@@ -6061,13 +6119,44 @@ impl<'function> FunctionLowerer<'function> {
 
         self.loops.push(LoopContext {
             exit_label,
+            continue_label,
+            carried_locals: local_handles,
+            entry_locals: self.locals.clone(),
             break_edges: Vec::new(),
+            continue_edges: Vec::new(),
         });
-        if self.execute_statements(body)?.is_some() {
-            return Err(Error::UnsupportedFeature(
-                "return from inside a loop".to_owned(),
-            ));
+        let returned_from_body = self.execute_statements(body)?;
+        let body_falls_through = returned_from_body.is_none();
+        let body_end = self.current_block;
+        if let Some(returned) = returned_from_body {
+            self.emit(Instr::new(OpBrk { target: exit_label }));
+            self.loops
+                .last_mut()
+                .expect("loop context was pushed")
+                .break_edges
+                .push(LoopBreakEdge {
+                    block: body_end,
+                    returned: Some(returned),
+                });
         }
+        let continuing_block = self.append_block(continue_label);
+        let mut continue_edges = self
+            .loops
+            .last()
+            .expect("loop context was pushed")
+            .continue_edges
+            .clone();
+        if body_falls_through {
+            continue_edges.push(LoopContinueEdge {
+                block: body_end,
+                locals: self.locals.clone(),
+            });
+        }
+        for edge in &continue_edges {
+            self.add_edge(edge.block, continuing_block);
+        }
+        self.current_block = continuing_block;
+        self.merge_continue_locals(&continue_edges, continuing_block)?;
         if self.execute_statements(continuing)?.is_some() {
             return Err(Error::UnsupportedFeature(
                 "return from a loop continuing block".to_owned(),
@@ -6111,6 +6200,182 @@ impl<'function> FunctionLowerer<'function> {
             self.locals.insert(phi.local, phi.header_value);
         }
         Ok(())
+    }
+
+    fn merge_continue_locals(
+        &mut self,
+        edges: &[LoopContinueEdge],
+        continuing_block: usize,
+    ) -> Result<(), Error> {
+        let Some(first) = edges.first() else {
+            return Ok(());
+        };
+        let local_handles = self
+            .loops
+            .last()
+            .expect("loop context was pushed")
+            .carried_locals
+            .clone();
+        let mut merges = Vec::with_capacity(local_handles.len());
+        for handle in local_handles {
+            let template = first.locals.get(&handle).ok_or_else(|| {
+                Error::UnsupportedFeature("missing continue-edge local".to_owned())
+            })?;
+            let phis = (0..template.components.len())
+                .map(|_| self.target.phi_alloc.alloc())
+                .collect::<Vec<_>>();
+            let destinations = (0..template.components.len())
+                .map(|_| self.target.ssa_alloc.alloc(RegFile::GPR))
+                .collect::<Vec<_>>();
+            merges.push((
+                handle,
+                template.kind,
+                template.components.len(),
+                phis,
+                destinations,
+            ));
+        }
+
+        for edge in edges {
+            self.current_block = edge.block;
+            let branch = self.blocks[edge.block]
+                .instrs
+                .last()
+                .is_some_and(|instruction| instruction.op.is_branch())
+                .then(|| self.blocks[edge.block].instrs.pop().expect("branch exists"));
+            let mut phi_sources = OpPhiSrcs::new();
+            for (handle, kind, component_count, phis, _) in &merges {
+                let value = edge.locals.get(handle).ok_or_else(|| {
+                    Error::UnsupportedFeature("missing continue-edge local".to_owned())
+                })?;
+                if value.kind != *kind || value.components.len() != *component_count {
+                    return Err(Error::UnsupportedFeature(
+                        "continue-edge local changed shape".to_owned(),
+                    ));
+                }
+                let sources = self.materialize_loop_components(value)?;
+                for (phi, source) in phis.iter().zip(sources) {
+                    phi_sources.srcs.push(*phi, Src::from(source));
+                }
+            }
+            self.emit(Instr::new(phi_sources));
+            if let Some(branch) = branch {
+                self.emit(branch);
+            }
+        }
+
+        self.current_block = continuing_block;
+        let mut phi_destinations = OpPhiDsts::new();
+        for (_, _, _, phis, destinations) in &merges {
+            for (phi, destination) in phis.iter().zip(destinations) {
+                phi_destinations.dsts.push(*phi, Dst::from(*destination));
+            }
+        }
+        self.emit(Instr::new(phi_destinations));
+
+        let mut merged_locals = self
+            .loops
+            .last()
+            .expect("loop context was pushed")
+            .entry_locals
+            .clone();
+        for (handle, kind, _, _, destinations) in merges {
+            let value = if kind == naga::ScalarKind::Bool {
+                self.boolean_loop_value(&destinations)
+            } else {
+                Value {
+                    components: destinations.into_iter().map(Src::from).collect(),
+                    kind,
+                }
+            };
+            merged_locals.insert(handle, value);
+        }
+        self.current_block = continuing_block;
+        self.locals = merged_locals;
+        Ok(())
+    }
+
+    fn collect_loop_carried_locals(
+        &self,
+        block: &naga::Block,
+        written: &mut HashSet<naga::Handle<naga::LocalVariable>>,
+        carried: &mut HashSet<naga::Handle<naga::LocalVariable>>,
+    ) {
+        for statement in block {
+            match statement {
+                naga::Statement::Emit(range) => {
+                    for expression in range.clone() {
+                        if let naga::Expression::Load { pointer } =
+                            self.source.expressions[expression]
+                            && let Ok((local, _, _)) = self.local_pointer(pointer)
+                            && !written.contains(&local)
+                        {
+                            carried.insert(local);
+                        }
+                    }
+                }
+                naga::Statement::Store { pointer, .. } => {
+                    if let Ok((local, _, _)) = self.local_pointer(*pointer) {
+                        written.insert(local);
+                    }
+                }
+                naga::Statement::Atomic { pointer, .. } => {
+                    if let Ok((local, _, _)) = self.local_pointer(*pointer) {
+                        if !written.contains(&local) {
+                            carried.insert(local);
+                        }
+                        written.insert(local);
+                    }
+                }
+                naga::Statement::Call { arguments, .. } => {
+                    for argument in arguments {
+                        if let Ok((local, _, _)) = self.local_pointer(*argument) {
+                            if !written.contains(&local) {
+                                carried.insert(local);
+                            }
+                            written.insert(local);
+                        }
+                    }
+                }
+                naga::Statement::Block(block) => {
+                    self.collect_loop_carried_locals(block, written, carried);
+                }
+                naga::Statement::If { accept, reject, .. } => {
+                    let mut accept_written = written.clone();
+                    let mut reject_written = written.clone();
+                    self.collect_loop_carried_locals(accept, &mut accept_written, carried);
+                    self.collect_loop_carried_locals(reject, &mut reject_written, carried);
+                    *written = accept_written
+                        .intersection(&reject_written)
+                        .copied()
+                        .collect();
+                }
+                naga::Statement::Switch { cases, .. } => {
+                    let mut all_written = None::<HashSet<_>>;
+                    for case in cases {
+                        let mut case_written = written.clone();
+                        self.collect_loop_carried_locals(&case.body, &mut case_written, carried);
+                        all_written = Some(match all_written {
+                            Some(previous) => {
+                                previous.intersection(&case_written).copied().collect()
+                            }
+                            None => case_written,
+                        });
+                    }
+                    if let Some(all_written) = all_written {
+                        *written = all_written;
+                    }
+                }
+                naga::Statement::Loop {
+                    body, continuing, ..
+                } => {
+                    let mut nested_written = written.clone();
+                    self.collect_loop_carried_locals(body, &mut nested_written, carried);
+                    self.collect_loop_carried_locals(continuing, &mut nested_written, carried);
+                }
+                _ => {}
+            }
+        }
     }
 
     fn merge_loop_returns(&mut self, context: &LoopContext) -> Result<(), Error> {
@@ -6202,7 +6467,7 @@ impl<'function> FunctionLowerer<'function> {
 
     #[allow(clippy::too_many_lines)]
     fn execute_statements(&mut self, body: &naga::Block) -> Result<Option<Value>, Error> {
-        for (statement_index, statement) in body.iter().enumerate() {
+        for statement in body {
             match statement {
                 naga::Statement::Return {
                     value: Some(handle),
@@ -6358,21 +6623,25 @@ impl<'function> FunctionLowerer<'function> {
                         && reject.is_empty()
                         && let Some(prefix) = Self::continue_prefix(accept)
                     {
-                        let remainder = naga::Block::from_vec(body[statement_index + 1..].to_vec());
-                        if let Some(value) = self.conditional(&condition, &prefix, &remainder)? {
+                        if let Some(value) =
+                            self.conditional(&condition, &prefix, &naga::Block::new())?
+                        {
                             return Ok(Some(self.finalize_return(value)?));
                         }
-                        return Ok(None);
+                        self.emit_conditional_continue(&condition, true)?;
+                        continue;
                     }
                     if !self.loops.is_empty()
                         && accept.is_empty()
                         && let Some(prefix) = Self::continue_prefix(reject)
                     {
-                        let remainder = naga::Block::from_vec(body[statement_index + 1..].to_vec());
-                        if let Some(value) = self.conditional(&condition, &remainder, &prefix)? {
+                        if let Some(value) =
+                            self.conditional(&condition, &naga::Block::new(), &prefix)?
+                        {
                             return Ok(Some(self.finalize_return(value)?));
                         }
-                        return Ok(None);
+                        self.emit_conditional_continue(&condition, false)?;
+                        continue;
                     }
                     if self.loops.len() > self.loop_base_depth && reject.is_empty() {
                         if let Some(value) = Self::block_return_value(accept) {
@@ -6683,30 +6952,62 @@ impl<'function> FunctionLowerer<'function> {
             return Err(Error::UnsupportedFeature("empty value".to_owned()));
         }
         let ssa = self.target.ssa_alloc.alloc_vec(RegFile::GPR, components);
+        let kind = value.kind;
         for (dst, src) in ssa.iter().zip(value.components) {
-            self.emit(Instr::new(OpMov {
-                dst: Dst::from(*dst),
-                src,
-                quad_lanes: 0xf,
-            }));
+            self.materialize_component(*dst, src, kind);
         }
         Ok(ssa)
     }
 
     fn materialize_components(&mut self, value: Value) -> Vec<SSAValue> {
+        let kind = value.kind;
         value
             .components
             .into_iter()
             .map(|source| {
                 let destination = self.target.ssa_alloc.alloc(RegFile::GPR);
-                self.emit(Instr::new(OpMov {
-                    dst: Dst::from(destination),
-                    src: source,
-                    quad_lanes: 0xf,
-                }));
+                self.materialize_component(destination, source, kind);
                 destination
             })
             .collect()
+    }
+
+    fn materialize_component(
+        &mut self,
+        destination: SSAValue,
+        source: Src,
+        kind: naga::ScalarKind,
+    ) {
+        let instruction = match (kind, source.src_mod) {
+            (naga::ScalarKind::Float, SrcMod::FAbs | SrcMod::FNeg | SrcMod::FNegAbs) => {
+                Instr::new(OpFAdd {
+                    dst: Dst::from(destination),
+                    srcs: [source, Src::from(0.0_f32)],
+                    saturate: false,
+                    rnd_mode: FRndMode::NearestEven,
+                    ftz: false,
+                })
+            }
+            (naga::ScalarKind::Sint, SrcMod::INeg) => Instr::new(OpIAdd2 {
+                dst: Dst::from(destination),
+                carry_out: Dst::None,
+                srcs: [source, Src::ZERO],
+            }),
+            (
+                naga::ScalarKind::Uint | naga::ScalarKind::Sint | naga::ScalarKind::Bool,
+                SrcMod::BNot,
+            ) => Instr::new(OpLop2 {
+                dst: Dst::from(destination),
+                srcs: [Src::ZERO, source],
+                op: LogicOp2::PassB,
+            }),
+            _ => Instr::new(OpMov {
+                dst: Dst::from(destination),
+                src: source,
+                quad_lanes: 0xf,
+            }),
+        };
+        self.emit(instruction);
     }
 
     fn materialize_loop_components(&mut self, value: &Value) -> Result<Vec<SSAValue>, Error> {

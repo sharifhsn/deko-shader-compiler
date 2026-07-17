@@ -969,7 +969,10 @@ fn spill_values<S: Spill>(
                 .expect("multi-successor block has no branch");
             let target = match branch.op {
                 Op::Brk(OpBrk { target }) => target,
-                _ => panic!("critical-edge spilling requires a predicated BRK"),
+                Op::Cont(OpCont { target }) => target,
+                _ => panic!(
+                    "critical-edge spilling requires a supported predicated branch: {branch}"
+                ),
             };
             successors
                 .iter()

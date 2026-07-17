@@ -17,6 +17,9 @@ pub fn compile_ir(mut shader: Shader<'_>, fs_key: Option<&FsKey>) -> Result<Shad
     if sm.sm() != 53 {
         return Err(Error::UnsupportedShaderModel(sm.sm()));
     }
+    if std::env::var_os("DEKO_NAK_PRINT_INITIAL_IR").is_some() {
+        eprintln!("{shader}");
+    }
 
     shader.opt_bar_prop();
     shader.opt_uniform_instrs();
@@ -28,7 +31,14 @@ pub fn compile_ir(mut shader: Shader<'_>, fs_key: Option<&FsKey>) -> Result<Shad
     shader.opt_out();
     shader.legalize();
     shader.opt_dce();
-    shader.opt_instr_sched_prepass();
+    // Keep compute carry-producing integer pairs in program order. The Mesa pre-RA scheduler
+    // may interleave independent 64-bit address additions, but GM20B has one carry register.
+    if !matches!(shader.info.stage, ShaderStageInfo::Compute(_)) {
+        shader.opt_instr_sched_prepass();
+    }
+    if std::env::var_os("DEKO_NAK_PRINT_IR").is_some() {
+        eprintln!("{shader}");
+    }
     shader.assign_regs();
     shader.lower_par_copies();
     shader.lower_copy_swap();

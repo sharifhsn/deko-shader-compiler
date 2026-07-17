@@ -1495,6 +1495,43 @@ mod tests {
     }
 
     #[test]
+    fn loop_continues_and_early_struct_return_compile() {
+        let source = r"
+            struct Result { value: f32, found: bool }
+
+            fn search(limit: u32) -> Result {
+                var result: Result;
+                result.value = 0.0;
+                result.found = false;
+                for (var index = 0u; index < limit; index += 1u) {
+                    if (index & 1u) == 0u { continue; }
+                    let weight = f32(index) * 0.25;
+                    if weight == 0.0 { continue; }
+                    result.value = weight;
+                    result.found = true;
+                    return result;
+                }
+                return result;
+            }
+
+            @fragment
+            fn main() -> @location(0) vec4<f32> {
+                let result = search(8u);
+                return vec4<f32>(result.value * f32(result.found));
+            }
+        ";
+        Compiler
+            .compile_wgsl(
+                source,
+                Stage::Fragment,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap();
+    }
+
+    #[test]
     fn pipeline_overrides_are_resolved_and_multiview_fails_explicitly() {
         let source = "override scale: f32 = 1.0; @fragment fn main() -> @location(0) vec4<f32> { return vec4<f32>(scale, 0.0, 0.0, 1.0); }";
         let compile = |scale| {

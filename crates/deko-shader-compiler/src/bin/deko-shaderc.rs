@@ -2,7 +2,7 @@
 
 use std::{env, fs, process::ExitCode};
 
-use deko_shader_compiler::{Compiler, Options, PipelineConstants, Stage};
+use deko_shader_compiler::{BindingArraySize, Compiler, Options, PipelineConstants, Stage};
 
 fn main() -> ExitCode {
     match run() {
@@ -25,8 +25,21 @@ fn run() -> Result<(), String> {
         _ => return Err(usage()),
     };
     let entry_point = arguments.next().unwrap_or_else(|| "main".to_owned());
-    if arguments.next().is_some() {
-        return Err(usage());
+    let mut binding_array_sizes = Vec::new();
+    for argument in arguments {
+        let (binding, count) = argument.split_once('=').ok_or_else(usage)?;
+        let (group, binding) = binding.split_once(':').ok_or_else(usage)?;
+        binding_array_sizes.push(BindingArraySize {
+            group: group
+                .parse()
+                .map_err(|_| format!("invalid bind-group index in '{argument}'"))?,
+            binding: binding
+                .parse()
+                .map_err(|_| format!("invalid binding index in '{argument}'"))?,
+            count: count
+                .parse()
+                .map_err(|_| format!("invalid binding-array count in '{argument}'"))?,
+        });
     }
     let source = fs::read_to_string(&input)
         .map_err(|error| format!("failed to read WGSL '{input}': {error}"))?;
@@ -36,7 +49,10 @@ fn run() -> Result<(), String> {
             stage,
             &entry_point,
             &PipelineConstants::new(),
-            Options::default(),
+            Options {
+                binding_array_sizes,
+                ..Options::default()
+            },
         )
         .map_err(|error| error.to_string())?;
     fs::write(&output, &artifact.dksh)
@@ -50,6 +66,5 @@ fn run() -> Result<(), String> {
 }
 
 fn usage() -> String {
-    "usage: deko-shaderc <input.wgsl> <output.dksh> <vertex|fragment|compute> [entry-point]"
-        .to_owned()
+    "usage: deko-shaderc <input.wgsl> <output.dksh> <vertex|fragment|compute> [entry-point] [group:binding=count ...]".to_owned()
 }

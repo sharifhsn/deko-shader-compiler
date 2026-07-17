@@ -475,7 +475,12 @@ impl RegAllocator {
 
         let reg = self
             .try_find_unused_reg_range(0, 1, 1, 0)
-            .expect("Failed to find free register");
+            .unwrap_or_else(|| {
+                panic!(
+                    "Failed to find free register for {ssa} at ip {ip}: {} of {} registers allocated",
+                    self.num_regs_used(), self.num_regs
+                )
+            });
         self.assign_reg(ssa, reg);
         reg
     }

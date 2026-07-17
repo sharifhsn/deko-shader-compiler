@@ -261,7 +261,7 @@ impl SM50Encoder<'_> {
     }
 
     fn set_reg_src(&mut self, range: Range<usize>, src: &Src) {
-        assert!(src.is_unmodified());
+        assert!(src.is_unmodified(), "modified register source in MOV: {src}");
         self.set_reg_src_ref(range, &src.src_ref);
     }
 
