@@ -23,3 +23,16 @@ files = [
     { upstream = "src/compiler/rust/proc/from_variants.rs", local = "crates/deko-shader-compiler-macros/src/compiler_proc/from_variants.rs", modified = false },
     { upstream = "src/nouveau/compiler/nak/ir_proc.rs", local = "crates/deko-shader-compiler-macros/src/lib.rs", modified = true },
 ]
+
+[[upstreams]]
+name = "Deko3D DKSH format"
+repository = "https://github.com/devkitPro/deko3d.git"
+revision = "350f2b00a3e76ecd4f00191f8c5d6544ffbcb9db"
+license = "Zlib"
+status = "format-reference"
+source_root = "source"
+notice = "The public DKSH layout and loader semantics define deko-dksh's independently written Rust representation."
+files = [
+    { upstream = "source/dksh.h", local = "crates/deko-dksh/src/lib.rs", modified = true },
+    { upstream = "source/cmd_bind_common.cpp", local = "crates/deko-dksh/src/lib.rs", modified = true },
+]

@@ -28,14 +28,14 @@ pub const BINDING_METADATA_MAGIC: &[u8; 8] = b"DKRBv001";
 pub enum ProgramType {
     /// Vertex shader.
     Vertex = 0,
-    /// Tessellation-control shader.
-    TessellationControl = 1,
-    /// Tessellation-evaluation shader.
-    TessellationEvaluation = 2,
-    /// Geometry shader.
-    Geometry = 3,
     /// Fragment shader.
-    Fragment = 4,
+    Fragment = 1,
+    /// Geometry shader.
+    Geometry = 2,
+    /// Tessellation-control shader.
+    TessellationControl = 3,
+    /// Tessellation-evaluation shader.
+    TessellationEvaluation = 4,
     /// Compute shader.
     Compute = 5,
 }
@@ -46,12 +46,196 @@ impl TryFrom<u32> for ProgramType {
     fn try_from(value: u32) -> Result<Self, Self::Error> {
         match value {
             0 => Ok(Self::Vertex),
-            1 => Ok(Self::TessellationControl),
-            2 => Ok(Self::TessellationEvaluation),
-            3 => Ok(Self::Geometry),
-            4 => Ok(Self::Fragment),
+            1 => Ok(Self::Fragment),
+            2 => Ok(Self::Geometry),
+            3 => Ok(Self::TessellationControl),
+            4 => Ok(Self::TessellationEvaluation),
             5 => Ok(Self::Compute),
             other => Err(Error::InvalidProgramType(other)),
+        }
+    }
+}
+
+/// Stage-specific metadata stored in the 36-byte union of a DKSH program entry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StagePayload {
+    /// Vertex-stage alternate entry point used by `Deko3D` when present.
+    Vertex {
+        /// Alternate machine-code offset.
+        alternate_entrypoint: u32,
+        /// Register count for the alternate entry point; zero disables it.
+        alternate_num_gprs: u32,
+    },
+    /// Fragment-stage fixed-function programming parameters.
+    Fragment {
+        /// Whether the four-word method `0x3d1` table is emitted.
+        has_table_3d1: bool,
+        /// Request early fragment tests.
+        early_fragment_tests: bool,
+        /// Request post-depth coverage.
+        post_depth_coverage: bool,
+        /// Run the shader once per sample.
+        per_sample_invocation: bool,
+        /// Values written to methods `0x3d1..=0x3d4` when enabled.
+        table_3d1: [u32; 4],
+        /// Value written to method `0x0d8`.
+        param_d8: u32,
+        /// Value written to method `0x65b`.
+        param_65b: u16,
+        /// Value written to method `0x489`.
+        param_489: u16,
+    },
+    /// Geometry-stage fixed-function programming parameters.
+    Geometry {
+        /// Value written to method `0x47c`.
+        flag_47c: bool,
+        /// Whether the eight-word method `0x490` table is emitted.
+        has_table_490: bool,
+        /// Values written to methods `0x490..=0x497` when enabled.
+        table_490: [u32; 8],
+    },
+    /// Tessellation-control stage; its union has no stage-specific fields.
+    TessellationControl,
+    /// Tessellation-evaluation fixed-function parameter.
+    TessellationEvaluation {
+        /// Value written to method `0x0c8`.
+        param_c8: u32,
+    },
+    /// Compute launch metadata consumed by `Deko3D`'s QMD builder.
+    Compute {
+        /// Local workgroup size in X, Y, and Z.
+        block_dimensions: [u32; 3],
+        /// Shared-memory bytes per workgroup.
+        shared_memory_size: u32,
+        /// Positive local-memory allocation.
+        local_positive_memory_size: u32,
+        /// Negative local-memory allocation.
+        local_negative_memory_size: u32,
+        /// Call/return stack allocation.
+        crs_size: u32,
+        /// Number of hardware barriers used.
+        num_barriers: u32,
+    },
+}
+
+impl StagePayload {
+    /// DKSH program type corresponding to this payload variant.
+    #[must_use]
+    pub const fn program_type(self) -> ProgramType {
+        match self {
+            Self::Vertex { .. } => ProgramType::Vertex,
+            Self::Fragment { .. } => ProgramType::Fragment,
+            Self::Geometry { .. } => ProgramType::Geometry,
+            Self::TessellationControl => ProgramType::TessellationControl,
+            Self::TessellationEvaluation { .. } => ProgramType::TessellationEvaluation,
+            Self::Compute { .. } => ProgramType::Compute,
+        }
+    }
+
+    fn encode(self) -> [u8; 36] {
+        let mut bytes = [0; 36];
+        match self {
+            Self::Vertex {
+                alternate_entrypoint,
+                alternate_num_gprs,
+            } => {
+                write_u32(&mut bytes, 0, alternate_entrypoint);
+                write_u32(&mut bytes, 4, alternate_num_gprs);
+            }
+            Self::Fragment {
+                has_table_3d1,
+                early_fragment_tests,
+                post_depth_coverage,
+                per_sample_invocation,
+                table_3d1,
+                param_d8,
+                param_65b,
+                param_489,
+            } => {
+                bytes[0] = u8::from(has_table_3d1);
+                bytes[1] = u8::from(early_fragment_tests);
+                bytes[2] = u8::from(post_depth_coverage);
+                bytes[3] = u8::from(per_sample_invocation);
+                for (index, value) in table_3d1.into_iter().enumerate() {
+                    write_u32(&mut bytes, 4 + index * 4, value);
+                }
+                write_u32(&mut bytes, 20, param_d8);
+                write_u16(&mut bytes, 24, param_65b);
+                write_u16(&mut bytes, 26, param_489);
+            }
+            Self::Geometry {
+                flag_47c,
+                has_table_490,
+                table_490,
+            } => {
+                bytes[0] = u8::from(flag_47c);
+                bytes[1] = u8::from(has_table_490);
+                for (index, value) in table_490.into_iter().enumerate() {
+                    write_u32(&mut bytes, 4 + index * 4, value);
+                }
+            }
+            Self::TessellationControl => {}
+            Self::TessellationEvaluation { param_c8 } => write_u32(&mut bytes, 0, param_c8),
+            Self::Compute {
+                block_dimensions,
+                shared_memory_size,
+                local_positive_memory_size,
+                local_negative_memory_size,
+                crs_size,
+                num_barriers,
+            } => {
+                for (index, value) in block_dimensions.into_iter().enumerate() {
+                    write_u32(&mut bytes, index * 4, value);
+                }
+                write_u32(&mut bytes, 12, shared_memory_size);
+                write_u32(&mut bytes, 16, local_positive_memory_size);
+                write_u32(&mut bytes, 20, local_negative_memory_size);
+                write_u32(&mut bytes, 24, crs_size);
+                write_u32(&mut bytes, 28, num_barriers);
+            }
+        }
+        bytes
+    }
+
+    fn decode(program_type: ProgramType, bytes: &[u8; 36]) -> Self {
+        match program_type {
+            ProgramType::Vertex => Self::Vertex {
+                alternate_entrypoint: read_u32(bytes, 0).expect("fixed payload offset"),
+                alternate_num_gprs: read_u32(bytes, 4).expect("fixed payload offset"),
+            },
+            ProgramType::Fragment => Self::Fragment {
+                has_table_3d1: bytes[0] != 0,
+                early_fragment_tests: bytes[1] != 0,
+                post_depth_coverage: bytes[2] != 0,
+                per_sample_invocation: bytes[3] != 0,
+                table_3d1: core::array::from_fn(|index| {
+                    read_u32(bytes, 4 + index * 4).expect("fixed payload offset")
+                }),
+                param_d8: read_u32(bytes, 20).expect("fixed payload offset"),
+                param_65b: read_u16(bytes, 24).expect("fixed payload offset"),
+                param_489: read_u16(bytes, 26).expect("fixed payload offset"),
+            },
+            ProgramType::Geometry => Self::Geometry {
+                flag_47c: bytes[0] != 0,
+                has_table_490: bytes[1] != 0,
+                table_490: core::array::from_fn(|index| {
+                    read_u32(bytes, 4 + index * 4).expect("fixed payload offset")
+                }),
+            },
+            ProgramType::TessellationControl => Self::TessellationControl,
+            ProgramType::TessellationEvaluation => Self::TessellationEvaluation {
+                param_c8: read_u32(bytes, 0).expect("fixed payload offset"),
+            },
+            ProgramType::Compute => Self::Compute {
+                block_dimensions: core::array::from_fn(|index| {
+                    read_u32(bytes, index * 4).expect("fixed payload offset")
+                }),
+                shared_memory_size: read_u32(bytes, 12).expect("fixed payload offset"),
+                local_positive_memory_size: read_u32(bytes, 16).expect("fixed payload offset"),
+                local_negative_memory_size: read_u32(bytes, 20).expect("fixed payload offset"),
+                crs_size: read_u32(bytes, 24).expect("fixed payload offset"),
+                num_barriers: read_u32(bytes, 28).expect("fixed payload offset"),
+            },
         }
     }
 }
@@ -113,8 +297,8 @@ pub struct Program {
     pub constbuf1: Option<(u32, u32)>,
     /// Scratch bytes required per warp.
     pub per_warp_scratch_size: u32,
-    /// Native 36-byte Maxwell shader-program-header payload.
-    pub payload: [u8; 36],
+    /// Stage-specific `Deko3D` command/QMD metadata.
+    pub payload: StagePayload,
 }
 
 /// A validated view of a DKSH container.
@@ -208,7 +392,7 @@ pub fn encode(program: Program, code: &[u8], bindings: &[Binding]) -> Result<Vec
     push_u32(&mut output, constbuf1_offset);
     push_u32(&mut output, constbuf1_size);
     push_u32(&mut output, program.per_warp_scratch_size);
-    output.extend_from_slice(&program.payload);
+    output.extend_from_slice(&program.payload.encode());
     push_u32(&mut output, 0);
 
     output.resize(control_size, 0);
@@ -285,9 +469,10 @@ pub fn parse(bytes: &[u8]) -> Result<Container<'_>, Error> {
     let constbuf1_size = read_u32(bytes, program_offset + 16).ok_or(Error::InvalidProgram)?;
     let per_warp_scratch_size =
         read_u32(bytes, program_offset + 20).ok_or(Error::InvalidProgram)?;
-    let payload: [u8; 36] = bytes[program_offset + 24..program_offset + 60]
+    let payload_bytes: [u8; 36] = bytes[program_offset + 24..program_offset + 60]
         .try_into()
         .map_err(|_| Error::InvalidProgram)?;
+    let payload = StagePayload::decode(program_type, &payload_bytes);
     let reserved = read_u32(bytes, program_offset + 60).ok_or(Error::InvalidProgram)?;
     if reserved != 0 {
         return Err(Error::InvalidProgram);
@@ -313,6 +498,9 @@ pub fn parse(bytes: &[u8]) -> Result<Container<'_>, Error> {
 }
 
 fn validate_program(program: Program, code_size: u32) -> Result<(), Error> {
+    if program.payload.program_type() != program.program_type {
+        return Err(Error::InvalidProgram);
+    }
     if program.entrypoint >= code_size {
         return Err(Error::InvalidProgram);
     }
@@ -369,6 +557,22 @@ fn push_u32(output: &mut Vec<u8>, value: u32) {
     output.extend_from_slice(&value.to_le_bytes());
 }
 
+fn write_u32(bytes: &mut [u8], offset: usize, value: u32) {
+    bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn write_u16(bytes: &mut [u8], offset: usize, value: u16) {
+    bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
+    bytes
+        .get(offset..offset.checked_add(2)?)?
+        .try_into()
+        .ok()
+        .map(u16::from_le_bytes)
+}
+
 fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
     bytes
         .get(offset..offset.checked_add(4)?)?
@@ -401,7 +605,39 @@ mod tests {
             num_gprs: 12,
             constbuf1: Some((8, 8)),
             per_warp_scratch_size: 32,
-            payload: [0x5a; 36],
+            payload: match program_type {
+                ProgramType::Vertex => StagePayload::Vertex {
+                    alternate_entrypoint: 0,
+                    alternate_num_gprs: 0,
+                },
+                ProgramType::Fragment => StagePayload::Fragment {
+                    has_table_3d1: true,
+                    early_fragment_tests: false,
+                    post_depth_coverage: true,
+                    per_sample_invocation: false,
+                    table_3d1: [1, 2, 3, 4],
+                    param_d8: 5,
+                    param_65b: 6,
+                    param_489: 7,
+                },
+                ProgramType::Geometry => StagePayload::Geometry {
+                    flag_47c: true,
+                    has_table_490: true,
+                    table_490: [1, 2, 3, 4, 5, 6, 7, 8],
+                },
+                ProgramType::TessellationControl => StagePayload::TessellationControl,
+                ProgramType::TessellationEvaluation => {
+                    StagePayload::TessellationEvaluation { param_c8: 9 }
+                }
+                ProgramType::Compute => StagePayload::Compute {
+                    block_dimensions: [8, 4, 2],
+                    shared_memory_size: 1024,
+                    local_positive_memory_size: 32,
+                    local_negative_memory_size: 64,
+                    crs_size: 128,
+                    num_barriers: 3,
+                },
+            },
         }
     }
 
@@ -433,6 +669,23 @@ mod tests {
         assert!(decoded.code[code.len()..].iter().all(|byte| *byte == 0));
         assert_eq!(decoded.bindings, bindings);
         assert_eq!(decoded.control_size, 256);
+    }
+
+    #[test]
+    fn official_program_type_values_and_payloads_round_trip() {
+        let stages = [
+            ProgramType::Vertex,
+            ProgramType::Fragment,
+            ProgramType::Geometry,
+            ProgramType::TessellationControl,
+            ProgramType::TessellationEvaluation,
+            ProgramType::Compute,
+        ];
+        for (expected, stage) in (0_u32..).zip(stages) {
+            assert_eq!(stage as u32, expected);
+            let encoded = encode(program(stage), &[0; 16], &[]).unwrap();
+            assert_eq!(parse(&encoded).unwrap().program, program(stage));
+        }
     }
 
     #[test]

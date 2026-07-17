@@ -31,8 +31,8 @@ pub struct ShaderBinary {
     pub num_gprs: u32,
     /// Scratch bytes required per warp.
     pub per_warp_scratch_size: u32,
-    /// Encoded shader-program-header payload.
-    pub header: [u8; 36],
+    /// NAK shader program header. For GM20B the first 20 words are meaningful `SPHv3`.
+    pub sph: [u32; 32],
 }
 
 /// Machine-backend failure.
