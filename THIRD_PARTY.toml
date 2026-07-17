@@ -7,9 +7,12 @@ revision = "99bf1b953cba11d41dbee519ae1b53387477df9e"
 license = "MIT"
 status = "extraction-in-progress"
 source_root = "src/nouveau/compiler/nak"
+staged_root = "crates/deko-nak/upstream/mesa"
+file_manifest = "crates/deko-nak/UPSTREAM_FILES.txt"
 notice = "Every imported file must retain its original copyright and SPDX header."
 
 files = [
+    { upstream = "src/nouveau/compiler/nak.h", local = "crates/deko-nak/src/bindings.rs", modified = true },
     { upstream = "src/nouveau/rust/bitview/lib.rs", local = "crates/deko-bitview/src/upstream.rs", modified = false },
     { upstream = "src/compiler/rust/as_slice.rs", local = "crates/deko-compiler-utils/src/as_slice.rs", modified = false },
     { upstream = "src/compiler/rust/bitset.rs", local = "crates/deko-compiler-utils/src/bitset.rs", modified = false },

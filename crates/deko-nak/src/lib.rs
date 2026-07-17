@@ -5,6 +5,10 @@
 
 use thiserror::Error;
 
+mod bindings;
+
+pub use bindings::{FsKey, MeshTopology, TransformFeedbackInfo};
+
 /// Maxwell target properties needed by the standalone backend.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Target {

@@ -13,8 +13,12 @@ homepage.workspace = true
 authors.workspace = true
 
 [dependencies]
+bitview = { package = "deko-bitview", version = "0.1.0", path = "../deko-bitview" }
+compiler = { package = "deko-compiler-utils", version = "0.1.0", path = "../deko-compiler-utils" }
+nak-ir-proc = { package = "deko-shader-compiler-macros", version = "0.1.0", path = "../deko-shader-compiler-macros" }
+paste.workspace = true
+rustc-hash.workspace = true
 thiserror.workspace = true
 
 [lints]
 workspace = true
-
