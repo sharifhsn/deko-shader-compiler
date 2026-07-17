@@ -19,6 +19,12 @@
 - Advance the backend ABI cache namespace for the explicit-gradient codegen changes.
 - Lower subgroup barriers to CTA-scoped memory fences on lockstep GM20B warps without
   introducing a whole-workgroup synchronization point.
+- Lower `subgroupBroadcastFirst` using a Maxwell active-lane ballot, first-set-lane
+  selection, and shuffle.
+- Lower array texture layer-count queries, including the Maxwell cube-face count to
+  cube-layer conversion used by Mesa NIR.
+- Accept pipeline-specialized compute workgroup-size overrides and preserve their
+  resolved dimensions in DKSH metadata.
 - Add a safe deterministic DKSH encoder/parser with typed stage payloads and
   versioned binding metadata consumed by wgpu-hal.
 - Add the explicit GM20B target descriptor, register allocation, scheduling, SPH

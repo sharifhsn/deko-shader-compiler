@@ -1442,6 +1442,8 @@ mod tests {
             @group(0) @binding(0) var image: texture_2d<f32>;
             @group(0) @binding(1) var image_sampler: sampler;
             @group(0) @binding(2) var multisampled: texture_multisampled_2d<f32>;
+            @group(0) @binding(3) var array_image: texture_2d_array<f32>;
+            @group(0) @binding(4) var cube_array: texture_cube_array<f32>;
 
             fn dimensions(value: texture_2d<f32>) -> vec2<u32> {
                 return textureDimensions(value, 0);
@@ -1451,8 +1453,9 @@ mod tests {
             fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
                 let size = dimensions(image);
                 let samples = textureNumSamples(multisampled);
+                let layers = textureNumLayers(array_image) + textureNumLayers(cube_array);
                 let color = textureSampleLevel(image, image_sampler, uv, 0.0, vec2<i32>(1, 0));
-                return color + vec4<f32>(f32(size.x + samples));
+                return color + vec4<f32>(f32(size.x + samples + layers));
             }
         ";
         Compiler
@@ -1568,6 +1571,28 @@ mod tests {
                 .unwrap()
         };
         assert_ne!(compile(0.25), compile(0.75));
+
+        let mut workgroup_constants = PipelineConstants::new();
+        workgroup_constants.insert("width".to_owned(), 8.0);
+        let workgroup_artifact = Compiler
+            .compile_wgsl(
+                "override width: u32 = 1u; @compute @workgroup_size(width, 2, 1) fn main() {}",
+                Stage::Compute,
+                "main",
+                &workgroup_constants,
+                Options::default(),
+            )
+            .unwrap();
+        assert!(matches!(
+            deko_dksh::parse(&workgroup_artifact.dksh)
+                .unwrap()
+                .program
+                .payload,
+            deko_dksh::StagePayload::Compute {
+                block_dimensions: [8, 2, 1],
+                ..
+            }
+        ));
 
         let multiview_error = Compiler
             .compile_wgsl(
@@ -1723,6 +1748,20 @@ mod tests {
         assert!(subgroup_ir.contains("membar"), "{subgroup_ir}");
         assert!(subgroup_ir.contains(".cta"), "{subgroup_ir}");
         assert!(!subgroup_ir.contains("bar.sync"), "{subgroup_ir}");
+
+        let broadcast_first_ir = lowered_ir(
+            "@compute @workgroup_size(32) fn main(@builtin(local_invocation_index) lane: u32) { _ = subgroupBroadcastFirst(lane); }",
+            naga::ShaderStage::Compute,
+            "main",
+        );
+        assert!(
+            broadcast_first_ir.contains("vote.any"),
+            "{broadcast_first_ir}"
+        );
+        assert!(
+            broadcast_first_ir.contains("shfl.idx"),
+            "{broadcast_first_ir}"
+        );
     }
 
     #[test]

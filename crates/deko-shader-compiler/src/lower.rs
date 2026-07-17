@@ -7,10 +7,10 @@ use deko_nak::ir::{
     OpFMnMx, OpFMul, OpFSetP, OpFSwzAdd, OpFlo, OpI2F, OpIAdd2, OpIAdd2X, OpIMad, OpIMnMx, OpIMul,
     OpISetP, OpIpa, OpKill, OpLd, OpLdc, OpLop2, OpMemBar, OpMov, OpMuFu, OpPBk, OpPCnt, OpPSetP,
     OpPhiDsts, OpPhiSrcs, OpPrmt, OpRegOut, OpS2R, OpSel, OpShfl, OpShl, OpShr, OpSt, OpSuLd,
-    OpSuSt, OpTex, OpTld, OpTld4, OpTxd, OpTxq, Phi, Pred, PredRef, PredSetOp, PrmtMode, RegFile,
-    SSARef, SSAValue, Shader, ShaderInfo, ShaderIoInfo, ShaderModelInfo, ShaderStageInfo, ShflOp,
-    Src, SrcMod, SrcRef, SrcSwizzle, TexDerivMode, TexDim, TexLodMode, TexOffsetMode, TexQuery,
-    TexRef,
+    OpSuSt, OpTex, OpTld, OpTld4, OpTxd, OpTxq, OpVote, Phi, Pred, PredRef, PredSetOp, PrmtMode,
+    RegFile, SSARef, SSAValue, Shader, ShaderInfo, ShaderIoInfo, ShaderModelInfo, ShaderStageInfo,
+    ShflOp, Src, SrcMod, SrcRef, SrcSwizzle, TexDerivMode, TexDim, TexLodMode, TexOffsetMode,
+    TexQuery, TexRef, VoteOp,
 };
 use deko_nak::sph::PixelImap;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
@@ -470,11 +470,6 @@ fn lower_compute<'sm>(
     if entry.function.result.is_some() {
         return Err(Error::UnsupportedFeature(
             "compute entry-point return values".to_owned(),
-        ));
-    }
-    if entry.workgroup_size_overrides.is_some() {
-        return Err(Error::UnsupportedFeature(
-            "overridden compute workgroup sizes".to_owned(),
         ));
     }
     let [x, y, z] = entry.workgroup_size;
@@ -1045,6 +1040,7 @@ impl<'function> FunctionLowerer<'function> {
         Ok(Src::from(destination))
     }
 
+    #[allow(clippy::too_many_lines)]
     fn image_query(
         &mut self,
         image: naga::Handle<naga::Expression>,
@@ -1069,13 +1065,17 @@ impl<'function> FunctionLowerer<'function> {
                 (TexRef::Bound(target), None)
             };
         let image_type = binding_resource_base_type(self.module, image);
-        let naga::TypeInner::Image { dim: dimension, .. } = self.module.types[image_type].inner
+        let naga::TypeInner::Image {
+            dim: dimension,
+            arrayed,
+            ..
+        } = self.module.types[image_type].inner
         else {
             return Err(Error::UnsupportedFeature(
                 "queried resource is not an image".to_owned(),
             ));
         };
-        let (level, components, native_query, channel_mask) = match query {
+        let (level, components, native_query, channel_mask, layer_divisor) = match query {
             naga::ImageQuery::Size { level } => {
                 let level = match level {
                     Some(level) => self.expression(level)?,
@@ -1101,6 +1101,7 @@ impl<'function> FunctionLowerer<'function> {
                     components,
                     TexQuery::Dimension,
                     ChannelMask::for_comps(components),
+                    None,
                 )
             }
             naga::ImageQuery::NumSamples => (
@@ -1111,6 +1112,7 @@ impl<'function> FunctionLowerer<'function> {
                 1,
                 TexQuery::TextureType,
                 ChannelMask::new(1 << 2),
+                None,
             ),
             naga::ImageQuery::NumLevels => (
                 Value {
@@ -1120,11 +1122,30 @@ impl<'function> FunctionLowerer<'function> {
                 1,
                 TexQuery::Dimension,
                 ChannelMask::new(1 << 3),
+                None,
             ),
-            query @ naga::ImageQuery::NumLayers => {
-                return Err(Error::UnsupportedFeature(format!(
-                    "texture query {query:?}"
-                )));
+            naga::ImageQuery::NumLayers if arrayed => (
+                Value {
+                    components: vec![Src::ZERO],
+                    kind: naga::ScalarKind::Uint,
+                },
+                1,
+                TexQuery::Dimension,
+                ChannelMask::new(match dimension {
+                    naga::ImageDimension::D1 => 1 << 1,
+                    naga::ImageDimension::D2 | naga::ImageDimension::Cube => 1 << 2,
+                    naga::ImageDimension::D3 => {
+                        return Err(Error::UnsupportedFeature(
+                            "arrayed 3D texture layer query".to_owned(),
+                        ));
+                    }
+                }),
+                (dimension == naga::ImageDimension::Cube).then_some(6_u32),
+            ),
+            naga::ImageQuery::NumLayers => {
+                return Err(Error::UnsupportedFeature(
+                    "layer query on a non-array texture".to_owned(),
+                ));
             }
         };
         let mut source = bindless_target.unwrap_or(Value {
@@ -1142,10 +1163,23 @@ impl<'function> FunctionLowerer<'function> {
             nodep: false,
             channel_mask,
         }));
-        Ok(Value {
+        let result = Value {
             components: destination.iter().copied().map(Src::from).collect(),
             kind: naga::ScalarKind::Uint,
-        })
+        };
+        if let Some(divisor) = layer_divisor {
+            self.binary(
+                naga::BinaryOperator::Divide,
+                &result,
+                &Value {
+                    components: vec![Src::from(divisor)],
+                    kind: naga::ScalarKind::Uint,
+                },
+                None,
+            )
+        } else {
+            Ok(result)
+        }
     }
 
     fn image_store(
@@ -1253,9 +1287,23 @@ impl<'function> FunctionLowerer<'function> {
         let sources = self.materialize_loop_components(&argument)?;
         let (lane, c, op) = match mode {
             naga::GatherMode::BroadcastFirst => {
-                return Err(Error::UnsupportedFeature(
-                    "subgroup broadcast-first".to_owned(),
-                ));
+                let active_lanes = self.target.ssa_alloc.alloc(RegFile::GPR);
+                self.emit(Instr::new(OpVote {
+                    op: VoteOp::Any,
+                    ballot: Dst::from(active_lanes),
+                    vote: Dst::None,
+                    pred: Src::from(SrcRef::True),
+                }));
+                let reversed = self.reverse_bits(Value {
+                    components: vec![Src::from(active_lanes)],
+                    kind: naga::ScalarKind::Uint,
+                })?;
+                let first_active = self.count_leading_zeros(reversed)?;
+                (
+                    Src::from(self.materialize(first_active)?),
+                    Src::from(0x1f_u32),
+                    ShflOp::Idx,
+                )
             }
             naga::GatherMode::Broadcast(index) | naga::GatherMode::Shuffle(index) => {
                 (self.subgroup_lane(index)?, Src::from(0x1f_u32), ShflOp::Idx)
