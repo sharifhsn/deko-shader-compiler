@@ -10,7 +10,10 @@ use thiserror::Error;
 mod cache;
 mod lower;
 
-pub use cache::{BACKEND_ABI_VERSION, CACHE_KEY_VERSION, CacheKey, CompilerCache};
+pub use cache::{
+    BACKEND_ABI_VERSION, CACHE_KEY_VERSION, CacheKey, CompilerCache, DEFAULT_MEMORY_CACHE_BYTES,
+    DEFAULT_MEMORY_CACHE_ENTRIES,
+};
 
 /// Pipeline override values after wgpu resolves their names.
 pub type PipelineConstants = BTreeMap<String, f64>;

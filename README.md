@@ -32,7 +32,10 @@ foundation. Imported upstream source retains its original notices and is recorde
 
 `deko-shader-compiler` also exposes a versioned `CacheKey` and thread-safe `CompilerCache`.
 Cache identities include the exact WGSL, stage, entry point, canonical pipeline constants, every
-code-generation option, the package version, and a manually versioned backend ABI.
+code-generation option, the package version, and a manually versioned backend ABI. The RAM cache
+has configurable entry and byte limits with deterministic LRU eviction. Call
+`with_persistent_directory` to opt into checksummed, structurally validated DKSH files written by
+atomic rename; corrupt or stale files are removed and regenerated without making compilation fail.
 
 Runtime-sized WGSL `binding_array<T>` declarations take their descriptor count from
 `Options::binding_array_sizes`; wgpu forwards these values from the explicit pipeline layout. The
