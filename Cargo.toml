@@ -23,7 +23,7 @@ deko-bitview = { version = "0.1.0", path = "crates/deko-bitview" }
 deko-compiler-utils = { version = "0.1.0", path = "crates/deko-compiler-utils" }
 deko-dksh = { version = "0.1.0", path = "crates/deko-dksh" }
 deko-nak = { version = "0.1.0", path = "crates/deko-nak" }
-naga = { version = "29.0.0", default-features = false, features = ["wgsl-in"] }
+naga = { version = "29.0.0", default-features = false, features = ["glsl-out", "wgsl-in"] }
 paste = "1.0"
 proc-macro2 = "1.0"
 quote = "1.0"

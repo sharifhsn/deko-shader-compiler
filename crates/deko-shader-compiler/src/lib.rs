@@ -112,6 +112,9 @@ pub enum Error {
     /// Naga validation failed.
     #[error("shader validation failed: {0}")]
     Validation(String),
+    /// Pipeline-overridable constants could not be resolved for the selected entry point.
+    #[error("pipeline constants failed: {0}")]
+    PipelineConstants(String),
     /// The requested entry point and stage do not exist together.
     #[error("{stage:?} entry point '{entry_point}' does not exist")]
     MissingEntryPoint {
@@ -174,17 +177,26 @@ impl Compiler {
     ///
     /// Returns an entry-point, backend, or DKSH packaging error.
     pub fn compile_module(self, request: &ModuleRequest<'_>) -> Result<Artifact, Error> {
-        let entry = lower::entry_point(request.module, request.stage, request.entry_point)
-            .ok_or_else(|| Error::MissingEntryPoint {
-                stage: request.stage,
-                entry_point: request.entry_point.to_owned(),
+        let constants = request
+            .constants
+            .iter()
+            .map(|(name, value)| (name.clone(), *value))
+            .collect::<naga::back::PipelineConstants>();
+        let (module, info) = naga::back::pipeline_constants::process_overrides(
+            request.module,
+            request.info,
+            Some((request.stage, request.entry_point)),
+            &constants,
+        )
+        .map_err(|error| Error::PipelineConstants(error.to_string()))?;
+        let entry =
+            lower::entry_point(&module, request.stage, request.entry_point).ok_or_else(|| {
+                Error::MissingEntryPoint {
+                    stage: request.stage,
+                    entry_point: request.entry_point.to_owned(),
+                }
             })?;
-        let _ = request.info;
-        if !request.module.overrides.is_empty() || !request.constants.is_empty() {
-            return Err(Error::UnsupportedFeature(
-                "pipeline-overridable constants".to_owned(),
-            ));
-        }
+        let _ = info;
         if request.options.multiview_mask.is_some() {
             return Err(Error::UnsupportedFeature("multiview".to_owned()));
         }
@@ -193,7 +205,7 @@ impl Compiler {
         }
 
         let sm = deko_nak::ir::ShaderModelInfo::new(53, 64);
-        let shader = lower::lower_entry_point(request.module, entry, &sm)?;
+        let shader = lower::lower_entry_point(&module, entry, &sm)?;
         let binary = deko_nak::compile_ir(shader, None)?;
 
         let (program_type, entrypoint, payload, code) = match request.stage {
@@ -534,19 +546,22 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_pipeline_options_fail_instead_of_changing_semantics() {
-        let mut constants = PipelineConstants::new();
-        constants.insert("scale".to_owned(), 2.0);
-        let override_error = Compiler
-            .compile_wgsl(
-                "override scale: f32 = 1.0; @compute @workgroup_size(1) fn main() {}",
-                Stage::Compute,
-                "main",
-                &constants,
-                Options::default(),
-            )
-            .unwrap_err();
-        assert!(matches!(override_error, Error::UnsupportedFeature(_)));
+    fn pipeline_overrides_are_resolved_and_multiview_fails_explicitly() {
+        let source = "override scale: f32 = 1.0; @fragment fn main() -> @location(0) vec4<f32> { return vec4<f32>(scale, 0.0, 0.0, 1.0); }";
+        let compile = |scale| {
+            let mut constants = PipelineConstants::new();
+            constants.insert("scale".to_owned(), scale);
+            Compiler
+                .compile_wgsl(
+                    source,
+                    Stage::Fragment,
+                    "main",
+                    &constants,
+                    Options::default(),
+                )
+                .unwrap()
+        };
+        assert_ne!(compile(0.25), compile(0.75));
 
         let multiview_error = Compiler
             .compile_wgsl(

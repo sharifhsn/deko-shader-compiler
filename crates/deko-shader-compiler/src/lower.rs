@@ -110,6 +110,9 @@ impl<'function> FunctionLowerer<'function> {
                 components: vec![literal_source(*literal)?],
                 kind: literal_kind(*literal)?,
             },
+            naga::Expression::Constant(constant) => {
+                global_value(self.module, self.module.constants[*constant].init)?
+            }
             naga::Expression::ZeroValue(ty) => zero_value(self.module, *ty)?,
             naga::Expression::Compose { components, .. } => {
                 let mut flattened = Vec::new();
@@ -431,6 +434,44 @@ fn zero_value(module: &naga::Module, ty: naga::Handle<naga::Type>) -> Result<Val
         components: vec![source; usize::from(components)],
         kind,
     })
+}
+
+fn global_value(
+    module: &naga::Module,
+    handle: naga::Handle<naga::Expression>,
+) -> Result<Value, Error> {
+    match &module.global_expressions[handle] {
+        naga::Expression::Literal(literal) => Ok(Value {
+            components: vec![literal_source(*literal)?],
+            kind: literal_kind(*literal)?,
+        }),
+        naga::Expression::ZeroValue(ty) => zero_value(module, *ty),
+        naga::Expression::Compose { components, .. } => {
+            let values = components
+                .iter()
+                .map(|component| global_value(module, *component))
+                .collect::<Result<Vec<_>, _>>()?;
+            let kind = values
+                .first()
+                .ok_or_else(|| Error::UnsupportedFeature("empty constant compose".to_owned()))?
+                .kind;
+            if values.iter().any(|value| value.kind != kind) {
+                return Err(Error::UnsupportedFeature(
+                    "mixed scalar kinds in constant compose".to_owned(),
+                ));
+            }
+            Ok(Value {
+                components: values
+                    .into_iter()
+                    .flat_map(|value| value.components)
+                    .collect(),
+                kind,
+            })
+        }
+        expression => Err(Error::UnsupportedFeature(format!(
+            "constant expression {expression:?}"
+        ))),
+    }
 }
 
 fn type_shape(
