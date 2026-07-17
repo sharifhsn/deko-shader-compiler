@@ -1823,6 +1823,35 @@ mod tests {
     }
 
     #[test]
+    fn subgroup_compute_builtins_compile() {
+        let source = r"
+            @compute @workgroup_size(40, 1, 1)
+            fn main(
+                @builtin(subgroup_invocation_id) lane: u32,
+                @builtin(subgroup_size) size: u32,
+                @builtin(subgroup_id) subgroup: u32,
+                @builtin(num_subgroups) count: u32,
+            ) {
+                _ = lane + size + subgroup + count;
+            }
+        ";
+        let artifact = Compiler
+            .compile_wgsl(
+                source,
+                Stage::Compute,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap();
+        assert!(artifact.dksh.starts_with(b"DKSH"));
+
+        let ir = lowered_ir(source, naga::ShaderStage::Compute, "main");
+        assert!(ir.contains("s2r"), "{ir}");
+        assert!(ir.contains("shr"), "{ir}");
+    }
+
+    #[test]
     fn gradient_lowering_selects_native_and_rewritten_paths() {
         let two_dimensional = lowered_ir(
             r"

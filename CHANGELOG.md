@@ -21,6 +21,8 @@
   introducing a whole-workgroup synchronization point.
 - Lower `subgroupBroadcastFirst` using a Maxwell active-lane ballot, first-set-lane
   selection, and shuffle.
+- Lower subgroup invocation ID, subgroup size, subgroup ID, and subgroup count compute
+  built-ins from GM20B lane state and pipeline-specialized workgroup geometry.
 - Lower array texture layer-count queries, including the Maxwell cube-face count to
   cube-layer conversion used by Mesa NIR.
 - Accept pipeline-specialized compute workgroup-size overrides and preserve their

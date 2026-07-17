@@ -575,6 +575,31 @@ fn read_compute_system_value(lowerer: &mut FunctionLowerer<'_>, indices: &[u8]) 
         .collect()
 }
 
+fn local_invocation_index(lowerer: &mut FunctionLowerer<'_>, workgroup_size: [u32; 3]) -> Src {
+    let local = read_compute_system_value(lowerer, &[32, 33, 34]);
+    let xy = lowerer.target.ssa_alloc.alloc(RegFile::GPR);
+    lowerer.emit(Instr::new(OpIMad {
+        dst: Dst::from(xy),
+        srcs: [
+            local[1].clone(),
+            Src::from(workgroup_size[0]),
+            local[0].clone(),
+        ],
+        signed: false,
+    }));
+    let index = lowerer.target.ssa_alloc.alloc(RegFile::GPR);
+    lowerer.emit(Instr::new(OpIMad {
+        dst: Dst::from(index),
+        srcs: [
+            local[2].clone(),
+            Src::from(workgroup_size[0].saturating_mul(workgroup_size[1])),
+            Src::from(xy),
+        ],
+        signed: false,
+    }));
+    Src::from(index)
+}
+
 fn bind_compute_builtin(
     module: &naga::Module,
     lowerer: &mut FunctionLowerer<'_>,
@@ -621,28 +646,27 @@ fn bind_compute_builtin(
             global
         }
         naga::BuiltIn::LocalInvocationIndex if components == 1 => {
-            let local = read_compute_system_value(lowerer, &[32, 33, 34]);
-            let xy = lowerer.target.ssa_alloc.alloc(RegFile::GPR);
-            lowerer.emit(Instr::new(OpIMad {
-                dst: Dst::from(xy),
-                srcs: [
-                    local[1].clone(),
-                    Src::from(workgroup_size[0]),
-                    local[0].clone(),
-                ],
+            vec![local_invocation_index(lowerer, workgroup_size)]
+        }
+        naga::BuiltIn::SubgroupInvocationId if components == 1 => {
+            read_compute_system_value(lowerer, &[0])
+        }
+        naga::BuiltIn::SubgroupSize if components == 1 => vec![Src::from(32_u32)],
+        naga::BuiltIn::NumSubgroups if components == 1 => {
+            let threads = workgroup_size.into_iter().fold(1_u32, u32::saturating_mul);
+            vec![Src::from(threads.div_ceil(32))]
+        }
+        naga::BuiltIn::SubgroupId if components == 1 => {
+            let local_index = local_invocation_index(lowerer, workgroup_size);
+            let subgroup = lowerer.target.ssa_alloc.alloc(RegFile::GPR);
+            lowerer.emit(Instr::new(OpShr {
+                dst: Dst::from(subgroup),
+                src: local_index,
+                shift: Src::from(5_u32),
                 signed: false,
+                wrap: true,
             }));
-            let index = lowerer.target.ssa_alloc.alloc(RegFile::GPR);
-            lowerer.emit(Instr::new(OpIMad {
-                dst: Dst::from(index),
-                srcs: [
-                    local[2].clone(),
-                    Src::from(workgroup_size[0].saturating_mul(workgroup_size[1])),
-                    Src::from(xy),
-                ],
-                signed: false,
-            }));
-            vec![Src::from(index)]
+            vec![Src::from(subgroup)]
         }
         _ => {
             return Err(Error::UnsupportedFeature(format!(

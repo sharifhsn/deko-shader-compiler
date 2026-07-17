@@ -32,12 +32,13 @@ fuzz_target!(|bytes: &[u8]| {
             4 => "@group(0) @binding(0) var image: texture_cube_array<f32>; @fragment fn main() -> @location(0) vec4<f32> { return vec4<f32>(f32(textureNumLayers(image))); }".to_owned(),
             _ => "@fragment fn main(@builtin(view_index) view: u32) -> @location(0) vec4<f32> { return vec4<f32>(f32(view)); }".to_owned(),
         },
-        Stage::Compute if bytes[2] % 3 == 0 => format!(
+        Stage::Compute if bytes[2] % 4 == 0 => format!(
             "@compute @workgroup_size(1) fn main(@builtin(global_invocation_id) id: vec3<u32>) {{ let left = id.x ^ {left}u; let right = id.x ^ {right}u; let value = left {operation} right; _ = value; }}"
         ),
-        Stage::Compute if bytes[2] % 3 == 1 =>
+        Stage::Compute if bytes[2] % 4 == 1 =>
             "@compute @workgroup_size(32) fn main() { subgroupBarrier(); }".to_owned(),
-        Stage::Compute => "@compute @workgroup_size(32) fn main(@builtin(local_invocation_index) lane: u32) { _ = subgroupBroadcastFirst(lane); }".to_owned(),
+        Stage::Compute if bytes[2] % 4 == 2 => "@compute @workgroup_size(32) fn main(@builtin(local_invocation_index) lane: u32) { _ = subgroupBroadcastFirst(lane); }".to_owned(),
+        Stage::Compute => "@compute @workgroup_size(40) fn main(@builtin(subgroup_invocation_id) lane: u32, @builtin(subgroup_size) size: u32, @builtin(subgroup_id) subgroup: u32, @builtin(num_subgroups) count: u32) { _ = lane + size + subgroup + count; }".to_owned(),
     };
     Compiler
         .compile_wgsl(
