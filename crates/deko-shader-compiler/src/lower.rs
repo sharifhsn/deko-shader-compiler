@@ -1584,23 +1584,33 @@ impl<'function> FunctionLowerer<'function> {
             *self.resources.samplers.get(&sampler).ok_or_else(|| {
                 Error::UnsupportedFeature("sampler has no Deko target".to_owned())
             })?;
-        let image_target = self.resource_array_target(image_range, image_binding_index)?;
-        let sampler_target = self.resource_array_target(sampler_range, sampler_binding_index)?;
-        let sampler_bits = self.binary(
-            naga::BinaryOperator::ShiftLeft,
-            &sampler_target,
-            &Value {
-                components: vec![Src::from(20_u32)],
+        let handle = if image_binding_index.is_none() && sampler_binding_index.is_none() {
+            Value {
+                components: vec![Src::from(
+                    u32::from(image_range.target) | (u32::from(sampler_range.target) << 20),
+                )],
                 kind: naga::ScalarKind::Uint,
-            },
-            None,
-        )?;
-        let handle = self.binary(
-            naga::BinaryOperator::InclusiveOr,
-            &image_target,
-            &sampler_bits,
-            None,
-        )?;
+            }
+        } else {
+            let image_target = self.resource_array_target(image_range, image_binding_index)?;
+            let sampler_target =
+                self.resource_array_target(sampler_range, sampler_binding_index)?;
+            let sampler_bits = self.binary(
+                naga::BinaryOperator::ShiftLeft,
+                &sampler_target,
+                &Value {
+                    components: vec![Src::from(20_u32)],
+                    kind: naga::ScalarKind::Uint,
+                },
+                None,
+            )?;
+            self.binary(
+                naga::BinaryOperator::InclusiveOr,
+                &image_target,
+                &sampler_bits,
+                None,
+            )?
+        };
         let texture_reference = TexRef::Bindless;
         let bindless_handle = Some(Src::from(self.materialize(handle)?));
         let (dim, kind) = match module_image_type(self.module, image)? {
