@@ -1045,6 +1045,73 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_texture_and_sampler_binding_arrays_compile_bindlessly() {
+        let source = r"
+            @group(0) @binding(0) var samplers: binding_array<sampler>;
+            @group(0) @binding(1) var images: binding_array<texture_2d<f32>>;
+
+            @fragment
+            fn main(@location(0) uv: vec2<f32>, @location(1) index: u32) -> @location(0) vec4<f32> {
+                return textureSample(images[index], samplers[index + 1u], uv);
+            }
+        ";
+        let artifact = Compiler
+            .compile_wgsl(
+                source,
+                Stage::Fragment,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            artifact.bindings,
+            vec![
+                deko_dksh::Binding {
+                    group: 0,
+                    binding: 1,
+                    target: 0,
+                    kind: deko_dksh::BindingKind::Texture,
+                },
+                deko_dksh::Binding {
+                    group: 0,
+                    binding: 0,
+                    target: 0,
+                    kind: deko_dksh::BindingKind::Sampler,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn cross_determinant_integer_clamp_and_signed_negate_compile() {
+        let source = r"
+            const OFFSETS: vec3<u32> = vec3<u32>(4u);
+
+            @vertex
+            fn main(@location(0) position: vec3<f32>, @location(1) value: i32) -> @builtin(position) vec4<f32> {
+                let basis = mat3x3<f32>(
+                    vec3<f32>(1.0, 2.0, 3.0),
+                    vec3<f32>(0.0, 1.0, 4.0),
+                    vec3<f32>(5.0, 6.0, 0.0),
+                );
+                let normal = cross(position, basis[0]);
+                let bounded = clamp(-value, -8, 8);
+                return vec4<f32>(normal * determinant(basis), f32(bounded + i32(OFFSETS.x)));
+            }
+        ";
+        Compiler
+            .compile_wgsl(
+                source,
+                Stage::Vertex,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap();
+    }
+
+    #[test]
     fn bevy_mip_compute_primitives_compile_together() {
         let source = r"
             @group(0) @binding(0)

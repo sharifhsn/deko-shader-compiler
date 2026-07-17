@@ -28,7 +28,8 @@ struct ResourceMap {
     storage_descriptor_base: u16,
     workgroups: HashMap<naga::Handle<naga::GlobalVariable>, u32>,
     workgroup_memory_size: u32,
-    textures: HashMap<naga::Handle<naga::GlobalVariable>, u16>,
+    textures: HashMap<naga::Handle<naga::GlobalVariable>, ResourceRange>,
+    samplers: HashMap<naga::Handle<naga::GlobalVariable>, ResourceRange>,
     texture_sampler_pairs: HashMap<
         (
             naga::Handle<naga::GlobalVariable>,
@@ -38,6 +39,12 @@ struct ResourceMap {
     >,
     storage_textures: HashMap<naga::Handle<naga::GlobalVariable>, u16>,
     bindings: Vec<deko_dksh::Binding>,
+}
+
+#[derive(Clone, Copy)]
+struct ResourceRange {
+    target: u16,
+    count: u16,
 }
 
 type SampledPair = (
@@ -185,19 +192,41 @@ fn resource_map(module: &naga::Module, entry: &naga::EntryPoint) -> Result<Resou
         .global_variables
         .iter()
         .filter_map(|(handle, variable)| {
-            (used_globals.contains(&handle)
-                && matches!(
-                    module.types[variable.ty].inner,
-                    naga::TypeInner::Image {
-                        class: naga::ImageClass::Sampled { .. } | naga::ImageClass::Depth { .. },
-                        ..
-                    }
-                ))
-            .then_some((handle, variable.binding.as_ref()))
+            (used_globals.contains(&handle) && sampled_image_count(module, handle).is_some())
+                .then_some((handle, variable.binding.as_ref()))
         })
         .collect::<Vec<_>>();
     textures.sort_by_key(|(_, binding)| binding.map(|binding| (binding.group, binding.binding)));
-    let mut texture_targets = HashMap::<(u32, u32), u16>::new();
+    let mut texture_targets = HashMap::<(u32, u32), ResourceRange>::new();
+    let mut sampler_targets = HashMap::<(u32, u32), ResourceRange>::new();
+    let mut next_image_target = 0_u16;
+    let mut next_sampler_target = 0_u16;
+    for &(handle, binding) in &textures {
+        let count = sampled_image_count(module, handle).expect("filtered above");
+        if count == 1 {
+            continue;
+        }
+        let binding = binding.ok_or_else(|| {
+            Error::UnsupportedFeature("texture binding array without a binding".to_owned())
+        })?;
+        let key = (binding.group, binding.binding);
+        let (range, first_alias) = if let Some(range) = texture_targets.get(&key) {
+            (*range, false)
+        } else {
+            let range = allocate_resource_range(&mut next_image_target, count, "sampled textures")?;
+            texture_targets.insert(key, range);
+            (range, true)
+        };
+        resources.textures.insert(handle, range);
+        if first_alias {
+            resources.bindings.push(deko_dksh::Binding {
+                group: binding.group,
+                binding: binding.binding,
+                target: u32::from(range.target),
+                kind: deko_dksh::BindingKind::Texture,
+            });
+        }
+    }
     let mut pair_targets = HashMap::<(u32, u32, u32, u32), u16>::new();
     let mut pairs = sampled_pairs(module, &entry.function, &reachable_functions)?;
     pairs.sort_by_key(|(image, sampler)| {
@@ -227,26 +256,85 @@ fn resource_map(module: &naga::Module, entry: &naga::EntryPoint) -> Result<Resou
             sampler_binding.group,
             sampler_binding.binding,
         );
-        let next_target = u16::try_from(pair_targets.len())
-            .map_err(|_| Error::UnsupportedFeature("too many sampled texture pairs".to_owned()))?;
-        if next_target >= 64 {
-            return Err(Error::UnsupportedFeature(
-                "more than 64 sampled texture pairs".to_owned(),
-            ));
+        let image_count = sampled_image_count(module, image).ok_or_else(|| {
+            Error::UnsupportedFeature(format!(
+                "sampled binding is not a texture: {:?}",
+                module.types[module.global_variables[image].ty].inner
+            ))
+        })?;
+        let sampler_count = sampler_binding_count(module, sampler).ok_or_else(|| {
+            Error::UnsupportedFeature("sampled binding is not a sampler".to_owned())
+        })?;
+        if image_count > 1 || sampler_count > 1 {
+            if let std::collections::hash_map::Entry::Vacant(entry) =
+                resources.textures.entry(image)
+            {
+                let key = (image_binding.group, image_binding.binding);
+                let (range, first_alias) = if let Some(range) = texture_targets.get(&key) {
+                    (*range, false)
+                } else {
+                    let range = allocate_resource_range(
+                        &mut next_image_target,
+                        image_count,
+                        "sampled textures",
+                    )?;
+                    texture_targets.insert(key, range);
+                    (range, true)
+                };
+                entry.insert(range);
+                if first_alias {
+                    resources.bindings.push(deko_dksh::Binding {
+                        group: image_binding.group,
+                        binding: image_binding.binding,
+                        target: u32::from(range.target),
+                        kind: deko_dksh::BindingKind::Texture,
+                    });
+                }
+            }
+            let sampler_key = (sampler_binding.group, sampler_binding.binding);
+            let (range, first_alias) = if let Some(range) = sampler_targets.get(&sampler_key) {
+                (*range, false)
+            } else {
+                let range =
+                    allocate_resource_range(&mut next_sampler_target, sampler_count, "samplers")?;
+                sampler_targets.insert(sampler_key, range);
+                (range, true)
+            };
+            resources.samplers.insert(sampler, range);
+            if first_alias {
+                resources.bindings.push(deko_dksh::Binding {
+                    group: sampler_binding.group,
+                    binding: sampler_binding.binding,
+                    target: u32::from(range.target),
+                    kind: deko_dksh::BindingKind::Sampler,
+                });
+            }
+            continue;
         }
+        let next_target = next_image_target.max(next_sampler_target);
         let (target, first_alias) = if let Some(target) = pair_targets.get(&pair_key) {
             (*target, false)
         } else {
+            if next_target >= 64 {
+                return Err(Error::UnsupportedFeature(
+                    "more than 64 sampled texture pairs".to_owned(),
+                ));
+            }
             pair_targets.insert(pair_key, next_target);
+            next_image_target = next_target + 1;
+            next_sampler_target = next_target + 1;
             (next_target, true)
         };
         resources
             .texture_sampler_pairs
             .insert((image, sampler), target);
-        resources.textures.entry(image).or_insert(target);
+        resources
+            .textures
+            .entry(image)
+            .or_insert(ResourceRange { target, count: 1 });
         texture_targets
             .entry((image_binding.group, image_binding.binding))
-            .or_insert(target);
+            .or_insert(ResourceRange { target, count: 1 });
         if first_alias {
             resources.bindings.extend([
                 deko_dksh::Binding {
@@ -269,28 +357,20 @@ fn resource_map(module: &naga::Module, entry: &naga::EntryPoint) -> Result<Resou
             Error::UnsupportedFeature("texture global without a resource binding".to_owned())
         })?;
         let key = (binding.group, binding.binding);
-        let next_target = texture_targets
-            .values()
-            .copied()
-            .max()
-            .map_or(0, |target| target.saturating_add(1));
-        let (target, first_alias) = if let Some(target) = texture_targets.get(&key) {
-            (*target, false)
+        let count = sampled_image_count(module, handle).expect("filtered above");
+        let (range, first_alias) = if let Some(range) = texture_targets.get(&key) {
+            (*range, false)
         } else {
-            if next_target >= 64 {
-                return Err(Error::UnsupportedFeature(
-                    "more than 64 sampled textures".to_owned(),
-                ));
-            }
-            texture_targets.insert(key, next_target);
-            (next_target, true)
+            let range = allocate_resource_range(&mut next_image_target, count, "sampled textures")?;
+            texture_targets.insert(key, range);
+            (range, true)
         };
-        resources.textures.insert(handle, target);
+        resources.textures.insert(handle, range);
         if first_alias {
             resources.bindings.push(deko_dksh::Binding {
                 group: binding.group,
                 binding: binding.binding,
-                target: u32::from(target),
+                target: u32::from(range.target),
                 kind: deko_dksh::BindingKind::Texture,
             });
         }
@@ -338,6 +418,72 @@ fn resource_map(module: &naga::Module, entry: &naga::EntryPoint) -> Result<Resou
     Ok(resources)
 }
 
+fn binding_resource_type(
+    module: &naga::Module,
+    global: naga::Handle<naga::GlobalVariable>,
+) -> Result<(naga::Handle<naga::Type>, u16), Error> {
+    let ty = module.global_variables[global].ty;
+    let naga::TypeInner::BindingArray { base, size } = module.types[ty].inner else {
+        return Ok((ty, 1));
+    };
+    let count = match size {
+        naga::ArraySize::Constant(size) => u16::try_from(size.get()).map_err(|_| {
+            Error::UnsupportedFeature("resource binding array exceeds u16".to_owned())
+        })?,
+        naga::ArraySize::Dynamic => 64,
+        naga::ArraySize::Pending(_) => {
+            return Err(Error::UnsupportedFeature(
+                "unresolved resource binding-array size".to_owned(),
+            ));
+        }
+    };
+    Ok((base, count))
+}
+
+fn sampled_image_count(
+    module: &naga::Module,
+    global: naga::Handle<naga::GlobalVariable>,
+) -> Option<u16> {
+    let (ty, count) = binding_resource_type(module, global).ok()?;
+    matches!(
+        module.types[ty].inner,
+        naga::TypeInner::Image {
+            class: naga::ImageClass::Sampled { .. } | naga::ImageClass::Depth { .. },
+            ..
+        }
+    )
+    .then_some(count)
+}
+
+fn sampler_binding_count(
+    module: &naga::Module,
+    global: naga::Handle<naga::GlobalVariable>,
+) -> Option<u16> {
+    let (ty, count) = binding_resource_type(module, global).ok()?;
+    matches!(module.types[ty].inner, naga::TypeInner::Sampler { .. }).then_some(count)
+}
+
+fn allocate_resource_range(
+    next: &mut u16,
+    count: u16,
+    description: &str,
+) -> Result<ResourceRange, Error> {
+    let end = next
+        .checked_add(count)
+        .ok_or_else(|| Error::UnsupportedFeature(format!("too many {description}")))?;
+    if end > 64 {
+        return Err(Error::UnsupportedFeature(format!(
+            "more than 64 {description}"
+        )));
+    }
+    let range = ResourceRange {
+        target: *next,
+        count,
+    };
+    *next = end;
+    Ok(range)
+}
+
 fn sampled_pairs(
     module: &naga::Module,
     entry: &naga::Function,
@@ -349,16 +495,12 @@ fn sampled_pairs(
             let naga::Expression::ImageSample { image, sampler, .. } = expression else {
                 continue;
             };
-            let naga::Expression::GlobalVariable(image) = function.expressions[*image] else {
-                return Err(Error::UnsupportedFeature(
-                    "sampled texture is not a global resource".to_owned(),
-                ));
-            };
-            let naga::Expression::GlobalVariable(sampler) = function.expressions[*sampler] else {
-                return Err(Error::UnsupportedFeature(
-                    "sampler is not a global resource".to_owned(),
-                ));
-            };
+            let image = expression_resource_global(function, *image).ok_or_else(|| {
+                Error::UnsupportedFeature("sampled texture is not a global resource".to_owned())
+            })?;
+            let sampler = expression_resource_global(function, *sampler).ok_or_else(|| {
+                Error::UnsupportedFeature("sampler is not a global resource".to_owned())
+            })?;
             pairs.push((image, sampler));
         }
         Ok(())
@@ -368,6 +510,19 @@ fn sampled_pairs(
         collect(&module.functions[*function])?;
     }
     Ok(pairs)
+}
+
+fn expression_resource_global(
+    function: &naga::Function,
+    expression: naga::Handle<naga::Expression>,
+) -> Option<naga::Handle<naga::GlobalVariable>> {
+    match function.expressions[expression] {
+        naga::Expression::GlobalVariable(global) => Some(global),
+        naga::Expression::Access { base, .. } | naga::Expression::AccessIndex { base, .. } => {
+            expression_resource_global(function, base)
+        }
+        _ => None,
+    }
 }
 
 fn reachable_functions(
@@ -1011,9 +1166,14 @@ impl<'function> FunctionLowerer<'function> {
         query: naga::ImageQuery,
     ) -> Result<Value, Error> {
         let image = self.global_expression(image, "texture query")?;
-        let target = *self.resources.textures.get(&image).ok_or_else(|| {
-            Error::UnsupportedFeature("queried texture has no Deko target".to_owned())
-        })?;
+        let target = self
+            .resources
+            .textures
+            .get(&image)
+            .ok_or_else(|| {
+                Error::UnsupportedFeature("queried texture has no Deko target".to_owned())
+            })?
+            .target;
         let (dimension, _, _) = module_image_type(self.module, image)?;
         let (level, components) = match query {
             naga::ImageQuery::Size { level } => {
@@ -1269,9 +1429,14 @@ impl<'function> FunctionLowerer<'function> {
                 level,
             );
         }
-        let target = *self.resources.textures.get(&image).ok_or_else(|| {
-            Error::UnsupportedFeature("loaded texture has no Deko target".to_owned())
-        })?;
+        let target = self
+            .resources
+            .textures
+            .get(&image)
+            .ok_or_else(|| {
+                Error::UnsupportedFeature("loaded texture has no Deko target".to_owned())
+            })?
+            .target;
         let (kind, output_components, multisampled) = match class {
             naga::ImageClass::Sampled { kind, multi } => (kind, 4, multi),
             naga::ImageClass::Depth { multi } => (naga::ScalarKind::Float, 1, multi),
@@ -1487,15 +1652,45 @@ impl<'function> FunctionLowerer<'function> {
                 depth_ref.is_some()
             )));
         }
-        let image = self.global_expression(image, "texture")?;
-        let sampler = self.global_expression(sampler, "sampler")?;
-        let target = *self
-            .resources
-            .texture_sampler_pairs
-            .get(&(image, sampler))
-            .ok_or_else(|| {
-                Error::UnsupportedFeature("sampled pair has no Deko target".to_owned())
-            })?;
+        let (image, image_binding_index) = self.sampled_resource(image, "texture")?;
+        let (sampler, sampler_binding_index) = self.sampled_resource(sampler, "sampler")?;
+        let (texture_reference, bindless_handle) =
+            if image_binding_index.is_some() || sampler_binding_index.is_some() {
+                let image_range = *self.resources.textures.get(&image).ok_or_else(|| {
+                    Error::UnsupportedFeature("sampled image array has no Deko target".to_owned())
+                })?;
+                let sampler_range = *self.resources.samplers.get(&sampler).ok_or_else(|| {
+                    Error::UnsupportedFeature("sampler array has no Deko target".to_owned())
+                })?;
+                let image_target = self.resource_array_target(image_range, image_binding_index)?;
+                let sampler_target =
+                    self.resource_array_target(sampler_range, sampler_binding_index)?;
+                let sampler_bits = self.binary(
+                    naga::BinaryOperator::ShiftLeft,
+                    &sampler_target,
+                    &Value {
+                        components: vec![Src::from(20_u32)],
+                        kind: naga::ScalarKind::Uint,
+                    },
+                    None,
+                )?;
+                let handle = self.binary(
+                    naga::BinaryOperator::InclusiveOr,
+                    &image_target,
+                    &sampler_bits,
+                    None,
+                )?;
+                (TexRef::Bindless, Some(Src::from(self.materialize(handle)?)))
+            } else {
+                let target = *self
+                    .resources
+                    .texture_sampler_pairs
+                    .get(&(image, sampler))
+                    .ok_or_else(|| {
+                        Error::UnsupportedFeature("sampled pair has no Deko target".to_owned())
+                    })?;
+                (TexRef::Bound(target), None)
+            };
         let (dim, kind) = match module_image_type(self.module, image)? {
             (naga::ImageDimension::D1, false, kind) => (TexDim::_1D, kind),
             (naga::ImageDimension::D1, true, kind) => (TexDim::Array1D, kind),
@@ -1583,8 +1778,8 @@ impl<'function> FunctionLowerer<'function> {
         self.emit(Instr::new(OpTex {
             dsts: [Dst::from(dst.clone()), Dst::None],
             fault: Dst::None,
-            tex: TexRef::Bound(target),
-            srcs: [Src::from(coordinate), Src::ZERO],
+            tex: texture_reference,
+            srcs: [Src::from(coordinate), bindless_handle.unwrap_or(Src::ZERO)],
             dim,
             lod_mode,
             deriv_mode: TexDerivMode::Auto,
@@ -1614,6 +1809,79 @@ impl<'function> FunctionLowerer<'function> {
         }
     }
 
+    fn sampled_resource(
+        &mut self,
+        handle: naga::Handle<naga::Expression>,
+        description: &str,
+    ) -> Result<(naga::Handle<naga::GlobalVariable>, Option<Value>), Error> {
+        match self.source.expressions[handle] {
+            naga::Expression::GlobalVariable(global) => Ok((global, None)),
+            naga::Expression::Access { base, index } => {
+                let (global, previous) = self.sampled_resource(base, description)?;
+                if previous.is_some() {
+                    return Err(Error::UnsupportedFeature(format!(
+                        "nested {description} binding-array access"
+                    )));
+                }
+                let index = self.expression(index)?;
+                if index.components.len() != 1
+                    || !matches!(index.kind, naga::ScalarKind::Uint | naga::ScalarKind::Sint)
+                {
+                    return Err(Error::UnsupportedFeature(format!(
+                        "{description} binding-array index is not an integer scalar"
+                    )));
+                }
+                Ok((global, Some(index)))
+            }
+            naga::Expression::AccessIndex { base, index } => {
+                let (global, previous) = self.sampled_resource(base, description)?;
+                if previous.is_some() {
+                    return Err(Error::UnsupportedFeature(format!(
+                        "nested {description} binding-array access"
+                    )));
+                }
+                Ok((
+                    global,
+                    Some(Value {
+                        components: vec![Src::from(index)],
+                        kind: naga::ScalarKind::Uint,
+                    }),
+                ))
+            }
+            ref expression => Err(Error::UnsupportedFeature(format!(
+                "{description} expression {expression:?}"
+            ))),
+        }
+    }
+
+    fn resource_array_target(
+        &mut self,
+        range: ResourceRange,
+        index: Option<Value>,
+    ) -> Result<Value, Error> {
+        let Some(mut index) = index else {
+            return Ok(Value {
+                components: vec![Src::from(u32::from(range.target))],
+                kind: naga::ScalarKind::Uint,
+            });
+        };
+        index.kind = naga::ScalarKind::Uint;
+        let maximum = Value {
+            components: vec![Src::from(u32::from(range.count - 1))],
+            kind: naga::ScalarKind::Uint,
+        };
+        let index = self.integer_minmax(&index, &maximum, true)?;
+        self.binary(
+            naga::BinaryOperator::Add,
+            &index,
+            &Value {
+                components: vec![Src::from(u32::from(range.target))],
+                kind: naga::ScalarKind::Uint,
+            },
+            None,
+        )
+    }
+
     #[allow(clippy::too_many_lines)]
     fn math(
         &mut self,
@@ -1630,6 +1898,21 @@ impl<'function> FunctionLowerer<'function> {
                 components: value.components.into_iter().map(Src::fabs).collect(),
                 kind: value.kind,
             }),
+            naga::MathFunction::Abs if value.kind == naga::ScalarKind::Sint => {
+                let components = value
+                    .components
+                    .into_iter()
+                    .map(|component| {
+                        let sign =
+                            self.emit_shift_right(component.clone(), Src::from(31_u32), true);
+                        self.emit_abs_source(component, sign)
+                    })
+                    .collect();
+                Ok(Value {
+                    components,
+                    kind: value.kind,
+                })
+            }
             naga::MathFunction::Sign if value.kind == naga::ScalarKind::Float => {
                 let width = value.components.len();
                 let zero = Value {
@@ -1660,8 +1943,13 @@ impl<'function> FunctionLowerer<'function> {
             naga::MathFunction::Clamp => {
                 let low = self.math_argument(fun, arg1, 1)?;
                 let high = self.math_argument(fun, arg2, 2)?;
-                let value = self.float_minmax(&value, &low, false)?;
-                self.float_minmax(&value, &high, true)
+                if value.kind == naga::ScalarKind::Float {
+                    let value = self.float_minmax(&value, &low, false)?;
+                    self.float_minmax(&value, &high, true)
+                } else {
+                    let value = self.integer_minmax(&value, &low, false)?;
+                    self.integer_minmax(&value, &high, true)
+                }
             }
             naga::MathFunction::Mix => {
                 let other = self.math_argument(fun, arg1, 1)?;
@@ -1691,6 +1979,21 @@ impl<'function> FunctionLowerer<'function> {
             naga::MathFunction::Dot => {
                 let other = self.math_argument(fun, arg1, 1)?;
                 self.float_dot(&value, &other)
+            }
+            naga::MathFunction::Cross => {
+                let other = self.math_argument(fun, arg1, 1)?;
+                self.float_cross(&value, &other)
+            }
+            naga::MathFunction::Determinant => {
+                let (columns, rows) = matrix_shape.ok_or_else(|| {
+                    Error::UnsupportedFeature("determinant of a non-matrix value".to_owned())
+                })?;
+                if columns != rows {
+                    return Err(Error::UnsupportedFeature(
+                        "determinant of a non-square matrix".to_owned(),
+                    ));
+                }
+                self.float_determinant(&value, columns)
             }
             naga::MathFunction::Floor => self.float_round(value, FRndMode::NegInf),
             naga::MathFunction::Fract => {
@@ -2266,6 +2569,117 @@ impl<'function> FunctionLowerer<'function> {
         })
     }
 
+    fn float_cross(&mut self, left: &Value, right: &Value) -> Result<Value, Error> {
+        if left.kind != naga::ScalarKind::Float
+            || right.kind != naga::ScalarKind::Float
+            || left.components.len() != 3
+            || right.components.len() != 3
+        {
+            return Err(Error::UnsupportedFeature(
+                "cross operands must be three-component float vectors".to_owned(),
+            ));
+        }
+        let product = |left: Src, right: Src| Value {
+            components: vec![left, right],
+            kind: naga::ScalarKind::Float,
+        };
+        let pairs = [(1, 2, 2, 1), (2, 0, 0, 2), (0, 1, 1, 0)];
+        let mut components = Vec::with_capacity(3);
+        for (left_a, right_a, left_b, right_b) in pairs {
+            let a = product(
+                left.components[left_a].clone(),
+                right.components[right_a].clone(),
+            );
+            let a = self.binary_component(
+                naga::BinaryOperator::Multiply,
+                naga::ScalarKind::Float,
+                a.components[0].clone(),
+                a.components[1].clone(),
+            )?;
+            self.emit(a.0);
+            let b = product(
+                left.components[left_b].clone(),
+                right.components[right_b].clone(),
+            );
+            let b = self.binary_component(
+                naga::BinaryOperator::Multiply,
+                naga::ScalarKind::Float,
+                b.components[0].clone(),
+                b.components[1].clone(),
+            )?;
+            self.emit(b.0);
+            let difference = self.binary_component(
+                naga::BinaryOperator::Subtract,
+                naga::ScalarKind::Float,
+                a.1,
+                b.1,
+            )?;
+            self.emit(difference.0);
+            components.push(difference.1);
+        }
+        Ok(Value {
+            components,
+            kind: naga::ScalarKind::Float,
+        })
+    }
+
+    fn float_determinant(&mut self, matrix: &Value, size: usize) -> Result<Value, Error> {
+        if matrix.kind != naga::ScalarKind::Float
+            || !(2..=4).contains(&size)
+            || matrix.components.len() != size * size
+        {
+            return Err(Error::UnsupportedFeature(
+                "determinant operand must be a square float matrix".to_owned(),
+            ));
+        }
+        self.float_determinant_components(&matrix.components, size)
+    }
+
+    fn float_determinant_components(
+        &mut self,
+        components: &[Src],
+        size: usize,
+    ) -> Result<Value, Error> {
+        if size == 1 {
+            return Ok(Value {
+                components: vec![components[0].clone()],
+                kind: naga::ScalarKind::Float,
+            });
+        }
+        let mut result = None;
+        for column in 0..size {
+            let mut minor = Vec::with_capacity((size - 1) * (size - 1));
+            for minor_column in 0..size {
+                if minor_column == column {
+                    continue;
+                }
+                for row in 1..size {
+                    minor.push(components[minor_column * size + row].clone());
+                }
+            }
+            let minor = self.float_determinant_components(&minor, size - 1)?;
+            let coefficient = Value {
+                components: vec![components[column * size].clone()],
+                kind: naga::ScalarKind::Float,
+            };
+            let term = self.binary(naga::BinaryOperator::Multiply, &coefficient, &minor, None)?;
+            result = Some(match result {
+                None => term,
+                Some(accumulator) => self.binary(
+                    if column % 2 == 0 {
+                        naga::BinaryOperator::Add
+                    } else {
+                        naga::BinaryOperator::Subtract
+                    },
+                    &accumulator,
+                    &term,
+                    None,
+                )?,
+            });
+        }
+        Ok(result.expect("matrix size is nonzero"))
+    }
+
     fn float_round(&mut self, value: Value, rnd_mode: FRndMode) -> Result<Value, Error> {
         if value.kind != naga::ScalarKind::Float {
             return Err(Error::UnsupportedFeature(
@@ -2361,6 +2775,9 @@ impl<'function> FunctionLowerer<'function> {
     ) -> Option<naga::Handle<naga::Type>> {
         match self.source.expressions[handle] {
             naga::Expression::Compose { ty, .. } | naga::Expression::ZeroValue(ty) => Some(ty),
+            naga::Expression::GlobalVariable(global) => {
+                Some(self.module.global_variables[global].ty)
+            }
             naga::Expression::FunctionArgument(index) => self
                 .source
                 .arguments
@@ -2376,7 +2793,8 @@ impl<'function> FunctionLowerer<'function> {
                     naga::TypeInner::Struct { ref members, .. } => {
                         members.get(index as usize).map(|member| member.ty)
                     }
-                    naga::TypeInner::Array { base, .. } => Some(base),
+                    naga::TypeInner::Array { base, .. }
+                    | naga::TypeInner::BindingArray { base, .. } => Some(base),
                     naga::TypeInner::Matrix { rows, scalar, .. } => {
                         self.vector_type_handle(rows, scalar)
                     }
@@ -2387,7 +2805,8 @@ impl<'function> FunctionLowerer<'function> {
             naga::Expression::Access { base, .. } => {
                 let base = self.expression_type(base)?;
                 match self.module.types[base].inner {
-                    naga::TypeInner::Array { base, .. } => Some(base),
+                    naga::TypeInner::Array { base, .. }
+                    | naga::TypeInner::BindingArray { base, .. } => Some(base),
                     naga::TypeInner::Matrix { rows, scalar, .. } => {
                         self.vector_type_handle(rows, scalar)
                     }
@@ -2404,6 +2823,17 @@ impl<'function> FunctionLowerer<'function> {
             naga::Expression::Load { pointer } => self.pointer_type(pointer),
             _ => None,
         }
+    }
+
+    fn expression_is_resource(&self, handle: naga::Handle<naga::Expression>) -> bool {
+        self.expression_type(handle).is_some_and(|ty| {
+            matches!(
+                self.module.types[ty].inner,
+                naga::TypeInner::Image { .. }
+                    | naga::TypeInner::Sampler { .. }
+                    | naga::TypeInner::BindingArray { .. }
+            )
+        })
     }
 
     fn pointer_type(
@@ -2669,6 +3099,14 @@ impl<'function> FunctionLowerer<'function> {
             for component in &mut value.components {
                 *component = component.clone().fneg();
             }
+            return Ok(value);
+        }
+        if op == naga::UnaryOperator::Negate && value.kind == naga::ScalarKind::Sint {
+            value.components = value
+                .components
+                .into_iter()
+                .map(|component| self.emit_iadd_source(component.ineg(), Src::ZERO))
+                .collect();
             return Ok(value);
         }
         if op == naga::UnaryOperator::LogicalNot && value.kind == naga::ScalarKind::Bool {
@@ -5286,6 +5724,7 @@ impl<'function> FunctionLowerer<'function> {
                 naga::Statement::Emit(range) => {
                     for expression in range.clone() {
                         if self.pointer_type(expression).is_some()
+                            || self.expression_is_resource(expression)
                             || matches!(
                                 self.source.expressions[expression],
                                 naga::Expression::FunctionArgument(index)
@@ -5636,12 +6075,12 @@ fn module_image_type(
     module: &naga::Module,
     global: naga::Handle<naga::GlobalVariable>,
 ) -> Result<(naga::ImageDimension, bool, naga::ScalarKind), Error> {
-    let variable = &module.global_variables[global];
+    let (ty, _) = binding_resource_type(module, global)?;
     let naga::TypeInner::Image {
         dim,
         arrayed,
         class,
-    } = module.types[variable.ty].inner
+    } = module.types[ty].inner
     else {
         return Err(Error::UnsupportedFeature(
             "sampled resource is not an image".to_owned(),
@@ -5766,6 +6205,18 @@ fn global_value(
             kind: literal_kind(*literal)?,
         }),
         naga::Expression::ZeroValue(ty) => zero_value(module, *ty),
+        naga::Expression::Splat { size, value } => {
+            let value = global_value(module, *value)?;
+            if value.components.len() != 1 {
+                return Err(Error::UnsupportedFeature(
+                    "constant splat of a non-scalar value".to_owned(),
+                ));
+            }
+            Ok(Value {
+                components: vec![value.components[0].clone(); vector_size(*size)],
+                kind: value.kind,
+            })
+        }
         naga::Expression::Compose { components, .. } => {
             let values = components
                 .iter()
@@ -6328,9 +6779,7 @@ fn lower_fragment<'sm>(
     sm: &'sm ShaderModelInfo,
     resources: &ResourceMap,
 ) -> Result<Shader<'sm>, Error> {
-    let result = entry.function.result.as_ref().ok_or_else(|| {
-        Error::UnsupportedFeature("fragment entry point without a result".to_owned())
-    })?;
+    let result = entry.function.result.as_ref();
     let mut info = ShaderInfo::fragment(entry.early_depth_test.is_some(), false, false);
     if block_uses_kill(&entry.function.body)
         || module
@@ -6345,49 +6794,58 @@ fn lower_fragment<'sm>(
     }
     let mut lowerer = FunctionLowerer::new(module, &entry.function, resources, Vec::new());
     bind_fragment_arguments(module, &mut lowerer, &mut info)?;
-    let value = lowerer.return_value()?;
     let mut outputs = Vec::new();
     let mut writes_color = 0_u32;
     let mut depth = None;
-    for field in output_fields(module, result)? {
-        if field.range.end > value.components.len() {
-            return Err(Error::UnsupportedFeature(
-                "fragment output shape".to_owned(),
-            ));
+    if let Some(result) = result {
+        let value = lowerer.return_value()?;
+        for field in output_fields(module, result)? {
+            if field.range.end > value.components.len() {
+                return Err(Error::UnsupportedFeature(
+                    "fragment output shape".to_owned(),
+                ));
+            }
+            let field_value = Value {
+                components: value.components[field.range].to_vec(),
+                kind: value.kind,
+            };
+            match field.binding {
+                naga::Binding::Location { location, .. } => {
+                    if location >= 8 || field_value.components.len() > 4 {
+                        return Err(Error::UnsupportedFeature(
+                            "fragment color output shape".to_owned(),
+                        ));
+                    }
+                    let ssa = lowerer.materialize(field_value)?;
+                    let mut target = ssa.iter().copied().map(Src::from).collect::<Vec<_>>();
+                    writes_color |= ((1_u32 << target.len()) - 1) << (location * 4);
+                    target.resize(4, Src::ZERO);
+                    outputs.extend(target);
+                }
+                naga::Binding::BuiltIn(naga::BuiltIn::FragDepth) => {
+                    if field_value.kind != naga::ScalarKind::Float
+                        || field_value.components.len() != 1
+                        || depth.is_some()
+                    {
+                        return Err(Error::UnsupportedFeature(
+                            "fragment depth output shape".to_owned(),
+                        ));
+                    }
+                    depth = Some(Src::from(lowerer.materialize(field_value)?));
+                }
+                binding @ naga::Binding::BuiltIn(_) => {
+                    return Err(Error::UnsupportedFeature(format!(
+                        "fragment result binding {binding:?}"
+                    )));
+                }
+            }
         }
-        let field_value = Value {
-            components: value.components[field.range].to_vec(),
-            kind: value.kind,
-        };
-        match field.binding {
-            naga::Binding::Location { location, .. } => {
-                if location >= 8 || field_value.components.len() > 4 {
-                    return Err(Error::UnsupportedFeature(
-                        "fragment color output shape".to_owned(),
-                    ));
-                }
-                let ssa = lowerer.materialize(field_value)?;
-                let mut target = ssa.iter().copied().map(Src::from).collect::<Vec<_>>();
-                writes_color |= ((1_u32 << target.len()) - 1) << (location * 4);
-                target.resize(4, Src::ZERO);
-                outputs.extend(target);
-            }
-            naga::Binding::BuiltIn(naga::BuiltIn::FragDepth) => {
-                if field_value.kind != naga::ScalarKind::Float
-                    || field_value.components.len() != 1
-                    || depth.is_some()
-                {
-                    return Err(Error::UnsupportedFeature(
-                        "fragment depth output shape".to_owned(),
-                    ));
-                }
-                depth = Some(Src::from(lowerer.materialize(field_value)?));
-            }
-            binding @ naga::Binding::BuiltIn(_) => {
-                return Err(Error::UnsupportedFeature(format!(
-                    "fragment result binding {binding:?}"
-                )));
-            }
+    } else {
+        let body = entry.function.body.clone();
+        if lowerer.execute_statements(&body)?.is_some() {
+            return Err(Error::UnsupportedFeature(
+                "void fragment entry point returned a value".to_owned(),
+            ));
         }
     }
     let writes_depth = depth.is_some();
