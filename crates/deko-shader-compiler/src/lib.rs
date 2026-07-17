@@ -1030,7 +1030,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_cross_group_sampler_emits_one_record_per_native_pair() {
+    fn shared_cross_group_sampler_uses_one_bindless_descriptor() {
         let source = r"
             @group(0) @binding(5) var first: texture_2d<f32>;
             @group(0) @binding(1) var second: texture_2d<f32>;
@@ -1050,7 +1050,7 @@ mod tests {
                 Options::default(),
             )
             .unwrap();
-        assert_eq!(artifact.bindings.len(), 4);
+        assert_eq!(artifact.bindings.len(), 3);
         assert_eq!(
             artifact
                 .bindings
@@ -1058,7 +1058,16 @@ mod tests {
                 .filter(|binding| binding.kind == deko_dksh::BindingKind::Sampler)
                 .map(|binding| (binding.group, binding.binding, binding.target))
                 .collect::<Vec<_>>(),
-            vec![(2, 7, 0), (2, 7, 1)]
+            vec![(2, 7, 0)]
+        );
+        assert_eq!(
+            artifact
+                .bindings
+                .iter()
+                .filter(|binding| binding.kind == deko_dksh::BindingKind::Texture)
+                .map(|binding| (binding.group, binding.binding, binding.target))
+                .collect::<Vec<_>>(),
+            vec![(0, 1, 0), (0, 5, 1)]
         );
     }
 

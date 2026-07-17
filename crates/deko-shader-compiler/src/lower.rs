@@ -30,13 +30,6 @@ struct ResourceMap {
     workgroup_memory_size: u32,
     textures: HashMap<naga::Handle<naga::GlobalVariable>, ResourceRange>,
     samplers: HashMap<naga::Handle<naga::GlobalVariable>, ResourceRange>,
-    texture_sampler_pairs: HashMap<
-        (
-            naga::Handle<naga::GlobalVariable>,
-            naga::Handle<naga::GlobalVariable>,
-        ),
-        u16,
-    >,
     storage_textures: HashMap<naga::Handle<naga::GlobalVariable>, u16>,
     bindings: Vec<deko_dksh::Binding>,
 }
@@ -46,11 +39,6 @@ struct ResourceRange {
     target: u16,
     count: u16,
 }
-
-type SampledPair = (
-    naga::Handle<naga::GlobalVariable>,
-    naga::Handle<naga::GlobalVariable>,
-);
 
 type DynamicLocalPointer = (
     naga::Handle<naga::LocalVariable>,
@@ -204,16 +192,11 @@ fn resource_map(
         .collect::<Vec<_>>();
     textures.sort_by_key(|(_, binding)| binding.map(|binding| (binding.group, binding.binding)));
     let mut texture_targets = HashMap::<(u32, u32), ResourceRange>::new();
-    let mut sampler_targets = HashMap::<(u32, u32), ResourceRange>::new();
     let mut next_image_target = 0_u16;
-    let mut next_sampler_target = 0_u16;
-    for &(handle, binding) in &textures {
+    for (handle, binding) in textures {
         let count = sampled_image_count(module, handle, options).expect("filtered above");
-        if count == 1 {
-            continue;
-        }
         let binding = binding.ok_or_else(|| {
-            Error::UnsupportedFeature("texture binding array without a binding".to_owned())
+            Error::UnsupportedFeature("texture global without a resource binding".to_owned())
         })?;
         let key = (binding.group, binding.binding);
         let (range, first_alias) = if let Some(range) = texture_targets.get(&key) {
@@ -233,151 +216,38 @@ fn resource_map(
             });
         }
     }
-    let mut pair_targets = HashMap::<(u32, u32, u32, u32), u16>::new();
-    let mut pairs = sampled_pairs(module, &entry.function, &reachable_functions)?;
-    pairs.sort_by_key(|(image, sampler)| {
-        let image = module.global_variables[*image].binding.as_ref();
-        let sampler = module.global_variables[*sampler].binding.as_ref();
-        (
-            image.map(|binding| (binding.group, binding.binding)),
-            sampler.map(|binding| (binding.group, binding.binding)),
-        )
-    });
-    for (image, sampler) in pairs {
-        let image_binding = module.global_variables[image]
-            .binding
-            .as_ref()
-            .ok_or_else(|| {
-                Error::UnsupportedFeature("sampled texture without a resource binding".to_owned())
-            })?;
-        let sampler_binding = module.global_variables[sampler]
-            .binding
-            .as_ref()
-            .ok_or_else(|| {
-                Error::UnsupportedFeature("sampler without a resource binding".to_owned())
-            })?;
-        let pair_key = (
-            image_binding.group,
-            image_binding.binding,
-            sampler_binding.group,
-            sampler_binding.binding,
-        );
-        let image_count = sampled_image_count(module, image, options).ok_or_else(|| {
-            Error::UnsupportedFeature(format!(
-                "sampled binding is not a texture: {:?}",
-                module.types[module.global_variables[image].ty].inner
-            ))
-        })?;
-        let sampler_count = sampler_binding_count(module, sampler, options).ok_or_else(|| {
-            Error::UnsupportedFeature("sampled binding is not a sampler".to_owned())
-        })?;
-        if image_count > 1 || sampler_count > 1 {
-            if let std::collections::hash_map::Entry::Vacant(entry) =
-                resources.textures.entry(image)
-            {
-                let key = (image_binding.group, image_binding.binding);
-                let (range, first_alias) = if let Some(range) = texture_targets.get(&key) {
-                    (*range, false)
-                } else {
-                    let range = allocate_resource_range(
-                        &mut next_image_target,
-                        image_count,
-                        "sampled textures",
-                    )?;
-                    texture_targets.insert(key, range);
-                    (range, true)
-                };
-                entry.insert(range);
-                if first_alias {
-                    resources.bindings.push(deko_dksh::Binding {
-                        group: image_binding.group,
-                        binding: image_binding.binding,
-                        target: u32::from(range.target),
-                        kind: deko_dksh::BindingKind::Texture,
-                    });
-                }
-            }
-            let sampler_key = (sampler_binding.group, sampler_binding.binding);
-            let (range, first_alias) = if let Some(range) = sampler_targets.get(&sampler_key) {
-                (*range, false)
-            } else {
-                let range =
-                    allocate_resource_range(&mut next_sampler_target, sampler_count, "samplers")?;
-                sampler_targets.insert(sampler_key, range);
-                (range, true)
-            };
-            resources.samplers.insert(sampler, range);
-            if first_alias {
-                resources.bindings.push(deko_dksh::Binding {
-                    group: sampler_binding.group,
-                    binding: sampler_binding.binding,
-                    target: u32::from(range.target),
-                    kind: deko_dksh::BindingKind::Sampler,
-                });
-            }
-            continue;
-        }
-        let next_target = next_image_target.max(next_sampler_target);
-        let (target, first_alias) = if let Some(target) = pair_targets.get(&pair_key) {
-            (*target, false)
-        } else {
-            if next_target >= 64 {
-                return Err(Error::UnsupportedFeature(
-                    "more than 64 sampled texture pairs".to_owned(),
-                ));
-            }
-            pair_targets.insert(pair_key, next_target);
-            next_image_target = next_target + 1;
-            next_sampler_target = next_target + 1;
-            (next_target, true)
-        };
-        resources
-            .texture_sampler_pairs
-            .insert((image, sampler), target);
-        resources
-            .textures
-            .entry(image)
-            .or_insert(ResourceRange { target, count: 1 });
-        texture_targets
-            .entry((image_binding.group, image_binding.binding))
-            .or_insert(ResourceRange { target, count: 1 });
-        if first_alias {
-            resources.bindings.extend([
-                deko_dksh::Binding {
-                    group: image_binding.group,
-                    binding: image_binding.binding,
-                    target: u32::from(target),
-                    kind: deko_dksh::BindingKind::Texture,
-                },
-                deko_dksh::Binding {
-                    group: sampler_binding.group,
-                    binding: sampler_binding.binding,
-                    target: u32::from(target),
-                    kind: deko_dksh::BindingKind::Sampler,
-                },
-            ]);
-        }
-    }
-    for (handle, binding) in textures {
+    let mut samplers = module
+        .global_variables
+        .iter()
+        .filter_map(|(handle, variable)| {
+            (used_globals.contains(&handle)
+                && sampler_binding_count(module, handle, options).is_some())
+            .then_some((handle, variable.binding.as_ref()))
+        })
+        .collect::<Vec<_>>();
+    samplers.sort_by_key(|(_, binding)| binding.map(|binding| (binding.group, binding.binding)));
+    let mut sampler_targets = HashMap::<(u32, u32), ResourceRange>::new();
+    let mut next_sampler_target = 0_u16;
+    for (handle, binding) in samplers {
+        let count = sampler_binding_count(module, handle, options).expect("filtered above");
         let binding = binding.ok_or_else(|| {
-            Error::UnsupportedFeature("texture global without a resource binding".to_owned())
+            Error::UnsupportedFeature("sampler global without a resource binding".to_owned())
         })?;
         let key = (binding.group, binding.binding);
-        let count = sampled_image_count(module, handle, options).expect("filtered above");
-        let (range, first_alias) = if let Some(range) = texture_targets.get(&key) {
+        let (range, first_alias) = if let Some(range) = sampler_targets.get(&key) {
             (*range, false)
         } else {
-            let range = allocate_resource_range(&mut next_image_target, count, "sampled textures")?;
-            texture_targets.insert(key, range);
+            let range = allocate_resource_range(&mut next_sampler_target, count, "samplers")?;
+            sampler_targets.insert(key, range);
             (range, true)
         };
-        resources.textures.insert(handle, range);
+        resources.samplers.insert(handle, range);
         if first_alias {
             resources.bindings.push(deko_dksh::Binding {
                 group: binding.group,
                 binding: binding.binding,
                 target: u32::from(range.target),
-                kind: deko_dksh::BindingKind::Texture,
+                kind: deko_dksh::BindingKind::Sampler,
             });
         }
     }
@@ -524,47 +394,6 @@ fn allocate_resource_range(
     };
     *next = end;
     Ok(range)
-}
-
-fn sampled_pairs(
-    module: &naga::Module,
-    entry: &naga::Function,
-    reachable_functions: &HashSet<naga::Handle<naga::Function>>,
-) -> Result<Vec<SampledPair>, Error> {
-    let mut pairs = Vec::new();
-    let mut collect = |function: &naga::Function| -> Result<(), Error> {
-        for (_, expression) in function.expressions.iter() {
-            let naga::Expression::ImageSample { image, sampler, .. } = expression else {
-                continue;
-            };
-            let image = expression_resource_global(function, *image).ok_or_else(|| {
-                Error::UnsupportedFeature("sampled texture is not a global resource".to_owned())
-            })?;
-            let sampler = expression_resource_global(function, *sampler).ok_or_else(|| {
-                Error::UnsupportedFeature("sampler is not a global resource".to_owned())
-            })?;
-            pairs.push((image, sampler));
-        }
-        Ok(())
-    };
-    collect(entry)?;
-    for function in reachable_functions {
-        collect(&module.functions[*function])?;
-    }
-    Ok(pairs)
-}
-
-fn expression_resource_global(
-    function: &naga::Function,
-    expression: naga::Handle<naga::Expression>,
-) -> Option<naga::Handle<naga::GlobalVariable>> {
-    match function.expressions[expression] {
-        naga::Expression::GlobalVariable(global) => Some(global),
-        naga::Expression::Access { base, .. } | naga::Expression::AccessIndex { base, .. } => {
-            expression_resource_global(function, base)
-        }
-        _ => None,
-    }
 }
 
 fn reachable_functions(
@@ -1221,26 +1050,23 @@ impl<'function> FunctionLowerer<'function> {
         query: naga::ImageQuery,
     ) -> Result<Value, Error> {
         let (image, binding_index) = self.sampled_resource(image, "texture query")?;
-        let (texture_reference, bindless_target) = if let Some(binding_index) = binding_index {
-            let range = *self.resources.textures.get(&image).ok_or_else(|| {
-                Error::UnsupportedFeature("queried texture array has no Deko target".to_owned())
-            })?;
-            (
-                TexRef::Bindless,
-                Some(self.resource_array_target(range, Some(binding_index))?),
-            )
-        } else {
-            let target = self
-                .resources
-                .textures
-                .get(&image)
-                .map(|range| range.target)
-                .or_else(|| self.resources.storage_textures.get(&image).copied())
-                .ok_or_else(|| {
-                    Error::UnsupportedFeature("queried texture has no Deko target".to_owned())
-                })?;
-            (TexRef::Bound(target), None)
-        };
+        let (texture_reference, bindless_target) =
+            if let Some(range) = self.resources.textures.get(&image).copied() {
+                (
+                    TexRef::Bindless,
+                    Some(self.resource_array_target(range, binding_index)?),
+                )
+            } else {
+                let target = self
+                    .resources
+                    .storage_textures
+                    .get(&image)
+                    .copied()
+                    .ok_or_else(|| {
+                        Error::UnsupportedFeature("queried texture has no Deko target".to_owned())
+                    })?;
+                (TexRef::Bound(target), None)
+            };
         let image_type = binding_resource_base_type(self.module, image);
         let naga::TypeInner::Image { dim: dimension, .. } = self.module.types[image_type].inner
         else {
@@ -1530,14 +1356,9 @@ impl<'function> FunctionLowerer<'function> {
                 level,
             );
         }
-        let target = self
-            .resources
-            .textures
-            .get(&image)
-            .ok_or_else(|| {
-                Error::UnsupportedFeature("loaded texture has no Deko target".to_owned())
-            })?
-            .target;
+        let range = *self.resources.textures.get(&image).ok_or_else(|| {
+            Error::UnsupportedFeature("loaded texture has no Deko target".to_owned())
+        })?;
         let (kind, output_components, multisampled) = match class {
             naga::ImageClass::Sampled { kind, multi } => (kind, 4, multi),
             naga::ImageClass::Depth { multi } => (naga::ScalarKind::Float, 1, multi),
@@ -1611,6 +1432,8 @@ impl<'function> FunctionLowerer<'function> {
         }
         source.components.extend(extra.components);
         let source = self.materialize(source)?;
+        let handle = self.resource_array_target(range, None)?;
+        let handle = self.materialize(handle)?;
         let destination = self
             .target
             .ssa_alloc
@@ -1618,8 +1441,8 @@ impl<'function> FunctionLowerer<'function> {
         self.emit(Instr::new(OpTld {
             dsts: [Dst::from(destination.clone()), Dst::None],
             fault: Dst::None,
-            tex: TexRef::Bound(target),
-            srcs: [Src::from(source), Src::ZERO],
+            tex: TexRef::Bindless,
+            srcs: [Src::from(source), Src::from(handle)],
             dim: tex_dim,
             is_ms: multisampled,
             lod_mode: if multisampled {
@@ -1754,43 +1577,32 @@ impl<'function> FunctionLowerer<'function> {
         }
         let (image, image_binding_index) = self.sampled_resource(image, "texture")?;
         let (sampler, sampler_binding_index) = self.sampled_resource(sampler, "sampler")?;
-        let (texture_reference, bindless_handle) =
-            if image_binding_index.is_some() || sampler_binding_index.is_some() {
-                let image_range = *self.resources.textures.get(&image).ok_or_else(|| {
-                    Error::UnsupportedFeature("sampled image array has no Deko target".to_owned())
-                })?;
-                let sampler_range = *self.resources.samplers.get(&sampler).ok_or_else(|| {
-                    Error::UnsupportedFeature("sampler array has no Deko target".to_owned())
-                })?;
-                let image_target = self.resource_array_target(image_range, image_binding_index)?;
-                let sampler_target =
-                    self.resource_array_target(sampler_range, sampler_binding_index)?;
-                let sampler_bits = self.binary(
-                    naga::BinaryOperator::ShiftLeft,
-                    &sampler_target,
-                    &Value {
-                        components: vec![Src::from(20_u32)],
-                        kind: naga::ScalarKind::Uint,
-                    },
-                    None,
-                )?;
-                let handle = self.binary(
-                    naga::BinaryOperator::InclusiveOr,
-                    &image_target,
-                    &sampler_bits,
-                    None,
-                )?;
-                (TexRef::Bindless, Some(Src::from(self.materialize(handle)?)))
-            } else {
-                let target = *self
-                    .resources
-                    .texture_sampler_pairs
-                    .get(&(image, sampler))
-                    .ok_or_else(|| {
-                        Error::UnsupportedFeature("sampled pair has no Deko target".to_owned())
-                    })?;
-                (TexRef::Bound(target), None)
-            };
+        let image_range = *self.resources.textures.get(&image).ok_or_else(|| {
+            Error::UnsupportedFeature("sampled image has no Deko target".to_owned())
+        })?;
+        let sampler_range =
+            *self.resources.samplers.get(&sampler).ok_or_else(|| {
+                Error::UnsupportedFeature("sampler has no Deko target".to_owned())
+            })?;
+        let image_target = self.resource_array_target(image_range, image_binding_index)?;
+        let sampler_target = self.resource_array_target(sampler_range, sampler_binding_index)?;
+        let sampler_bits = self.binary(
+            naga::BinaryOperator::ShiftLeft,
+            &sampler_target,
+            &Value {
+                components: vec![Src::from(20_u32)],
+                kind: naga::ScalarKind::Uint,
+            },
+            None,
+        )?;
+        let handle = self.binary(
+            naga::BinaryOperator::InclusiveOr,
+            &image_target,
+            &sampler_bits,
+            None,
+        )?;
+        let texture_reference = TexRef::Bindless;
+        let bindless_handle = Some(Src::from(self.materialize(handle)?));
         let (dim, kind) = match module_image_type(self.module, image)? {
             (naga::ImageDimension::D1, false, kind) => (TexDim::_1D, kind),
             (naga::ImageDimension::D1, true, kind) => (TexDim::Array1D, kind),
