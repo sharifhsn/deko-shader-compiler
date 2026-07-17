@@ -16,6 +16,8 @@ pub mod depth_first_search;
 #[rustfmt::skip]
 pub mod enum_as_u8;
 #[rustfmt::skip]
+pub mod lower_bounded;
+#[rustfmt::skip]
 pub mod smallvec;
 #[rustfmt::skip]
 pub mod vec_pair;

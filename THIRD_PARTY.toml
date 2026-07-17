@@ -9,6 +9,8 @@ status = "extraction-in-progress"
 source_root = "src/nouveau/compiler/nak"
 staged_root = "crates/deko-nak/upstream/mesa"
 file_manifest = "crates/deko-nak/UPSTREAM_FILES.txt"
+active_root = "crates/deko-nak/src"
+active_manifest = "crates/deko-nak/ACTIVE_FILES.toml"
 notice = "Every imported file must retain its original copyright and SPDX header."
 
 files = [
@@ -20,12 +22,25 @@ files = [
     { upstream = "src/compiler/rust/dataflow.rs", local = "crates/deko-compiler-utils/src/dataflow.rs", modified = false },
     { upstream = "src/compiler/rust/depth_first_search.rs", local = "crates/deko-compiler-utils/src/depth_first_search.rs", modified = false },
     { upstream = "src/compiler/rust/enum_as_u8.rs", local = "crates/deko-compiler-utils/src/enum_as_u8.rs", modified = false },
+    { upstream = "src/compiler/rust/lower_bounded.rs", local = "crates/deko-compiler-utils/src/lower_bounded.rs", modified = false },
     { upstream = "src/compiler/rust/smallvec.rs", local = "crates/deko-compiler-utils/src/smallvec.rs", modified = false },
     { upstream = "src/compiler/rust/vec_pair.rs", local = "crates/deko-compiler-utils/src/vec_pair.rs", modified = false },
     { upstream = "src/compiler/rust/proc/as_slice.rs", local = "crates/deko-shader-compiler-macros/src/compiler_proc/as_slice.rs", modified = false },
     { upstream = "src/compiler/rust/proc/enum_as_u8.rs", local = "crates/deko-shader-compiler-macros/src/compiler_proc/enum_as_u8.rs", modified = false },
     { upstream = "src/compiler/rust/proc/from_variants.rs", local = "crates/deko-shader-compiler-macros/src/compiler_proc/from_variants.rs", modified = false },
     { upstream = "src/nouveau/compiler/nak/ir_proc.rs", local = "crates/deko-shader-compiler-macros/src/lib.rs", modified = true },
+]
+
+[[upstreams]]
+name = "NVIDIA Maxwell SPH definitions"
+repository = "https://gitlab.freedesktop.org/mesa/mesa.git"
+revision = "99bf1b953cba11d41dbee519ae1b53387477df9e"
+license = "MIT"
+status = "constant-reference"
+source_root = "src/nouveau/headers/nvidia/classes"
+notice = "Public SPHv3 bit ranges and values are reproduced as local Rust constants."
+files = [
+    { upstream = "src/nouveau/headers/nvidia/classes/cla097sph.h", local = "crates/deko-nak/src/sph.rs", modified = true },
 ]
 
 [[upstreams]]

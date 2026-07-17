@@ -6,8 +6,68 @@
 use thiserror::Error;
 
 mod bindings;
+mod compiler;
+pub mod debug;
+pub mod sph;
+
+pub(crate) use debug as api;
+
+#[rustfmt::skip]
+mod assign_regs;
+#[rustfmt::skip]
+mod builder;
+#[rustfmt::skip]
+mod calc_instr_deps;
+#[rustfmt::skip]
+mod const_tracker;
+pub mod ir;
+#[rustfmt::skip]
+mod legalize;
+#[rustfmt::skip]
+mod liveness;
+#[rustfmt::skip]
+mod lower_copy_swap;
+#[rustfmt::skip]
+mod lower_par_copies;
+#[rustfmt::skip]
+mod opt_bar_prop;
+#[rustfmt::skip]
+mod opt_copy_prop;
+#[rustfmt::skip]
+mod opt_crs;
+#[rustfmt::skip]
+mod opt_dce;
+#[rustfmt::skip]
+mod opt_instr_sched_common;
+#[rustfmt::skip]
+mod opt_instr_sched_postpass;
+#[rustfmt::skip]
+mod opt_instr_sched_prepass;
+#[rustfmt::skip]
+mod opt_lop;
+#[rustfmt::skip]
+mod opt_out;
+#[rustfmt::skip]
+mod opt_prmt;
+#[rustfmt::skip]
+mod opt_uniform_instrs;
+#[rustfmt::skip]
+mod reg_tracker;
+#[rustfmt::skip]
+mod repair_ssa;
+#[rustfmt::skip]
+mod sm50;
+#[rustfmt::skip]
+mod spill_values;
+#[rustfmt::skip]
+mod ssa_value;
+#[rustfmt::skip]
+mod to_cssa;
+#[rustfmt::skip]
+mod union_find;
 
 pub use bindings::{FsKey, MeshTopology, TransformFeedbackInfo};
+pub use compiler::compile_ir;
 
 /// Maxwell target properties needed by the standalone backend.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -45,6 +105,9 @@ pub enum Error {
     /// The NAK extraction has not reached an executable backend yet.
     #[error("the standalone NAK backend is not implemented yet")]
     BackendUnavailable,
+    /// The standalone backend deliberately targets only the Switch's GM20B GPU.
+    #[error("shader model {0} is unsupported; deko-nak targets SM53")]
+    UnsupportedShaderModel(u8),
 }
 
 /// Confirm that a target is within the deliberately narrow initial support envelope.

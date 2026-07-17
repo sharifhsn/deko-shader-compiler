@@ -20,5 +20,13 @@ paste.workspace = true
 rustc-hash.workspace = true
 thiserror.workspace = true
 
-[lints]
-workspace = true
+[lints.rust]
+unsafe_code = "allow"
+missing_docs = "allow"
+dead_code = "allow"
+non_snake_case = "allow"
+unfulfilled_lint_expectations = "allow"
+
+[lints.clippy]
+all = "allow"
+pedantic = "allow"
