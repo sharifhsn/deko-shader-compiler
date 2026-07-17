@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::BTreeMap,
     sync::{Arc, Mutex},
 };
 
@@ -99,7 +99,7 @@ fn put_bytes(digest: &mut Sha256, bytes: &[u8]) {
 /// Thread-safe deterministic in-memory artifact cache.
 #[derive(Clone, Debug, Default)]
 pub struct CompilerCache {
-    entries: Arc<Mutex<HashMap<CacheKey, Arc<Artifact>>>>,
+    entries: Arc<Mutex<BTreeMap<CacheKey, Arc<Artifact>>>>,
 }
 
 impl CompilerCache {
