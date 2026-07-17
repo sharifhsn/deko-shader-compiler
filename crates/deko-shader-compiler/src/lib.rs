@@ -1,8 +1,7 @@
 //! Public Naga-facing API for the Deko shader compiler.
 //!
-//! WGSL parsing and validation already work. Native lowering remains unavailable until
-//! the Mesa NAK extraction is connected, and is reported as a typed error rather than
-//! falling back to a host compiler or embedded artifact.
+//! WGSL is parsed and validated with Naga, lowered directly to the extracted Mesa NAK backend,
+//! and packaged as DKSH. Unsupported language and pipeline features fail with a typed error.
 
 use std::collections::BTreeMap;
 
@@ -12,6 +11,27 @@ mod lower;
 
 /// Pipeline override values after wgpu resolves their names.
 pub type PipelineConstants = BTreeMap<String, f64>;
+
+/// Programmable pipeline stage selected for compilation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum Stage {
+    /// Vertex stage.
+    Vertex,
+    /// Fragment stage.
+    Fragment,
+    /// Compute stage.
+    Compute,
+}
+
+impl From<Stage> for naga::ShaderStage {
+    fn from(stage: Stage) -> Self {
+        match stage {
+            Stage::Vertex => Self::Vertex,
+            Stage::Fragment => Self::Fragment,
+            Stage::Compute => Self::Compute,
+        }
+    }
+}
 
 /// Switch compiler target.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -40,6 +60,8 @@ pub struct Options {
     pub robustness: Robustness,
     /// Optional multiview mask for vertex-stage compilation.
     pub multiview_mask: Option<u32>,
+    /// Whether workgroup-scoped memory must be initialized to zero.
+    pub zero_initialize_workgroup_memory: bool,
 }
 
 impl Default for Options {
@@ -48,6 +70,7 @@ impl Default for Options {
             target: Target::Gm20b,
             robustness: Robustness::Robust,
             multiview_mask: None,
+            zero_initialize_workgroup_memory: true,
         }
     }
 }
@@ -118,7 +141,7 @@ impl Compiler {
     pub fn compile_wgsl(
         self,
         source: &str,
-        stage: naga::ShaderStage,
+        stage: Stage,
         entry_point: &str,
         constants: &PipelineConstants,
         options: Options,
@@ -135,7 +158,7 @@ impl Compiler {
         self.compile_module(&ModuleRequest {
             module: &module,
             info: &info,
-            stage,
+            stage: stage.into(),
             entry_point,
             constants,
             options,
@@ -154,9 +177,17 @@ impl Compiler {
                 entry_point: request.entry_point.to_owned(),
             })?;
         let _ = request.info;
-        let _ = request.constants;
-        let _ = request.options;
-        deko_nak::validate_target(deko_nak::Target::GM20B)?;
+        if !request.module.overrides.is_empty() || !request.constants.is_empty() {
+            return Err(Error::UnsupportedFeature(
+                "pipeline-overridable constants".to_owned(),
+            ));
+        }
+        if request.options.multiview_mask.is_some() {
+            return Err(Error::UnsupportedFeature("multiview".to_owned()));
+        }
+        match request.options.target {
+            Target::Gm20b => deko_nak::validate_target(deko_nak::Target::GM20B)?,
+        }
 
         let sm = deko_nak::ir::ShaderModelInfo::new(53, 64);
         let shader = lower::lower_entry_point(request.module, entry, &sm)?;
@@ -250,7 +281,7 @@ mod tests {
         let error = Compiler
             .compile_wgsl(
                 "this is not WGSL",
-                naga::ShaderStage::Compute,
+                Stage::Compute,
                 "main",
                 &PipelineConstants::new(),
                 Options::default(),
@@ -264,7 +295,7 @@ mod tests {
         let missing = Compiler
             .compile_wgsl(
                 COMPUTE,
-                naga::ShaderStage::Compute,
+                Stage::Compute,
                 "missing",
                 &PipelineConstants::new(),
                 Options::default(),
@@ -275,7 +306,7 @@ mod tests {
         let artifact = Compiler
             .compile_wgsl(
                 COMPUTE,
-                naga::ShaderStage::Compute,
+                Stage::Compute,
                 "main",
                 &PipelineConstants::new(),
                 Options::default(),
@@ -300,7 +331,7 @@ mod tests {
             Compiler
                 .compile_wgsl(
                     source,
-                    naga::ShaderStage::Compute,
+                    Stage::Compute,
                     "main",
                     &PipelineConstants::new(),
                     Options::default(),
@@ -330,7 +361,7 @@ mod tests {
         let vertex = Compiler
             .compile_wgsl(
                 "@vertex fn main() -> @builtin(position) vec4<f32> { return vec4<f32>(0.0, 0.0, 0.0, 1.0); }",
-                naga::ShaderStage::Vertex,
+                Stage::Vertex,
                 "main",
                 &PipelineConstants::new(),
                 Options::default(),
@@ -349,7 +380,7 @@ mod tests {
         let fragment = Compiler
             .compile_wgsl(
                 "@fragment fn main() -> @location(0) vec4<f32> { return vec4<f32>(1.0, 0.0, 0.0, 1.0); }",
-                naga::ShaderStage::Fragment,
+                Stage::Fragment,
                 "main",
                 &PipelineConstants::new(),
                 Options::default(),
@@ -373,7 +404,7 @@ mod tests {
         let vertex = Compiler
             .compile_wgsl(
                 "@vertex fn main(@location(0) position: vec3<f32>) -> @builtin(position) vec4<f32> { return vec4<f32>(position, 1.0); }",
-                naga::ShaderStage::Vertex,
+                Stage::Vertex,
                 "main",
                 &PipelineConstants::new(),
                 Options::default(),
@@ -386,7 +417,7 @@ mod tests {
         let fragment = Compiler
             .compile_wgsl(
                 "@fragment fn main(@location(0) color: vec4<f32>) -> @location(0) vec4<f32> { return color; }",
-                naga::ShaderStage::Fragment,
+                Stage::Fragment,
                 "main",
                 &PipelineConstants::new(),
                 Options::default(),
@@ -405,7 +436,7 @@ mod tests {
         let artifact = Compiler
             .compile_wgsl(
                 "@fragment fn main(@location(0) color: vec4<f32>) -> @location(0) vec4<f32> { return color * 0.5 + vec4<f32>(0.1, 0.2, 0.3, 0.0); }",
-                naga::ShaderStage::Fragment,
+                Stage::Fragment,
                 "main",
                 &PipelineConstants::new(),
                 Options::default(),
@@ -438,7 +469,7 @@ mod tests {
         let artifact = Compiler
             .compile_wgsl(
                 source,
-                naga::ShaderStage::Vertex,
+                Stage::Vertex,
                 "main",
                 &PipelineConstants::new(),
                 Options::default(),
@@ -450,5 +481,35 @@ mod tests {
             deko_dksh::ProgramType::Vertex
         );
         assert!(container.code[0x80..].iter().any(|byte| *byte != 0));
+    }
+
+    #[test]
+    fn unsupported_pipeline_options_fail_instead_of_changing_semantics() {
+        let mut constants = PipelineConstants::new();
+        constants.insert("scale".to_owned(), 2.0);
+        let override_error = Compiler
+            .compile_wgsl(
+                "override scale: f32 = 1.0; @compute @workgroup_size(1) fn main() {}",
+                Stage::Compute,
+                "main",
+                &constants,
+                Options::default(),
+            )
+            .unwrap_err();
+        assert!(matches!(override_error, Error::UnsupportedFeature(_)));
+
+        let multiview_error = Compiler
+            .compile_wgsl(
+                "@vertex fn main() -> @builtin(position) vec4<f32> { return vec4<f32>(); }",
+                Stage::Vertex,
+                "main",
+                &PipelineConstants::new(),
+                Options {
+                    multiview_mask: Some(1),
+                    ..Options::default()
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(multiview_error, Error::UnsupportedFeature(_)));
     }
 }
