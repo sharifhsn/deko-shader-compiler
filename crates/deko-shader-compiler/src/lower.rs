@@ -733,6 +733,7 @@ struct LoopContext {
     break_edges: Vec<LoopBreakEdge>,
     continue_edges: Vec<LoopContinueEdge>,
     needs_exit_local_merge: bool,
+    live_after: HashSet<naga::Handle<naga::LocalVariable>>,
 }
 
 struct LoopBreakEdge {
@@ -6589,17 +6590,14 @@ impl<'function> FunctionLowerer<'function> {
         let control_index = block
             .iter()
             .rposition(|statement| !matches!(statement, naga::Statement::Emit(_)))?;
-        let prefix = block[..control_index].to_vec();
+        let mut prefix = block[..control_index].to_vec();
         match &block[control_index] {
             naga::Statement::Break if is_break => {}
             naga::Statement::Continue if !is_break => {}
             naga::Statement::Block(nested) => {
-                if !prefix.is_empty() {
-                    return None;
-                }
                 let nested_prefix = Self::loop_control_prefix(nested, is_break)?;
                 if !nested_prefix.is_empty() {
-                    return None;
+                    prefix.push(naga::Statement::Block(nested_prefix));
                 }
             }
             _ => return None,
@@ -6619,6 +6617,17 @@ impl<'function> FunctionLowerer<'function> {
             }
         }
         None
+    }
+
+    fn loop_prefix_writes_live_local(&self, prefix: &naga::Block) -> bool {
+        let Some(context) = self.loops.last() else {
+            return false;
+        };
+        let mut written = HashSet::default();
+        self.collect_loop_written_locals(prefix, &mut written);
+        written
+            .iter()
+            .any(|local| context.live_after.contains(local))
     }
 
     fn emit_conditional_break(
@@ -6716,6 +6725,7 @@ impl<'function> FunctionLowerer<'function> {
         body: &naga::Block,
         continuing: &naga::Block,
         break_if: Option<naga::Handle<naga::Expression>>,
+        live_after: HashSet<naga::Handle<naga::LocalVariable>>,
     ) -> Result<(), Error> {
         let header_label = self.allocate_label();
         let continue_label = self.allocate_label();
@@ -6803,6 +6813,7 @@ impl<'function> FunctionLowerer<'function> {
             break_edges: Vec::new(),
             continue_edges: Vec::new(),
             needs_exit_local_merge: false,
+            live_after,
         });
         let break_prefix = Self::break_prefix(body);
         let continue_prefix = Self::continue_prefix(body);
@@ -6810,7 +6821,23 @@ impl<'function> FunctionLowerer<'function> {
             .as_ref()
             .or(continue_prefix.as_ref())
             .unwrap_or(body);
-        let returned_from_body = self.execute_statements(executable_body)?;
+        let mut continuing_live_out = self
+            .loops
+            .last()
+            .expect("loop context was pushed")
+            .live_after
+            .clone();
+        continuing_live_out.extend(
+            self.loops
+                .last()
+                .expect("loop context was pushed")
+                .carried_locals
+                .iter()
+                .copied(),
+        );
+        let body_live_out = self.local_liveness_before(continuing, continuing_live_out.clone());
+        let returned_from_body =
+            self.execute_statements_with_live_out(executable_body, &body_live_out)?;
         let mut body_falls_through = returned_from_body.is_none();
         let body_end = self.current_block;
         if let Some(returned) = returned_from_body {
@@ -6831,8 +6858,11 @@ impl<'function> FunctionLowerer<'function> {
                 .expect("loop context was pushed")
                 .exit_label;
             self.emit(Instr::new(OpBrk { target: exit_label }));
+            let merge_live_local = break_prefix
+                .as_ref()
+                .is_some_and(|prefix| self.loop_prefix_writes_live_local(prefix));
             let context = self.loops.last_mut().expect("loop context was pushed");
-            context.needs_exit_local_merge = true;
+            context.needs_exit_local_merge = merge_live_local;
             context.break_edges.push(LoopBreakEdge {
                 block: body_end,
                 returned: None,
@@ -6858,7 +6888,10 @@ impl<'function> FunctionLowerer<'function> {
         }
         self.current_block = continuing_block;
         self.merge_continue_locals(&continue_edges, continuing_block)?;
-        if self.execute_statements(continuing)?.is_some() {
+        if self
+            .execute_statements_with_live_out(continuing, &continuing_live_out)?
+            .is_some()
+        {
             return Err(Error::UnsupportedFeature(
                 "return from a loop continuing block".to_owned(),
             ));
@@ -6927,6 +6960,9 @@ impl<'function> FunctionLowerer<'function> {
         };
         let mut local_handles = Vec::new();
         for &handle in &context.exit_locals {
+            if !context.live_after.contains(&handle) {
+                continue;
+            }
             if context
                 .break_edges
                 .iter()
@@ -7239,6 +7275,79 @@ impl<'function> FunctionLowerer<'function> {
         }
     }
 
+    fn local_liveness_before(
+        &self,
+        statements: &[naga::Statement],
+        mut live: HashSet<naga::Handle<naga::LocalVariable>>,
+    ) -> HashSet<naga::Handle<naga::LocalVariable>> {
+        for statement in statements.iter().rev() {
+            match statement {
+                naga::Statement::Emit(range) => {
+                    for expression in range.clone() {
+                        if let naga::Expression::Load { pointer } =
+                            self.source.expressions[expression]
+                            && let Ok((local, _, _)) = self.local_pointer(pointer)
+                        {
+                            live.insert(local);
+                        }
+                    }
+                }
+                naga::Statement::Store { pointer, .. } => {
+                    if let naga::Expression::LocalVariable(local) =
+                        self.source.expressions[*pointer]
+                    {
+                        live.remove(&local);
+                    }
+                }
+                naga::Statement::Atomic { pointer, .. } => {
+                    if let Ok((local, _, _)) = self.local_pointer(*pointer) {
+                        live.insert(local);
+                    }
+                }
+                naga::Statement::Call { arguments, .. } => {
+                    for &argument in arguments {
+                        if let Ok((local, _, _)) = self.local_pointer(argument) {
+                            live.insert(local);
+                        }
+                    }
+                }
+                naga::Statement::Block(block) => {
+                    live = self.local_liveness_before(block, live);
+                }
+                naga::Statement::If { accept, reject, .. } => {
+                    let mut accepted = self.local_liveness_before(accept, live.clone());
+                    accepted.extend(self.local_liveness_before(reject, live));
+                    live = accepted;
+                }
+                naga::Statement::Switch { cases, .. } => {
+                    let live_after = live;
+                    let mut merged = HashSet::default();
+                    for case in cases {
+                        merged.extend(self.local_liveness_before(&case.body, live_after.clone()));
+                    }
+                    live = merged;
+                }
+                naga::Statement::Loop {
+                    body, continuing, ..
+                } => {
+                    let live_after = live.clone();
+                    loop {
+                        let continuing_live = self.local_liveness_before(continuing, live.clone());
+                        let mut next = self.local_liveness_before(body, continuing_live);
+                        next.extend(live_after.iter().copied());
+                        if next == live {
+                            break;
+                        }
+                        live = next;
+                    }
+                }
+                naga::Statement::Return { .. } | naga::Statement::Kill => live.clear(),
+                _ => {}
+            }
+        }
+        live
+    }
+
     fn merge_loop_returns(&mut self, context: &LoopContext) -> Result<(), Error> {
         let Some(template) = context
             .break_edges
@@ -7330,8 +7439,19 @@ impl<'function> FunctionLowerer<'function> {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn execute_statements(&mut self, body: &naga::Block) -> Result<Option<Value>, Error> {
-        for statement in body {
+    fn execute_statements(&mut self, statements: &naga::Block) -> Result<Option<Value>, Error> {
+        self.execute_statements_with_live_out(statements, &HashSet::default())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn execute_statements_with_live_out(
+        &mut self,
+        statements: &naga::Block,
+        live_out: &HashSet<naga::Handle<naga::LocalVariable>>,
+    ) -> Result<Option<Value>, Error> {
+        for (statement_index, statement) in statements.iter().enumerate() {
+            let statement_live_out =
+                self.local_liveness_before(&statements[statement_index + 1..], live_out.clone());
             match statement {
                 naga::Statement::Return {
                     value: Some(handle),
@@ -7494,7 +7614,9 @@ impl<'function> FunctionLowerer<'function> {
                     }
                 }
                 naga::Statement::Block(block) => {
-                    if let Some(value) = self.execute_statements(block)? {
+                    if let Some(value) =
+                        self.execute_statements_with_live_out(block, &statement_live_out)?
+                    {
                         return Ok(Some(value));
                     }
                 }
@@ -7508,8 +7630,14 @@ impl<'function> FunctionLowerer<'function> {
                         && reject.is_empty()
                         && let Some(prefix) = Self::continue_prefix(accept)
                     {
+                        let live_out = self
+                            .loops
+                            .last()
+                            .expect("loop context checked above")
+                            .live_after
+                            .clone();
                         if let Some(value) =
-                            self.conditional(&condition, &prefix, &naga::Block::new())?
+                            self.conditional(&condition, &prefix, &naga::Block::new(), &live_out)?
                         {
                             return Ok(Some(value));
                         }
@@ -7520,8 +7648,14 @@ impl<'function> FunctionLowerer<'function> {
                         && accept.is_empty()
                         && let Some(prefix) = Self::continue_prefix(reject)
                     {
+                        let live_out = self
+                            .loops
+                            .last()
+                            .expect("loop context checked above")
+                            .live_after
+                            .clone();
                         if let Some(value) =
-                            self.conditional(&condition, &naga::Block::new(), &prefix)?
+                            self.conditional(&condition, &naga::Block::new(), &prefix, &live_out)?
                         {
                             return Ok(Some(value));
                         }
@@ -7545,30 +7679,78 @@ impl<'function> FunctionLowerer<'function> {
                     if !self.loops.is_empty()
                         && accept.is_empty()
                         && let Some(prefix) = Self::break_prefix(reject)
-                        && prefix.is_empty()
                     {
+                        if !prefix.is_empty() {
+                            let merge_live_local = self.loop_prefix_writes_live_local(&prefix);
+                            let live_out = self
+                                .loops
+                                .last()
+                                .expect("loop context checked above")
+                                .live_after
+                                .clone();
+                            if let Some(value) = self.conditional(
+                                &condition,
+                                &naga::Block::new(),
+                                &prefix,
+                                &live_out,
+                            )? {
+                                return Ok(Some(value));
+                            }
+                            if merge_live_local {
+                                self.loops
+                                    .last_mut()
+                                    .expect("loop context checked above")
+                                    .needs_exit_local_merge = true;
+                            }
+                        }
                         self.emit_conditional_break(&condition, false, None)?;
                         continue;
                     }
                     if !self.loops.is_empty()
                         && reject.is_empty()
                         && let Some(prefix) = Self::break_prefix(accept)
-                        && prefix.is_empty()
                     {
+                        if !prefix.is_empty() {
+                            let merge_live_local = self.loop_prefix_writes_live_local(&prefix);
+                            let live_out = self
+                                .loops
+                                .last()
+                                .expect("loop context checked above")
+                                .live_after
+                                .clone();
+                            if let Some(value) = self.conditional(
+                                &condition,
+                                &prefix,
+                                &naga::Block::new(),
+                                &live_out,
+                            )? {
+                                return Ok(Some(value));
+                            }
+                            if merge_live_local {
+                                self.loops
+                                    .last_mut()
+                                    .expect("loop context checked above")
+                                    .needs_exit_local_merge = true;
+                            }
+                        }
                         self.emit_conditional_break(&condition, true, None)?;
                         continue;
                     }
-                    if let Some(value) = self.conditional(&condition, accept, reject)? {
+                    if let Some(value) =
+                        self.conditional(&condition, accept, reject, &statement_live_out)?
+                    {
                         return Ok(Some(value));
                     }
                 }
                 naga::Statement::Loop {
-                    body,
+                    body: loop_body,
                     continuing,
                     break_if,
-                } => self.lower_loop(body, continuing, *break_if)?,
+                } => {
+                    self.lower_loop(loop_body, continuing, *break_if, statement_live_out)?;
+                }
                 naga::Statement::Switch { selector, cases } => {
-                    if let Some(value) = self.lower_switch(*selector, cases)? {
+                    if let Some(value) = self.lower_switch(*selector, cases, &statement_live_out)? {
                         return Ok(Some(value));
                     }
                 }
@@ -7642,6 +7824,7 @@ impl<'function> FunctionLowerer<'function> {
         condition: &Value,
         accept: &naga::Block,
         reject: &naga::Block,
+        live_out: &HashSet<naga::Handle<naga::LocalVariable>>,
     ) -> Result<Option<Value>, Error> {
         if condition.kind != naga::ScalarKind::Bool || condition.components.len() != 1 {
             return Err(Error::UnsupportedFeature(
@@ -7664,7 +7847,7 @@ impl<'function> FunctionLowerer<'function> {
         let accepted_predicate = self.combine_predicates(parent_predicate, condition_predicate);
         self.execution_predicate = accepted_predicate;
         let early_returns_before_accept = self.early_returns.len();
-        let accepted = self.execute_statements(accept)?;
+        let accepted = self.execute_statements_with_live_out(accept, live_out)?;
         let accepted_has_partial_return =
             accepted.is_none() && self.early_returns.len() != early_returns_before_accept;
         let accepted_locals = self.locals.clone();
@@ -7680,7 +7863,7 @@ impl<'function> FunctionLowerer<'function> {
             self.combine_predicates(parent_predicate, condition_predicate.bnot());
         self.execution_predicate = rejected_predicate;
         let early_returns_before_reject = self.early_returns.len();
-        let rejected = self.execute_statements(reject)?;
+        let rejected = self.execute_statements_with_live_out(reject, live_out)?;
         let rejected_has_partial_return =
             rejected.is_none() && self.early_returns.len() != early_returns_before_reject;
         let rejected_locals = self.locals.clone();
@@ -7742,6 +7925,7 @@ impl<'function> FunctionLowerer<'function> {
         &mut self,
         selector: naga::Handle<naga::Expression>,
         cases: &[naga::SwitchCase],
+        live_out: &HashSet<naga::Handle<naga::LocalVariable>>,
     ) -> Result<Option<Value>, Error> {
         let selector = self.expression(selector)?;
         if selector.components.len() != 1
@@ -7755,7 +7939,7 @@ impl<'function> FunctionLowerer<'function> {
             ));
         }
         if cases.iter().all(|case| !case.fall_through) {
-            return self.lower_simple_switch(&selector, cases);
+            return self.lower_simple_switch(&selector, cases, live_out);
         }
         let false_value = || Value {
             components: vec![Src::new_imm_bool(false)],
@@ -7803,7 +7987,7 @@ impl<'function> FunctionLowerer<'function> {
                 };
                 condition = self.boolean_or(&condition, &value_condition)?;
             }
-            if let Some(value) = self.conditional(&condition, body, &empty)? {
+            if let Some(value) = self.conditional(&condition, body, &empty, live_out)? {
                 return Ok(Some(value));
             }
         }
@@ -7814,6 +7998,7 @@ impl<'function> FunctionLowerer<'function> {
         &mut self,
         selector: &Value,
         cases: &[naga::SwitchCase],
+        live_out: &HashSet<naga::Handle<naga::LocalVariable>>,
     ) -> Result<Option<Value>, Error> {
         let mut matched = Value {
             components: vec![Src::new_imm_bool(false)],
@@ -7837,7 +8022,7 @@ impl<'function> FunctionLowerer<'function> {
                 }
             };
             let condition = self.binary(naga::BinaryOperator::Equal, selector, &literal, None)?;
-            if let Some(value) = self.conditional(&condition, &case.body, &empty)? {
+            if let Some(value) = self.conditional(&condition, &case.body, &empty, live_out)? {
                 return Ok(Some(value));
             }
             let destination = self.target.ssa_alloc.alloc(RegFile::Pred);
@@ -7854,7 +8039,7 @@ impl<'function> FunctionLowerer<'function> {
         }
         if let Some(default) = default {
             matched.components[0] = matched.components[0].clone().bnot();
-            if let Some(value) = self.conditional(&matched, default, &empty)? {
+            if let Some(value) = self.conditional(&matched, default, &empty, live_out)? {
                 return Ok(Some(value));
             }
         }

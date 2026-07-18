@@ -46,9 +46,10 @@
   removed.
 - Preserve the proven loop-header value path for ordinary conditional loop exits; exit-edge
   phi merging is restricted to terminal unconditional breaks that require post-body values.
-- Recognize `break` and `continue` through control-only nested lexical blocks, while rejecting
-  mutation-bearing nested exits and side-effecting conditional-break prefixes until their exit
-  liveness can be proven.
+- Analyze function-local liveness backward across lexical statement suffixes, branches,
+  switches, calls, atomics, and nested loops. Mutation-bearing nested exits and side-effecting
+  conditional breaks now merge only locals genuinely read after the loop, while overwritten or
+  dead locals avoid destabilizing exit phis.
 - Snapshot and merge pointer arguments across divergent helper-function arms, and write
   updated pointer values back from both void and value-returning calls.
 - Lower WGSL atomic operations on `r32uint` and `r32sint` storage textures to native

@@ -2414,16 +2414,18 @@ mod tests {
                 var value = 0u;
                 loop {
                     {
+                        value += 1u;
                         break;
                     }
                 }
                 loop {
                     {
+                        value += 1u;
                         continue;
                     }
                     continuing {
                         value += 1u;
-                        break if value == 1u;
+                        break if value == 3u;
                     }
                 }
                 output[0] = value;
@@ -2442,7 +2444,7 @@ mod tests {
     }
 
     #[test]
-    fn side_effecting_conditional_break_is_rejected_without_miscompilation() {
+    fn side_effecting_conditional_break_merges_live_exit_value() {
         let source = r"
             @group(0) @binding(0) var<storage, read_write> output: array<u32>;
 
@@ -2459,7 +2461,7 @@ mod tests {
                 output[0] = value;
             }
         ";
-        let error = Compiler
+        let artifact = Compiler
             .compile_wgsl(
                 source,
                 Stage::Compute,
@@ -2467,8 +2469,43 @@ mod tests {
                 &PipelineConstants::new(),
                 Options::default(),
             )
-            .unwrap_err();
-        assert!(matches!(error, Error::UnsupportedFeature(_)), "{error:?}");
+            .unwrap();
+        assert!(artifact.dksh.starts_with(b"DKSH"));
+        let ir = lowered_ir(source, naga::ShaderStage::Compute, "main");
+        assert_eq!(ir.matches("phi_dst").count(), 3, "{ir}");
+    }
+
+    #[test]
+    fn overwritten_loop_exit_local_does_not_require_an_exit_phi() {
+        let source = r"
+            @group(0) @binding(0) var<storage, read_write> output: array<u32>;
+
+            @compute @workgroup_size(1)
+            fn main() {
+                var value = 0u;
+                loop {
+                    if value == 3u {
+                        value += 10u;
+                        break;
+                    }
+                    value += 1u;
+                }
+                value = 99u;
+                output[0] = value;
+            }
+        ";
+        let artifact = Compiler
+            .compile_wgsl(
+                source,
+                Stage::Compute,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap();
+        assert!(artifact.dksh.starts_with(b"DKSH"));
+        let ir = lowered_ir(source, naga::ShaderStage::Compute, "main");
+        assert_eq!(ir.matches("phi_dst").count(), 2, "{ir}");
     }
 
     #[test]
