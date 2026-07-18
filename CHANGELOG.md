@@ -23,6 +23,8 @@
   selection, and shuffle.
 - Lower subgroup invocation ID, subgroup size, subgroup ID, and subgroup count compute
   built-ins from GM20B lane state and pipeline-specialized workgroup geometry.
+- Lower boolean subgroup all/any reductions and subgroup ballots directly through
+  Maxwell vote instructions, preserving active-lane semantics.
 - Lower array texture layer-count queries, including the Maxwell cube-face count to
   cube-layer conversion used by Mesa NIR.
 - Accept pipeline-specialized compute workgroup-size overrides and preserve their

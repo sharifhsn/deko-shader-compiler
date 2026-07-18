@@ -1400,6 +1400,79 @@ impl<'function> FunctionLowerer<'function> {
         Ok(())
     }
 
+    fn subgroup_ballot(
+        &mut self,
+        predicate: Option<naga::Handle<naga::Expression>>,
+        result: naga::Handle<naga::Expression>,
+    ) -> Result<(), Error> {
+        let predicate = match predicate {
+            Some(predicate) => {
+                let value = self.expression(predicate)?;
+                if value.kind != naga::ScalarKind::Bool || value.components.len() != 1 {
+                    return Err(Error::UnsupportedFeature(
+                        "subgroup ballot predicate must be a scalar boolean".to_owned(),
+                    ));
+                }
+                Self::predicate(&value.components[0])?
+            }
+            None => Pred::from(true),
+        };
+        let ballot = self.target.ssa_alloc.alloc(RegFile::GPR);
+        self.emit(Instr::new(OpVote {
+            op: VoteOp::Any,
+            ballot: Dst::from(ballot),
+            vote: Dst::None,
+            pred: Src::from(predicate),
+        }));
+        self.values.insert(
+            result,
+            Value {
+                components: vec![Src::from(ballot), Src::ZERO, Src::ZERO, Src::ZERO],
+                kind: naga::ScalarKind::Uint,
+            },
+        );
+        Ok(())
+    }
+
+    fn subgroup_collective(
+        &mut self,
+        op: naga::SubgroupOperation,
+        collective_op: naga::CollectiveOperation,
+        argument: naga::Handle<naga::Expression>,
+        result: naga::Handle<naga::Expression>,
+    ) -> Result<(), Error> {
+        let vote_op = match (op, collective_op) {
+            (naga::SubgroupOperation::All, naga::CollectiveOperation::Reduce) => VoteOp::All,
+            (naga::SubgroupOperation::Any, naga::CollectiveOperation::Reduce) => VoteOp::Any,
+            _ => {
+                return Err(Error::UnsupportedFeature(format!(
+                    "subgroup collective {collective_op:?} {op:?}"
+                )));
+            }
+        };
+        let argument = self.expression(argument)?;
+        if argument.kind != naga::ScalarKind::Bool || argument.components.len() != 1 {
+            return Err(Error::UnsupportedFeature(
+                "subgroup vote argument must be a scalar boolean".to_owned(),
+            ));
+        }
+        let vote = self.target.ssa_alloc.alloc(RegFile::Pred);
+        self.emit(Instr::new(OpVote {
+            op: vote_op,
+            ballot: Dst::None,
+            vote: Dst::from(vote),
+            pred: Src::from(Self::predicate(&argument.components[0])?),
+        }));
+        self.values.insert(
+            result,
+            Value {
+                components: vec![Src::from(vote)],
+                kind: naga::ScalarKind::Bool,
+            },
+        );
+        Ok(())
+    }
+
     fn subgroup_lane(&mut self, index: naga::Handle<naga::Expression>) -> Result<Src, Error> {
         let index = self.expression(index)?;
         if index.components.len() != 1
@@ -6759,6 +6832,15 @@ impl<'function> FunctionLowerer<'function> {
                     argument,
                     result,
                 } => self.subgroup_gather(*mode, *argument, *result)?,
+                naga::Statement::SubgroupBallot { result, predicate } => {
+                    self.subgroup_ballot(*predicate, *result)?;
+                }
+                naga::Statement::SubgroupCollectiveOperation {
+                    op,
+                    collective_op,
+                    argument,
+                    result,
+                } => self.subgroup_collective(*op, *collective_op, *argument, *result)?,
                 naga::Statement::Store { pointer, value } => {
                     if self.pointer_is_argument(*pointer) {
                         let value = self.expression(*value)?;

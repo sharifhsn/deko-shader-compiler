@@ -1820,6 +1820,14 @@ mod tests {
             broadcast_first_ir.contains("shfl.idx"),
             "{broadcast_first_ir}"
         );
+
+        let vote_ir = lowered_ir(
+            "@compute @workgroup_size(32) fn main(@builtin(local_invocation_index) lane: u32) { let predicate = lane < 16u; _ = subgroupAll(predicate); _ = subgroupAny(predicate); _ = subgroupBallot(predicate); _ = subgroupBallot(); }",
+            naga::ShaderStage::Compute,
+            "main",
+        );
+        assert!(vote_ir.contains("vote.all"), "{vote_ir}");
+        assert!(vote_ir.matches("vote.any").count() >= 3, "{vote_ir}");
     }
 
     #[test]
