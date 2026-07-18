@@ -39,7 +39,8 @@
 - Snapshot and merge pointer arguments across divergent helper-function arms, and write
   updated pointer values back from both void and value-returning calls.
 - Group WGSL multi-selector switch markers into a shared predicate and body while
-  continuing to reject non-empty source-IR fall-through cases.
+  continuing to reject non-empty source-IR fall-through cases. Preserve the proven
+  direct lowering path for ordinary switches that contain no such markers.
 - Lower array texture layer-count queries, including the Maxwell cube-face count to
   cube-layer conversion used by Mesa NIR.
 - Accept pipeline-specialized compute workgroup-size overrides and preserve their
@@ -57,7 +58,7 @@
 - Add typed diagnostics for parse, validation, specialization, unsupported-feature,
   backend, and DKSH errors.
 - Add deterministic unit and regression coverage for the compiler pipeline. The
-  captured Bevy corpus currently compiles 110 of 110 entry points.
+  captured Bevy corpus currently compiles 111 of 111 entry points.
 - Integrate the compiler into the Deko3D wgpu backend and validate runtime WGSL
   rendering in Ryujinx without game-specific DKSH overrides. Physical Switch
   execution remains an explicit release gate.

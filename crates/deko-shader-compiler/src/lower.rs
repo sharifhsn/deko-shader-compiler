@@ -7416,6 +7416,9 @@ impl<'function> FunctionLowerer<'function> {
                 "switch selector must be an integer scalar".to_owned(),
             ));
         }
+        if cases.iter().all(|case| !case.fall_through) {
+            return self.lower_simple_switch(&selector, cases);
+        }
         let false_value = || Value {
             components: vec![Src::new_imm_bool(false)],
             kind: naga::ScalarKind::Bool,
@@ -7463,6 +7466,57 @@ impl<'function> FunctionLowerer<'function> {
                 condition = self.boolean_or(&condition, &value_condition)?;
             }
             if let Some(value) = self.conditional(&condition, body, &empty)? {
+                return Ok(Some(value));
+            }
+        }
+        Ok(None)
+    }
+
+    fn lower_simple_switch(
+        &mut self,
+        selector: &Value,
+        cases: &[naga::SwitchCase],
+    ) -> Result<Option<Value>, Error> {
+        let mut matched = Value {
+            components: vec![Src::new_imm_bool(false)],
+            kind: naga::ScalarKind::Bool,
+        };
+        let empty = naga::Block::new();
+        let mut default = None;
+        for case in cases {
+            let literal = match case.value {
+                naga::SwitchValue::I32(value) => Value {
+                    components: vec![Src::from(value.cast_unsigned())],
+                    kind: naga::ScalarKind::Sint,
+                },
+                naga::SwitchValue::U32(value) => Value {
+                    components: vec![Src::from(value)],
+                    kind: naga::ScalarKind::Uint,
+                },
+                naga::SwitchValue::Default => {
+                    default = Some(&case.body);
+                    continue;
+                }
+            };
+            let condition = self.binary(naga::BinaryOperator::Equal, selector, &literal, None)?;
+            if let Some(value) = self.conditional(&condition, &case.body, &empty)? {
+                return Ok(Some(value));
+            }
+            let destination = self.target.ssa_alloc.alloc(RegFile::Pred);
+            self.emit(Instr::new(OpPSetP {
+                dsts: [Dst::from(destination), Dst::None],
+                ops: [PredSetOp::And, PredSetOp::Or],
+                srcs: [
+                    matched.components[0].clone(),
+                    true.into(),
+                    condition.components[0].clone(),
+                ],
+            }));
+            matched.components[0] = Src::from(destination);
+        }
+        if let Some(default) = default {
+            matched.components[0] = matched.components[0].clone().bnot();
+            if let Some(value) = self.conditional(&matched, default, &empty)? {
                 return Ok(Some(value));
             }
         }
