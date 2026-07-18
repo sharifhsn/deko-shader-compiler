@@ -1441,36 +1441,229 @@ impl<'function> FunctionLowerer<'function> {
         argument: naga::Handle<naga::Expression>,
         result: naga::Handle<naga::Expression>,
     ) -> Result<(), Error> {
-        let vote_op = match (op, collective_op) {
-            (naga::SubgroupOperation::All, naga::CollectiveOperation::Reduce) => VoteOp::All,
-            (naga::SubgroupOperation::Any, naga::CollectiveOperation::Reduce) => VoteOp::Any,
+        let argument = self.expression(argument)?;
+        if let Some(vote_op) = match (op, collective_op) {
+            (naga::SubgroupOperation::All, naga::CollectiveOperation::Reduce) => Some(VoteOp::All),
+            (naga::SubgroupOperation::Any, naga::CollectiveOperation::Reduce) => Some(VoteOp::Any),
+            _ => None,
+        } {
+            if argument.kind != naga::ScalarKind::Bool || argument.components.len() != 1 {
+                return Err(Error::UnsupportedFeature(
+                    "subgroup vote argument must be a scalar boolean".to_owned(),
+                ));
+            }
+            let vote = self.target.ssa_alloc.alloc(RegFile::Pred);
+            self.emit(Instr::new(OpVote {
+                op: vote_op,
+                ballot: Dst::None,
+                vote: Dst::from(vote),
+                pred: Src::from(Self::predicate(&argument.components[0])?),
+            }));
+            self.values.insert(
+                result,
+                Value {
+                    components: vec![Src::from(vote)],
+                    kind: naga::ScalarKind::Bool,
+                },
+            );
+            return Ok(());
+        }
+
+        if matches!(
+            op,
+            naga::SubgroupOperation::All | naga::SubgroupOperation::Any
+        ) {
+            return Err(Error::UnsupportedFeature(format!(
+                "subgroup collective {collective_op:?} {op:?}"
+            )));
+        }
+        if !matches!(
+            argument.kind,
+            naga::ScalarKind::Float | naga::ScalarKind::Sint | naga::ScalarKind::Uint
+        ) {
+            return Err(Error::UnsupportedFeature(format!(
+                "subgroup {op:?} for {:?}",
+                argument.kind
+            )));
+        }
+
+        let sources = self.materialize_loop_components(&argument)?;
+        let ballot = self.target.ssa_alloc.alloc(RegFile::GPR);
+        self.emit(Instr::new(OpVote {
+            op: VoteOp::Any,
+            ballot: Dst::from(ballot),
+            vote: Dst::None,
+            pred: Src::from(SrcRef::True),
+        }));
+        let ballot = Value {
+            components: vec![Src::from(ballot)],
+            kind: naga::ScalarKind::Uint,
+        };
+        let current_lane = if collective_op == naga::CollectiveOperation::Reduce {
+            None
+        } else {
+            Some(Value {
+                components: read_compute_system_value(self, &[0]),
+                kind: naga::ScalarKind::Uint,
+            })
+        };
+        let mut accumulator = Self::subgroup_identity(op, argument.kind, sources.len())?;
+        for lane in 0..32_u32 {
+            let include = self.subgroup_collective_include(
+                &ballot,
+                current_lane.as_ref(),
+                collective_op,
+                lane,
+            )?;
+            let mut components = Vec::with_capacity(sources.len());
+            for source in &sources {
+                let destination = self.target.ssa_alloc.alloc(RegFile::GPR);
+                self.emit(Instr::new(OpShfl {
+                    dst: Dst::from(destination),
+                    in_bounds: Dst::None,
+                    src: Src::from(*source),
+                    lane: Src::from(lane),
+                    c: Src::from(0x1f_u32),
+                    op: ShflOp::Idx,
+                }));
+                components.push(Src::from(destination));
+            }
+            let shuffled = Value {
+                components,
+                kind: argument.kind,
+            };
+            let combined = self.subgroup_combine(op, &accumulator, &shuffled)?;
+            accumulator = self.select(&include, combined, accumulator)?;
+        }
+        self.values.insert(result, accumulator);
+        Ok(())
+    }
+
+    fn subgroup_collective_include(
+        &mut self,
+        ballot: &Value,
+        current_lane: Option<&Value>,
+        collective_op: naga::CollectiveOperation,
+        lane: u32,
+    ) -> Result<Value, Error> {
+        let lane_value = Value {
+            components: vec![Src::from(lane)],
+            kind: naga::ScalarKind::Uint,
+        };
+        let shifted = self.binary(naga::BinaryOperator::ShiftRight, ballot, &lane_value, None)?;
+        let active = self.binary(
+            naga::BinaryOperator::And,
+            &shifted,
+            &Value {
+                components: vec![Src::from(1_u32)],
+                kind: naga::ScalarKind::Uint,
+            },
+            None,
+        )?;
+        let include = self.binary(
+            naga::BinaryOperator::NotEqual,
+            &active,
+            &Value {
+                components: vec![Src::ZERO],
+                kind: naga::ScalarKind::Uint,
+            },
+            None,
+        )?;
+        let Some(current_lane) = current_lane else {
+            return Ok(include);
+        };
+        let comparison = match collective_op {
+            naga::CollectiveOperation::InclusiveScan => naga::BinaryOperator::GreaterEqual,
+            naga::CollectiveOperation::ExclusiveScan => naga::BinaryOperator::Greater,
+            naga::CollectiveOperation::Reduce => unreachable!(),
+        };
+        let in_prefix = self.binary(comparison, current_lane, &lane_value, None)?;
+        Ok(Value {
+            components: vec![self.emit_predicate_binary(
+                PredSetOp::And,
+                include.components[0].clone(),
+                in_prefix.components[0].clone(),
+            )],
+            kind: naga::ScalarKind::Bool,
+        })
+    }
+
+    fn subgroup_identity(
+        op: naga::SubgroupOperation,
+        kind: naga::ScalarKind,
+        width: usize,
+    ) -> Result<Value, Error> {
+        let component = match (op, kind) {
+            (naga::SubgroupOperation::Add, naga::ScalarKind::Float) => Src::from(0.0_f32),
+            (
+                naga::SubgroupOperation::Add
+                | naga::SubgroupOperation::Or
+                | naga::SubgroupOperation::Xor,
+                naga::ScalarKind::Sint | naga::ScalarKind::Uint,
+            )
+            | (naga::SubgroupOperation::Max, naga::ScalarKind::Uint) => Src::ZERO,
+            (naga::SubgroupOperation::Mul, naga::ScalarKind::Float) => Src::from(1.0_f32),
+            (naga::SubgroupOperation::Mul, naga::ScalarKind::Sint | naga::ScalarKind::Uint) => {
+                Src::from(1_u32)
+            }
+            (naga::SubgroupOperation::Min, naga::ScalarKind::Float) => Src::from(f32::INFINITY),
+            (naga::SubgroupOperation::Max, naga::ScalarKind::Float) => Src::from(f32::NEG_INFINITY),
+            (naga::SubgroupOperation::Min, naga::ScalarKind::Sint) => {
+                Src::from(i32::MAX.cast_unsigned())
+            }
+            (naga::SubgroupOperation::Max, naga::ScalarKind::Sint) => {
+                Src::from(i32::MIN.cast_unsigned())
+            }
+            (naga::SubgroupOperation::Min, naga::ScalarKind::Uint) => Src::from(u32::MAX),
+            (naga::SubgroupOperation::And, naga::ScalarKind::Sint | naga::ScalarKind::Uint) => {
+                Src::from(u32::MAX)
+            }
             _ => {
                 return Err(Error::UnsupportedFeature(format!(
-                    "subgroup collective {collective_op:?} {op:?}"
+                    "subgroup {op:?} for {kind:?}"
                 )));
             }
         };
-        let argument = self.expression(argument)?;
-        if argument.kind != naga::ScalarKind::Bool || argument.components.len() != 1 {
-            return Err(Error::UnsupportedFeature(
-                "subgroup vote argument must be a scalar boolean".to_owned(),
-            ));
+        Ok(Value {
+            components: vec![component; width],
+            kind,
+        })
+    }
+
+    fn subgroup_combine(
+        &mut self,
+        op: naga::SubgroupOperation,
+        left: &Value,
+        right: &Value,
+    ) -> Result<Value, Error> {
+        match op {
+            naga::SubgroupOperation::Add => {
+                self.binary(naga::BinaryOperator::Add, left, right, None)
+            }
+            naga::SubgroupOperation::Mul => {
+                self.binary(naga::BinaryOperator::Multiply, left, right, None)
+            }
+            naga::SubgroupOperation::Min if left.kind == naga::ScalarKind::Float => {
+                self.float_minmax(left, right, true)
+            }
+            naga::SubgroupOperation::Max if left.kind == naga::ScalarKind::Float => {
+                self.float_minmax(left, right, false)
+            }
+            naga::SubgroupOperation::Min => self.integer_minmax(left, right, true),
+            naga::SubgroupOperation::Max => self.integer_minmax(left, right, false),
+            naga::SubgroupOperation::And => {
+                self.binary(naga::BinaryOperator::And, left, right, None)
+            }
+            naga::SubgroupOperation::Or => {
+                self.binary(naga::BinaryOperator::InclusiveOr, left, right, None)
+            }
+            naga::SubgroupOperation::Xor => {
+                self.binary(naga::BinaryOperator::ExclusiveOr, left, right, None)
+            }
+            naga::SubgroupOperation::All | naga::SubgroupOperation::Any => Err(
+                Error::UnsupportedFeature(format!("non-boolean subgroup {op:?}")),
+            ),
         }
-        let vote = self.target.ssa_alloc.alloc(RegFile::Pred);
-        self.emit(Instr::new(OpVote {
-            op: vote_op,
-            ballot: Dst::None,
-            vote: Dst::from(vote),
-            pred: Src::from(Self::predicate(&argument.components[0])?),
-        }));
-        self.values.insert(
-            result,
-            Value {
-                components: vec![Src::from(vote)],
-                kind: naga::ScalarKind::Bool,
-            },
-        );
-        Ok(())
     }
 
     fn subgroup_lane(&mut self, index: naga::Handle<naga::Expression>) -> Result<Src, Error> {

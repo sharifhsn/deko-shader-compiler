@@ -1860,6 +1860,95 @@ mod tests {
     }
 
     #[test]
+    fn subgroup_arithmetic_collectives_compile() {
+        let functions = [
+            "subgroupAdd(value)",
+            "subgroupMul(value)",
+            "subgroupMin(value)",
+            "subgroupMax(value)",
+            "subgroupAnd(value)",
+            "subgroupOr(value)",
+            "subgroupXor(value)",
+            "subgroupExclusiveAdd(value)",
+            "subgroupInclusiveAdd(value)",
+            "subgroupExclusiveMul(value)",
+            "subgroupInclusiveMul(value)",
+        ];
+        for function in functions {
+            let source = format!(
+                "@compute @workgroup_size(40) fn main(@builtin(local_invocation_index) lane: u32) {{ let value = lane + 1u; _ = {function}; }}"
+            );
+            let artifact = Compiler
+                .compile_wgsl(
+                    &source,
+                    Stage::Compute,
+                    "main",
+                    &PipelineConstants::new(),
+                    Options::default(),
+                )
+                .unwrap_or_else(|error| panic!("{function}: {error}"));
+            assert!(artifact.dksh.starts_with(b"DKSH"), "{function}");
+        }
+
+        for expression in [
+            "subgroupAdd(value)",
+            "subgroupMul(value)",
+            "subgroupMin(value)",
+            "subgroupMax(value)",
+            "subgroupExclusiveAdd(value)",
+            "subgroupInclusiveMul(value)",
+        ] {
+            let source = format!(
+                "@compute @workgroup_size(7) fn main(@builtin(local_invocation_index) lane: u32) {{ let value = f32(lane) + 1.0; _ = {expression}; }}"
+            );
+            Compiler
+                .compile_wgsl(
+                    &source,
+                    Stage::Compute,
+                    "main",
+                    &PipelineConstants::new(),
+                    Options::default(),
+                )
+                .unwrap_or_else(|error| panic!("{expression}: {error}"));
+        }
+
+        for expression in [
+            "subgroupAdd(vec2<u32>(lane + 1u, lane + 2u))",
+            "subgroupMin(vec4<f32>(f32(lane), 2.0, 3.0, 4.0))",
+            "subgroupInclusiveAdd(vec2<i32>(i32(lane), -1))",
+        ] {
+            let source = format!(
+                "@compute @workgroup_size(7) fn main(@builtin(local_invocation_index) lane: u32) {{ _ = {expression}; }}"
+            );
+            Compiler
+                .compile_wgsl(
+                    &source,
+                    Stage::Compute,
+                    "main",
+                    &PipelineConstants::new(),
+                    Options::default(),
+                )
+                .unwrap_or_else(|error| panic!("{expression}: {error}"));
+        }
+
+        let reduction_ir = lowered_ir(
+            "@compute @workgroup_size(7) fn main(@builtin(local_invocation_index) lane: u32) { _ = subgroupAdd(lane + 1u); }",
+            naga::ShaderStage::Compute,
+            "main",
+        );
+        assert!(reduction_ir.contains("vote.any"), "{reduction_ir}");
+        assert!(reduction_ir.contains("shfl.idx"), "{reduction_ir}");
+
+        let scan_ir = lowered_ir(
+            "@compute @workgroup_size(7) fn main(@builtin(local_invocation_index) lane: u32) { _ = subgroupExclusiveAdd(lane + 1u); }",
+            naga::ShaderStage::Compute,
+            "main",
+        );
+        assert!(scan_ir.contains("s2r"), "{scan_ir}");
+        assert!(scan_ir.contains("shfl.idx"), "{scan_ir}");
+    }
+
+    #[test]
     fn gradient_lowering_selects_native_and_rewritten_paths() {
         let two_dimensional = lowered_ir(
             r"

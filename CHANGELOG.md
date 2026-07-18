@@ -25,6 +25,9 @@
   built-ins from GM20B lane state and pipeline-specialized workgroup geometry.
 - Lower boolean subgroup all/any reductions and subgroup ballots directly through
   Maxwell vote instructions, preserving active-lane semantics.
+- Lower arithmetic and bitwise subgroup reductions plus add/multiply inclusive and
+  exclusive scans for scalar and vector operands. Active ballots preserve partial-warp
+  and divergent-lane semantics instead of reading inactive shuffle lanes.
 - Lower array texture layer-count queries, including the Maxwell cube-face count to
   cube-layer conversion used by Mesa NIR.
 - Accept pipeline-specialized compute workgroup-size overrides and preserve their

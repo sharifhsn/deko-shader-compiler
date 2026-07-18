@@ -14,7 +14,9 @@ read/write storage buffers with static or dynamically indexed host-shareable dat
 workgroup atomics, barriers, workgroup memory, and runtime storage-array lengths. Unsupported
 features return a typed error instead of silently changing shader semantics.
 Subgroup support includes barriers, gathers, invocation and geometry built-ins, boolean
-all/any reductions, and ballots with native Maxwell active-lane behavior.
+all/any reductions, ballots, arithmetic and bitwise reductions, and add/multiply scans.
+Collectives use an active-lane ballot so partial and sparse GM20B warps do not contribute
+undefined shuffle values.
 Native Maxwell TXD lowering supports explicit WGSL gradients for 1D/2D sampled textures,
 including array layers and constant offsets. 3D and cube gradients use Mesa's mathematically
 equivalent derivative-to-LOD rewrite before the ordinary Maxwell texture instruction.
