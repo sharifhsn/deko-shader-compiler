@@ -24,7 +24,8 @@ image, atomic, and discard side effects while pure calculations remain safely if
 Nested value and void returns remove completed lanes from later side effects.
 Returns taken from inside loops also remove those lanes from effects after the loop.
 Terminal unconditional loop controls preserve values written before `break` and route
-`continue` through the WGSL continuing block.
+`continue` through the WGSL continuing block. Ordinary conditional loop exits retain the
+established loop-header value path.
 Pointer arguments preserve per-invocation writes across divergent void and value helpers.
 WGSL switch cases with multiple selectors lower to one shared conditional body while ordinary
 switches retain their direct lowering path.

@@ -6795,6 +6795,7 @@ impl<'function> FunctionLowerer<'function> {
         });
         let break_prefix = Self::break_prefix(body);
         let continue_prefix = Self::continue_prefix(body);
+        let merge_exit_locals = break_prefix.is_some();
         let executable_body = break_prefix
             .as_ref()
             .or(continue_prefix.as_ref())
@@ -6887,8 +6888,15 @@ impl<'function> FunctionLowerer<'function> {
             self.add_edge(edge.block, exit);
         }
         self.current_block = exit;
-        self.merge_break_locals(&context, exit)?;
-        self.merge_loop_returns(&context)?;
+        if merge_exit_locals {
+            self.merge_break_locals(&context, exit)?;
+            self.merge_loop_returns(&context)?;
+        } else {
+            self.merge_loop_returns(&context)?;
+            for phi in loop_phis {
+                self.locals.insert(phi.local, phi.header_value);
+            }
+        }
         Ok(())
     }
 

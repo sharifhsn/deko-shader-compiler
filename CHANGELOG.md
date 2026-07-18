@@ -41,6 +41,8 @@
 - Lower terminal unconditional loop `break` and `continue` statements, merge loop-carried
   locals from every break edge, and correctly remap CFG edges when unreachable blocks are
   removed.
+- Preserve the proven loop-header value path for ordinary conditional loop exits; exit-edge
+  phi merging is restricted to terminal unconditional breaks that require post-body values.
 - Snapshot and merge pointer arguments across divergent helper-function arms, and write
   updated pointer values back from both void and value-returning calls.
 - Lower WGSL atomic operations on `r32uint` and `r32sint` storage textures to native
