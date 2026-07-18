@@ -28,6 +28,10 @@
 - Lower arithmetic and bitwise subgroup reductions plus add/multiply inclusive and
   exclusive scans for scalar and vector operands. Active ballots preserve partial-warp
   and divergent-lane semantics instead of reading inactive shuffle lanes.
+- Lower `workgroupUniformLoad` for scalar, atomic, and aggregate workgroup pointers
+  with the required workgroup barrier-load-barrier sequence.
+- Predicate instructions emitted by divergent `if` arms, so storage, workgroup, image,
+  and atomic side effects occur only in the invocations that selected that arm.
 - Lower array texture layer-count queries, including the Maxwell cube-face count to
   cube-layer conversion used by Mesa NIR.
 - Accept pipeline-specialized compute workgroup-size overrides and preserve their

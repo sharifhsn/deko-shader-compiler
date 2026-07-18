@@ -17,6 +17,9 @@ Subgroup support includes barriers, gathers, invocation and geometry built-ins, 
 all/any reductions, ballots, arithmetic and bitwise reductions, and add/multiply scans.
 Collectives use an active-lane ballot so partial and sparse GM20B warps do not contribute
 undefined shuffle values.
+`workgroupUniformLoad` supports constructible and atomic workgroup values with two
+workgroup synchronization points. Divergent structured branches predicate their emitted
+instructions, including memory and image side effects.
 Native Maxwell TXD lowering supports explicit WGSL gradients for 1D/2D sampled textures,
 including array layers and constant offsets. 3D and cube gradients use Mesa's mathematically
 equivalent derivative-to-LOD rewrite before the ordinary Maxwell texture instruction.

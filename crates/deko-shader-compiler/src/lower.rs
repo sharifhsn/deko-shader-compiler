@@ -742,6 +742,7 @@ struct FunctionLowerer<'function> {
     blocks: Vec<BasicBlock>,
     edges: Vec<(usize, usize)>,
     current_block: usize,
+    execution_predicate: Pred,
     labels: LabelAllocator,
     loops: Vec<LoopContext>,
     loop_base_depth: usize,
@@ -773,6 +774,7 @@ impl<'function> FunctionLowerer<'function> {
             blocks: vec![entry],
             edges: Vec::new(),
             current_block: 0,
+            execution_predicate: true.into(),
             labels,
             loops: Vec::new(),
             loop_base_depth: 0,
@@ -784,8 +786,32 @@ impl<'function> FunctionLowerer<'function> {
         }
     }
 
-    fn emit(&mut self, instruction: Instr) {
+    fn emit(&mut self, mut instruction: Instr) {
+        if !self.execution_predicate.is_true() {
+            instruction.pred = self.combine_predicates(self.execution_predicate, instruction.pred);
+        }
         self.blocks[self.current_block].instrs.push(instruction);
+    }
+
+    fn combine_predicates(&mut self, left: Pred, right: Pred) -> Pred {
+        if left.is_false() || right.is_false() {
+            return false.into();
+        }
+        if left.is_true() {
+            return right;
+        }
+        if right.is_true() {
+            return left;
+        }
+        let destination = self.target.ssa_alloc.alloc(RegFile::Pred);
+        self.blocks[self.current_block]
+            .instrs
+            .push(Instr::new(OpPSetP {
+                dsts: [Dst::from(destination), Dst::None],
+                ops: [PredSetOp::And, PredSetOp::And],
+                srcs: [Src::from(left), true.into(), Src::from(right)],
+            }));
+        Pred::from(destination)
     }
 
     fn allocate_label(&mut self) -> Label {
@@ -7014,6 +7040,23 @@ impl<'function> FunctionLowerer<'function> {
                     };
                     self.emit(Instr::new(OpMemBar { scope }));
                 }
+                naga::Statement::WorkGroupUniformLoad { pointer, result } => {
+                    if !self.pointer_is_workgroup(*pointer) {
+                        return Err(Error::UnsupportedFeature(
+                            "workgroup uniform load requires a workgroup pointer".to_owned(),
+                        ));
+                    }
+                    self.emit(Instr::new(OpMemBar {
+                        scope: MemScope::CTA,
+                    }));
+                    self.emit(Instr::new(OpBar {}));
+                    let value = self.load_workgroup(*pointer)?;
+                    self.emit(Instr::new(OpMemBar {
+                        scope: MemScope::CTA,
+                    }));
+                    self.emit(Instr::new(OpBar {}));
+                    self.values.insert(*result, value);
+                }
                 naga::Statement::ImageStore {
                     image,
                     coordinate,
@@ -7202,12 +7245,18 @@ impl<'function> FunctionLowerer<'function> {
         for handle in &local_handles {
             self.local_value(*handle)?;
         }
+        let parent_predicate = self.execution_predicate;
+        let condition_predicate = Self::predicate(&condition.components[0])?;
         let locals = self.locals.clone();
+        self.execution_predicate = self.combine_predicates(parent_predicate, condition_predicate);
         let accepted = self.execute_statements(accept)?;
         let accepted_locals = self.locals.clone();
         self.locals.clone_from(&locals);
+        self.execution_predicate =
+            self.combine_predicates(parent_predicate, condition_predicate.bnot());
         let rejected = self.execute_statements(reject)?;
         let rejected_locals = self.locals.clone();
+        self.execution_predicate = parent_predicate;
         match (accepted, rejected) {
             (Some(accepted), Some(rejected)) => {
                 Ok(Some(self.select(condition, accepted, rejected)?))
@@ -7336,6 +7385,7 @@ impl<'function> FunctionLowerer<'function> {
             blocks: std::mem::take(&mut self.blocks),
             edges: std::mem::take(&mut self.edges),
             current_block: self.current_block,
+            execution_predicate: self.execution_predicate,
             labels: std::mem::replace(&mut self.labels, LabelAllocator::new()),
             loops: std::mem::take(&mut self.loops),
             loop_base_depth,
@@ -7377,6 +7427,7 @@ impl<'function> FunctionLowerer<'function> {
             blocks: std::mem::take(&mut self.blocks),
             edges: std::mem::take(&mut self.edges),
             current_block: self.current_block,
+            execution_predicate: self.execution_predicate,
             labels: std::mem::replace(&mut self.labels, LabelAllocator::new()),
             loops: std::mem::take(&mut self.loops),
             loop_base_depth,

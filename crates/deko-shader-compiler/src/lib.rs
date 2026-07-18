@@ -1949,6 +1949,73 @@ mod tests {
     }
 
     #[test]
+    fn workgroup_uniform_load_compiles() {
+        let source = r"
+            struct Pair { first: u32, second: vec2<u32> }
+            var<workgroup> wg_value: Pair;
+            var<workgroup> atomic_value: atomic<u32>;
+
+            @compute @workgroup_size(4)
+            fn main(@builtin(local_invocation_index) lane: u32) {
+                if lane == 0u {
+                    wg_value.first = 42u;
+                    wg_value.second = vec2<u32>(7u, 9u);
+                    atomicStore(&atomic_value, 11u);
+                }
+                let pair = workgroupUniformLoad(&wg_value);
+                let atomic_result = workgroupUniformLoad(&atomic_value);
+                _ = pair.first + pair.second.x + atomic_result;
+            }
+        ";
+        let artifact = Compiler
+            .compile_wgsl(
+                source,
+                Stage::Compute,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap();
+        assert!(artifact.dksh.starts_with(b"DKSH"));
+
+        let ir = lowered_ir(source, naga::ShaderStage::Compute, "main");
+        assert!(ir.matches("bar.sync").count() >= 4, "{ir}");
+        assert!(ir.matches("membar").count() >= 4, "{ir}");
+        assert!(ir.contains("ld.shared"), "{ir}");
+        assert!(
+            ir.lines()
+                .filter(|line| line.contains("st.shared"))
+                .all(|line| line.contains('@')),
+            "{ir}"
+        );
+    }
+
+    #[test]
+    fn conditional_side_effects_are_predicated() {
+        let source = r"
+            struct Output { value: u32 }
+            @group(0) @binding(0) var<storage, read_write> output: Output;
+
+            @compute @workgroup_size(4)
+            fn main(@builtin(local_invocation_index) lane: u32) {
+                if lane == 0u {
+                    output.value = 1u;
+                } else {
+                    output.value = 2u;
+                }
+            }
+        ";
+        let ir = lowered_ir(source, naga::ShaderStage::Compute, "main");
+        let stores = ir
+            .lines()
+            .filter(|line| line.contains("st.global"))
+            .collect::<Vec<_>>();
+        assert_eq!(stores.len(), 2, "{ir}");
+        assert!(stores.iter().all(|line| line.contains('@')), "{ir}");
+        assert!(stores.iter().any(|line| line.contains('!')), "{ir}");
+    }
+
+    #[test]
     fn gradient_lowering_selects_native_and_rewritten_paths() {
         let two_dimensional = lowered_ir(
             r"
