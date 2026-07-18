@@ -38,6 +38,8 @@
   so lanes that have returned cannot execute later side effects.
 - Snapshot and merge pointer arguments across divergent helper-function arms, and write
   updated pointer values back from both void and value-returning calls.
+- Group WGSL multi-selector switch markers into a shared predicate and body while
+  continuing to reject non-empty source-IR fall-through cases.
 - Lower array texture layer-count queries, including the Maxwell cube-face count to
   cube-layer conversion used by Mesa NIR.
 - Accept pipeline-specialized compute workgroup-size overrides and preserve their

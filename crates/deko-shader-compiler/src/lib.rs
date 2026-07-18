@@ -1385,6 +1385,43 @@ mod tests {
     }
 
     #[test]
+    fn multi_selector_switch_cases_compile() {
+        let source = r"
+            @group(0) @binding(0) var<storage, read_write> output: array<u32>;
+
+            @compute @workgroup_size(4)
+            fn main(@builtin(local_invocation_index) lane: u32) {
+                switch lane {
+                    case 0u, 1u: {
+                        output[lane] = 10u;
+                    }
+                    default: {
+                        output[lane] = 20u;
+                    }
+                }
+            }
+        ";
+        let artifact = Compiler
+            .compile_wgsl(
+                source,
+                Stage::Compute,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap();
+        assert!(artifact.dksh.starts_with(b"DKSH"));
+
+        let ir = lowered_ir(source, naga::ShaderStage::Compute, "main");
+        let stores = ir
+            .lines()
+            .filter(|line| line.contains("st.global"))
+            .collect::<Vec<_>>();
+        assert_eq!(stores.len(), 2, "{ir}");
+        assert!(stores.iter().all(|line| line.contains('@')), "{ir}");
+    }
+
+    #[test]
     fn bevy_style_dynamic_uniform_vertex_features_compile() {
         let source = r"
             struct Mesh { world_from_local: mat3x4<f32> }

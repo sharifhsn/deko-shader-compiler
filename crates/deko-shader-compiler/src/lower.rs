@@ -7416,55 +7416,98 @@ impl<'function> FunctionLowerer<'function> {
                 "switch selector must be an integer scalar".to_owned(),
             ));
         }
-        if cases.iter().any(|case| case.fall_through) {
-            return Err(Error::UnsupportedFeature(
-                "fall-through switch case".to_owned(),
-            ));
-        }
-        let mut matched = Value {
+        let false_value = || Value {
             components: vec![Src::new_imm_bool(false)],
             kind: naga::ScalarKind::Bool,
         };
-        let empty = naga::Block::new();
-        let mut default = None;
+        let mut groups = Vec::new();
+        let mut group_values = Vec::new();
         for case in cases {
-            let literal = match case.value {
-                naga::SwitchValue::I32(value) => Value {
-                    components: vec![Src::from(value.cast_unsigned())],
-                    kind: naga::ScalarKind::Sint,
-                },
-                naga::SwitchValue::U32(value) => Value {
-                    components: vec![Src::from(value)],
-                    kind: naga::ScalarKind::Uint,
-                },
-                naga::SwitchValue::Default => {
-                    default = Some(&case.body);
-                    continue;
+            group_values.push(case.value);
+            if case.fall_through {
+                if !case.body.is_empty() {
+                    return Err(Error::UnsupportedFeature(
+                        "non-empty fall-through switch case".to_owned(),
+                    ));
                 }
-            };
-            let condition = self.binary(naga::BinaryOperator::Equal, &selector, &literal, None)?;
-            if let Some(value) = self.conditional(&condition, &case.body, &empty)? {
-                return Ok(Some(value));
+            } else {
+                groups.push((std::mem::take(&mut group_values), &case.body));
             }
-            let dst = self.target.ssa_alloc.alloc(RegFile::Pred);
-            self.emit(Instr::new(OpPSetP {
-                dsts: [Dst::from(dst), Dst::None],
-                ops: [PredSetOp::And, PredSetOp::Or],
-                srcs: [
-                    matched.components[0].clone(),
-                    true.into(),
-                    condition.components[0].clone(),
-                ],
-            }));
-            matched.components[0] = Src::from(dst);
         }
-        if let Some(default) = default {
-            matched.components[0] = matched.components[0].clone().bnot();
-            if let Some(value) = self.conditional(&matched, default, &empty)? {
+        if !group_values.is_empty() {
+            return Err(Error::UnsupportedFeature(
+                "trailing fall-through switch case".to_owned(),
+            ));
+        }
+
+        let mut matched = false_value();
+        for value in cases.iter().filter_map(|case| match case.value {
+            naga::SwitchValue::Default => None,
+            value => Some(value),
+        }) {
+            let condition = self.switch_value_condition(&selector, value)?;
+            matched = self.boolean_or(&matched, &condition)?;
+        }
+        let default_condition = Value {
+            components: vec![matched.components[0].clone().bnot()],
+            kind: naga::ScalarKind::Bool,
+        };
+        let empty = naga::Block::new();
+        for (values, body) in groups {
+            let mut condition = false_value();
+            for value in values {
+                let value_condition = match value {
+                    naga::SwitchValue::Default => default_condition.clone(),
+                    value => self.switch_value_condition(&selector, value)?,
+                };
+                condition = self.boolean_or(&condition, &value_condition)?;
+            }
+            if let Some(value) = self.conditional(&condition, body, &empty)? {
                 return Ok(Some(value));
             }
         }
         Ok(None)
+    }
+
+    fn boolean_or(&mut self, left: &Value, right: &Value) -> Result<Value, Error> {
+        if left.kind != naga::ScalarKind::Bool
+            || right.kind != naga::ScalarKind::Bool
+            || left.components.len() != 1
+            || right.components.len() != 1
+        {
+            return Err(Error::UnsupportedFeature(
+                "logical OR requires scalar booleans".to_owned(),
+            ));
+        }
+        let left = Self::predicate(&left.components[0])?;
+        let right = Self::predicate(&right.components[0])?;
+        Ok(Value {
+            components: vec![Src::from(self.combine_predicates_or(left, right))],
+            kind: naga::ScalarKind::Bool,
+        })
+    }
+
+    fn switch_value_condition(
+        &mut self,
+        selector: &Value,
+        value: naga::SwitchValue,
+    ) -> Result<Value, Error> {
+        let literal = match value {
+            naga::SwitchValue::I32(value) => Value {
+                components: vec![Src::from(value.cast_unsigned())],
+                kind: naga::ScalarKind::Sint,
+            },
+            naga::SwitchValue::U32(value) => Value {
+                components: vec![Src::from(value)],
+                kind: naga::ScalarKind::Uint,
+            },
+            naga::SwitchValue::Default => {
+                return Err(Error::UnsupportedFeature(
+                    "default switch value used as a literal".to_owned(),
+                ));
+            }
+        };
+        self.binary(naga::BinaryOperator::Equal, selector, &literal, None)
     }
 
     fn finalize_return(&mut self, mut value: Value) -> Result<Value, Error> {
