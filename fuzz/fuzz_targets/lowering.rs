@@ -32,18 +32,19 @@ fuzz_target!(|bytes: &[u8]| {
             4 => "@group(0) @binding(0) var image: texture_cube_array<f32>; @fragment fn main() -> @location(0) vec4<f32> { return vec4<f32>(f32(textureNumLayers(image))); }".to_owned(),
             _ => "@fragment fn main(@builtin(view_index) view: u32) -> @location(0) vec4<f32> { return vec4<f32>(f32(view)); }".to_owned(),
         },
-        Stage::Compute if bytes[2] % 10 == 0 => format!(
+        Stage::Compute if bytes[2] % 11 == 0 => format!(
             "@compute @workgroup_size(1) fn main(@builtin(global_invocation_id) id: vec3<u32>) {{ let left = id.x ^ {left}u; let right = id.x ^ {right}u; let value = left {operation} right; _ = value; }}"
         ),
-        Stage::Compute if bytes[2] % 10 == 1 =>
+        Stage::Compute if bytes[2] % 11 == 1 =>
             "@compute @workgroup_size(32) fn main() { subgroupBarrier(); }".to_owned(),
-        Stage::Compute if bytes[2] % 10 == 2 => "@compute @workgroup_size(32) fn main(@builtin(local_invocation_index) lane: u32) { _ = subgroupBroadcastFirst(lane); }".to_owned(),
-        Stage::Compute if bytes[2] % 10 == 3 => "@compute @workgroup_size(40) fn main(@builtin(subgroup_invocation_id) lane: u32, @builtin(subgroup_size) size: u32, @builtin(subgroup_id) subgroup: u32, @builtin(num_subgroups) count: u32) { _ = lane + size + subgroup + count; }".to_owned(),
-        Stage::Compute if bytes[2] % 10 == 4 => "@compute @workgroup_size(32) fn main(@builtin(local_invocation_index) lane: u32) { let predicate = lane < 16u; _ = subgroupAll(predicate); _ = subgroupAny(predicate); _ = subgroupBallot(predicate); }".to_owned(),
-        Stage::Compute if bytes[2] % 10 == 5 => "@compute @workgroup_size(7) fn main(@builtin(local_invocation_index) lane: u32) { let value = lane + 1u; _ = subgroupAdd(value); _ = subgroupXor(value); _ = subgroupExclusiveAdd(value); _ = subgroupInclusiveMul(value); }".to_owned(),
-        Stage::Compute if bytes[2] % 10 == 6 => "@group(0) @binding(0) var<storage, read_write> output: array<u32>; @compute @workgroup_size(4) fn main(@builtin(local_invocation_index) lane: u32) { if lane == 0u { return; } output[lane] = 7u; }".to_owned(),
-        Stage::Compute if bytes[2] % 10 == 7 => "@group(0) @binding(0) var<storage, read_write> output: array<u32>; fn choose(destination: ptr<function, u32>, lane: u32) -> u32 { if lane == 0u { *destination = 11u; return 1u; } *destination = 22u; return 2u; } @compute @workgroup_size(4) fn main(@builtin(local_invocation_index) lane: u32) { var value = 0u; output[lane] = value + choose(&value, lane); }".to_owned(),
-        Stage::Compute if bytes[2] % 10 == 8 => "@group(0) @binding(0) var<storage, read_write> output: array<u32>; @compute @workgroup_size(4) fn main(@builtin(local_invocation_index) lane: u32) { switch lane { case 0u, 1u: { output[lane] = 10u; } default: { output[lane] = 20u; } } }".to_owned(),
+        Stage::Compute if bytes[2] % 11 == 2 => "@compute @workgroup_size(32) fn main(@builtin(local_invocation_index) lane: u32) { _ = subgroupBroadcastFirst(lane); }".to_owned(),
+        Stage::Compute if bytes[2] % 11 == 3 => "@compute @workgroup_size(40) fn main(@builtin(subgroup_invocation_id) lane: u32, @builtin(subgroup_size) size: u32, @builtin(subgroup_id) subgroup: u32, @builtin(num_subgroups) count: u32) { _ = lane + size + subgroup + count; }".to_owned(),
+        Stage::Compute if bytes[2] % 11 == 4 => "@compute @workgroup_size(32) fn main(@builtin(local_invocation_index) lane: u32) { let predicate = lane < 16u; _ = subgroupAll(predicate); _ = subgroupAny(predicate); _ = subgroupBallot(predicate); }".to_owned(),
+        Stage::Compute if bytes[2] % 11 == 5 => "@compute @workgroup_size(7) fn main(@builtin(local_invocation_index) lane: u32) { let value = lane + 1u; _ = subgroupAdd(value); _ = subgroupXor(value); _ = subgroupExclusiveAdd(value); _ = subgroupInclusiveMul(value); }".to_owned(),
+        Stage::Compute if bytes[2] % 11 == 6 => "@group(0) @binding(0) var<storage, read_write> output: array<u32>; @compute @workgroup_size(4) fn main(@builtin(local_invocation_index) lane: u32) { if lane == 0u { return; } output[lane] = 7u; }".to_owned(),
+        Stage::Compute if bytes[2] % 11 == 7 => "@group(0) @binding(0) var<storage, read_write> output: array<u32>; fn choose(destination: ptr<function, u32>, lane: u32) -> u32 { if lane == 0u { *destination = 11u; return 1u; } *destination = 22u; return 2u; } @compute @workgroup_size(4) fn main(@builtin(local_invocation_index) lane: u32) { var value = 0u; output[lane] = value + choose(&value, lane); }".to_owned(),
+        Stage::Compute if bytes[2] % 11 == 8 => "@group(0) @binding(0) var<storage, read_write> output: array<u32>; @compute @workgroup_size(4) fn main(@builtin(local_invocation_index) lane: u32) { switch lane { case 0u, 1u: { output[lane] = 10u; } default: { output[lane] = 20u; } } }".to_owned(),
+        Stage::Compute if bytes[2] % 11 == 9 => "@group(0) @binding(0) var image: texture_storage_2d<r32uint, atomic>; @compute @workgroup_size(4) fn main(@builtin(local_invocation_index) lane: u32) { textureAtomicAdd(image, vec2<i32>(i32(lane), 0), 1u); }".to_owned(),
         Stage::Compute => "var<workgroup> value: u32; @compute @workgroup_size(4) fn main(@builtin(local_invocation_index) lane: u32) { if lane == 0u { value = 42u; } _ = workgroupUniformLoad(&value); }".to_owned(),
     };
     Compiler

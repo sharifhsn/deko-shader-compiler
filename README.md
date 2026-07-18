@@ -10,8 +10,9 @@ and packages the resulting GM20B machine code as DKSH. The host suite covers rep
 Bevy UI, mesh, PBR, image-processing, and compute shader families; the application-level
 Ryujinx probe currently exercises 29 distinct runtime-compiled artifacts. Compute shaders
 support the core invocation built-ins,
-read/write storage buffers with static or dynamically indexed host-shareable data, storage and
-workgroup atomics, barriers, workgroup memory, and runtime storage-array lengths. Unsupported
+read/write storage buffers with static or dynamically indexed host-shareable data, storage-buffer,
+storage-texture, and workgroup atomics, barriers, workgroup memory, and runtime storage-array
+lengths. Unsupported
 features return a typed error instead of silently changing shader semantics.
 Subgroup support includes barriers, gathers, invocation and geometry built-ins, boolean
 all/any reductions, ballots, arithmetic and bitwise reductions, and add/multiply scans.
@@ -22,7 +23,8 @@ workgroup synchronization points. Divergent structured branches predicate their 
 image, atomic, and discard side effects while pure calculations remain safely if-converted.
 Nested value and void returns remove completed lanes from later side effects.
 Pointer arguments preserve per-invocation writes across divergent void and value helpers.
-WGSL switch cases with multiple selectors lower to one shared conditional body.
+WGSL switch cases with multiple selectors lower to one shared conditional body while ordinary
+switches retain their direct lowering path.
 Native Maxwell TXD lowering supports explicit WGSL gradients for 1D/2D sampled textures,
 including array layers and constant offsets. 3D and cube gradients use Mesa's mathematically
 equivalent derivative-to-LOD rewrite before the ordinary Maxwell texture instruction.

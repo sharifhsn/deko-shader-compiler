@@ -38,6 +38,8 @@
   so lanes that have returned cannot execute later side effects.
 - Snapshot and merge pointer arguments across divergent helper-function arms, and write
   updated pointer values back from both void and value-returning calls.
+- Lower WGSL atomic operations on `r32uint` and `r32sint` storage textures to native
+  Maxwell `SUATOM` instructions.
 - Group WGSL multi-selector switch markers into a shared predicate and body while
   continuing to reject non-empty source-IR fall-through cases. Preserve the proven
   direct lowering path for ordinary switches that contain no such markers.

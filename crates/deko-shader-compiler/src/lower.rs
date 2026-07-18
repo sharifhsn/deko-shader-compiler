@@ -6,11 +6,11 @@ use deko_nak::ir::{
     OffsetStride, Op, OpALd, OpASt, OpAtom, OpBar, OpBfe, OpBrk, OpCont, OpExit, OpF2I, OpFAdd,
     OpFMnMx, OpFMul, OpFSetP, OpFSwzAdd, OpFlo, OpI2F, OpIAdd2, OpIAdd2X, OpIMad, OpIMnMx, OpIMul,
     OpISetP, OpIpa, OpKill, OpLd, OpLdc, OpLop2, OpMemBar, OpMov, OpMuFu, OpPBk, OpPCnt, OpPSetP,
-    OpPhiDsts, OpPhiSrcs, OpPrmt, OpRegOut, OpS2R, OpSel, OpShfl, OpShl, OpShr, OpSt, OpSuLd,
-    OpSuSt, OpTex, OpTld, OpTld4, OpTxd, OpTxq, OpVote, Phi, Pred, PredRef, PredSetOp, PrmtMode,
-    RegFile, SSARef, SSAValue, Shader, ShaderInfo, ShaderIoInfo, ShaderModelInfo, ShaderStageInfo,
-    ShflOp, Src, SrcMod, SrcRef, SrcSwizzle, TexDerivMode, TexDim, TexLodMode, TexOffsetMode,
-    TexQuery, TexRef, VoteOp,
+    OpPhiDsts, OpPhiSrcs, OpPrmt, OpRegOut, OpS2R, OpSel, OpShfl, OpShl, OpShr, OpSt, OpSuAtom,
+    OpSuLd, OpSuSt, OpTex, OpTld, OpTld4, OpTxd, OpTxq, OpVote, Phi, Pred, PredRef, PredSetOp,
+    PrmtMode, RegFile, SSARef, SSAValue, Shader, ShaderInfo, ShaderIoInfo, ShaderModelInfo,
+    ShaderStageInfo, ShflOp, Src, SrcMod, SrcRef, SrcSwizzle, TexDerivMode, TexDim, TexLodMode,
+    TexOffsetMode, TexQuery, TexRef, VoteOp,
 };
 use deko_nak::sph::PixelImap;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
@@ -1389,6 +1389,118 @@ impl<'function> FunctionLowerer<'function> {
             data: Src::from(data),
         }));
         Ok(())
+    }
+
+    fn image_atomic(
+        &mut self,
+        image: naga::Handle<naga::Expression>,
+        coordinate: naga::Handle<naga::Expression>,
+        array_index: Option<naga::Handle<naga::Expression>>,
+        fun: naga::AtomicFunction,
+        value: naga::Handle<naga::Expression>,
+    ) -> Result<(), Error> {
+        let image = self.global_expression(image, "texture atomic")?;
+        let target = *self.resources.storage_textures.get(&image).ok_or_else(|| {
+            Error::UnsupportedFeature("atomic texture has no Deko target".to_owned())
+        })?;
+        let variable = &self.module.global_variables[image];
+        let naga::TypeInner::Image {
+            dim,
+            arrayed,
+            class: naga::ImageClass::Storage { access, format },
+        } = self.module.types[variable.ty].inner
+        else {
+            return Err(Error::UnsupportedFeature(
+                "texture atomic resource is not a storage image".to_owned(),
+            ));
+        };
+        if !access.contains(naga::StorageAccess::ATOMIC) {
+            return Err(Error::UnsupportedFeature(
+                "texture atomic on a non-atomic image".to_owned(),
+            ));
+        }
+        let (atom_type, kind) = match format {
+            naga::StorageFormat::R32Uint => (AtomType::U32, naga::ScalarKind::Uint),
+            naga::StorageFormat::R32Sint => (AtomType::I32, naga::ScalarKind::Sint),
+            other => {
+                return Err(Error::UnsupportedFeature(format!(
+                    "texture atomic format {other:?}"
+                )));
+            }
+        };
+        let (image_dim, coordinate_components) = match (dim, arrayed) {
+            (naga::ImageDimension::D1, false) => (ImageDim::_1D, 1),
+            (naga::ImageDimension::D1, true) => (ImageDim::_1DArray, 1),
+            (naga::ImageDimension::D2, false) => (ImageDim::_2D, 2),
+            (naga::ImageDimension::D2, true) => (ImageDim::_2DArray, 2),
+            (naga::ImageDimension::D3, false) => (ImageDim::_3D, 3),
+            (naga::ImageDimension::D3, true) => {
+                return Err(Error::UnsupportedFeature(
+                    "arrayed 3D atomic texture".to_owned(),
+                ));
+            }
+            (naga::ImageDimension::Cube, _) => {
+                return Err(Error::UnsupportedFeature("cube atomic texture".to_owned()));
+            }
+        };
+        let mut coordinate = self.expression(coordinate)?;
+        if coordinate.kind != naga::ScalarKind::Sint
+            || coordinate.components.len() != coordinate_components
+            || arrayed != array_index.is_some()
+        {
+            return Err(Error::UnsupportedFeature(
+                "texture atomic coordinate shape mismatch".to_owned(),
+            ));
+        }
+        if let Some(array_index) = array_index {
+            let array_index = self.expression(array_index)?;
+            if array_index.kind != naga::ScalarKind::Sint || array_index.components.len() != 1 {
+                return Err(Error::UnsupportedFeature(
+                    "texture atomic array index must be a signed integer scalar".to_owned(),
+                ));
+            }
+            coordinate.components.extend(array_index.components);
+        }
+        let value = self.expression(value)?;
+        if value.kind != kind || value.components.len() != 1 {
+            return Err(Error::UnsupportedFeature(
+                "texture atomic value type mismatch".to_owned(),
+            ));
+        }
+        let atom_op = Self::image_atomic_operation(fun)?;
+        let coordinate = self.materialize(coordinate)?;
+        let data = self.materialize(value)?;
+        let handle = self.materialize(Value {
+            components: vec![Src::from(u32::from(target))],
+            kind: naga::ScalarKind::Uint,
+        })?;
+        self.emit(Instr::new(OpSuAtom {
+            dst: Dst::None,
+            fault: Dst::None,
+            image_dim,
+            atom_op,
+            atom_type,
+            mem_order: MemOrder::Strong(MemScope::GPU),
+            mem_eviction_priority: MemEvictionPriority::Normal,
+            handle: Src::from(handle),
+            coord: Src::from(coordinate),
+            data: Src::from(data),
+        }));
+        Ok(())
+    }
+
+    fn image_atomic_operation(fun: naga::AtomicFunction) -> Result<AtomOp, Error> {
+        match fun {
+            naga::AtomicFunction::Add => Ok(AtomOp::Add),
+            naga::AtomicFunction::And => Ok(AtomOp::And),
+            naga::AtomicFunction::ExclusiveOr => Ok(AtomOp::Xor),
+            naga::AtomicFunction::InclusiveOr => Ok(AtomOp::Or),
+            naga::AtomicFunction::Min => Ok(AtomOp::Min),
+            naga::AtomicFunction::Max => Ok(AtomOp::Max),
+            other => Err(Error::UnsupportedFeature(format!(
+                "texture atomic operation {other:?}"
+            ))),
+        }
     }
 
     fn subgroup_gather(
@@ -7101,6 +7213,13 @@ impl<'function> FunctionLowerer<'function> {
                     array_index,
                     value,
                 } => self.image_store(*image, *coordinate, *array_index, *value)?,
+                naga::Statement::ImageAtomic {
+                    image,
+                    coordinate,
+                    array_index,
+                    fun,
+                    value,
+                } => self.image_atomic(*image, *coordinate, *array_index, *fun, *value)?,
                 naga::Statement::SubgroupGather {
                     mode,
                     argument,

@@ -576,6 +576,53 @@ mod tests {
     }
 
     #[test]
+    fn compute_storage_texture_atomics_compile() {
+        let source = r"
+            @group(0) @binding(0)
+            var unsigned_image: texture_storage_2d<r32uint, atomic>;
+            @group(0) @binding(1)
+            var signed_image: texture_storage_2d<r32sint, atomic>;
+
+            @compute @workgroup_size(2)
+            fn main(@builtin(local_invocation_id) id: vec3<u32>) {
+                let coordinate = vec2<i32>(id.xy);
+                textureAtomicMax(unsigned_image, coordinate, 1u);
+                textureAtomicMin(unsigned_image, coordinate, 1u);
+                textureAtomicAdd(unsigned_image, coordinate, 1u);
+                textureAtomicAnd(unsigned_image, coordinate, 1u);
+                textureAtomicOr(unsigned_image, coordinate, 1u);
+                textureAtomicXor(unsigned_image, coordinate, 1u);
+                textureAtomicMax(signed_image, coordinate, 1i);
+                textureAtomicMin(signed_image, coordinate, 1i);
+                textureAtomicAdd(signed_image, coordinate, 1i);
+                textureAtomicAnd(signed_image, coordinate, 1i);
+                textureAtomicOr(signed_image, coordinate, 1i);
+                textureAtomicXor(signed_image, coordinate, 1i);
+            }
+        ";
+        let artifact = Compiler
+            .compile_wgsl(
+                source,
+                Stage::Compute,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap();
+        assert_eq!(artifact.bindings.len(), 2);
+        assert!(
+            artifact
+                .bindings
+                .iter()
+                .all(|binding| binding.kind == deko_dksh::BindingKind::StorageTexture)
+        );
+        assert!(deko_dksh::parse(&artifact.dksh).is_ok());
+
+        let ir = lowered_ir(source, naga::ShaderStage::Compute, "main");
+        assert_eq!(ir.matches("suatom").count(), 12, "{ir}");
+    }
+
+    #[test]
     fn compute_workgroup_memory_and_barriers_compile() {
         let source = r"
             @group(0) @binding(0)
