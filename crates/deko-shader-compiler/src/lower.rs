@@ -6589,7 +6589,7 @@ impl<'function> FunctionLowerer<'function> {
         let control_index = block
             .iter()
             .rposition(|statement| !matches!(statement, naga::Statement::Emit(_)))?;
-        let mut prefix = block[..control_index].to_vec();
+        let prefix = block[..control_index].to_vec();
         match &block[control_index] {
             naga::Statement::Break if is_break => {}
             naga::Statement::Continue if !is_break => {}
@@ -6599,7 +6599,7 @@ impl<'function> FunctionLowerer<'function> {
                 }
                 let nested_prefix = Self::loop_control_prefix(nested, is_break)?;
                 if !nested_prefix.is_empty() {
-                    prefix.push(naga::Statement::Block(nested_prefix));
+                    return None;
                 }
             }
             _ => return None,

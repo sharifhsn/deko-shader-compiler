@@ -2414,17 +2414,16 @@ mod tests {
                 var value = 0u;
                 loop {
                     {
-                        value += 1u;
                         break;
                     }
                 }
                 loop {
                     {
-                        value += 1u;
                         continue;
                     }
                     continuing {
-                        break if value == 4u;
+                        value += 1u;
+                        break if value == 1u;
                     }
                 }
                 output[0] = value;
