@@ -1469,6 +1469,116 @@ mod tests {
     }
 
     #[test]
+    fn switch_break_inside_loop_targets_switch() {
+        let source = r"
+            @group(0) @binding(0) var<storage, read_write> output: array<u32>;
+
+            @compute @workgroup_size(1)
+            fn main() {
+                var value = 0u;
+                loop {
+                    switch value {
+                        case 0u: {
+                            value += 1u;
+                            break;
+                        }
+                        default: {}
+                    }
+                    value += 10u;
+                    break;
+                }
+                output[0] = value;
+            }
+        ";
+        let artifact = Compiler
+            .compile_wgsl(
+                source,
+                Stage::Compute,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap();
+        assert!(artifact.dksh.starts_with(b"DKSH"));
+    }
+
+    #[test]
+    fn conditional_switch_break_preserves_case_local() {
+        let source = r"
+            @group(0) @binding(0) var<storage, read_write> output: array<u32>;
+
+            @compute @workgroup_size(4)
+            fn main(@builtin(local_invocation_index) lane: u32) {
+                var value = lane;
+                switch lane {
+                    case 0u: {
+                        value += 1u;
+                        if value == 1u {
+                            value += 2u;
+                            break;
+                        }
+                        value += 100u;
+                    }
+                    default: {
+                        value += 4u;
+                    }
+                }
+                output[lane] = value + 10u;
+            }
+        ";
+        let artifact = Compiler
+            .compile_wgsl(
+                source,
+                Stage::Compute,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap();
+        assert!(artifact.dksh.starts_with(b"DKSH"));
+        let ir = lowered_ir(source, naga::ShaderStage::Compute, "main");
+        assert!(!ir.contains("brk"), "{ir}");
+        assert!(ir.matches("sel").count() >= 2, "{ir}");
+    }
+
+    #[test]
+    fn continue_inside_switch_targets_enclosing_loop() {
+        let source = r"
+            @group(0) @binding(0) var<storage, read_write> output: array<u32>;
+
+            @compute @workgroup_size(1)
+            fn main() {
+                var value = 0u;
+                loop {
+                    value += 1u;
+                    switch value {
+                        case 1u: { continue; }
+                        default: {}
+                    }
+                    break;
+                    continuing {
+                        break if value == 2u;
+                    }
+                }
+                output[0] = value;
+            }
+        ";
+        let artifact = Compiler
+            .compile_wgsl(
+                source,
+                Stage::Compute,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap();
+        assert!(artifact.dksh.starts_with(b"DKSH"));
+        let ir = lowered_ir(source, naga::ShaderStage::Compute, "main");
+        assert!(ir.contains("cont"), "{ir}");
+        assert!(ir.contains("brk"), "{ir}");
+    }
+
+    #[test]
     fn bevy_style_dynamic_uniform_vertex_features_compile() {
         let source = r"
             struct Mesh { world_from_local: mat3x4<f32> }
@@ -2305,7 +2415,9 @@ mod tests {
             .unwrap();
         assert!(artifact.dksh.starts_with(b"DKSH"));
         let ir = lowered_ir(source, naga::ShaderStage::Compute, "main");
-        assert_eq!(ir.matches("phi_dst").count(), 2, "{ir}");
+        assert_eq!(ir.matches("phi_dst").count(), 1, "{ir}");
+        assert_eq!(ir.matches("st.local").count(), 1, "{ir}");
+        assert_eq!(ir.matches("ld.local").count(), 1, "{ir}");
     }
 
     #[test]
@@ -2372,7 +2484,9 @@ mod tests {
         assert!(artifact.dksh.starts_with(b"DKSH"));
         let ir = lowered_ir(source, naga::ShaderStage::Compute, "main");
         assert_eq!(ir.matches("brk").count(), 2, "{ir}");
-        assert_eq!(ir.matches("phi_dst").count(), 2, "{ir}");
+        assert_eq!(ir.matches("phi_dst").count(), 1, "{ir}");
+        assert_eq!(ir.matches("st.local").count(), 2, "{ir}");
+        assert_eq!(ir.matches("ld.local").count(), 1, "{ir}");
     }
 
     #[test]
@@ -2401,7 +2515,9 @@ mod tests {
             .unwrap();
         assert!(artifact.dksh.starts_with(b"DKSH"));
         let ir = lowered_ir(source, naga::ShaderStage::Compute, "main");
-        assert_eq!(ir.matches("phi_dst").count(), 1, "{ir}");
+        assert_eq!(ir.matches("phi_dst").count(), 0, "{ir}");
+        assert_eq!(ir.matches("st.local").count(), 1, "{ir}");
+        assert_eq!(ir.matches("ld.local").count(), 1, "{ir}");
     }
 
     #[test]
@@ -2414,16 +2530,18 @@ mod tests {
                 var value = 0u;
                 loop {
                     {
+                        value += 1u;
                         break;
                     }
                 }
                 loop {
                     {
+                        value += 1u;
                         continue;
                     }
                     continuing {
                         value += 1u;
-                        break if value == 1u;
+                        break if value == 3u;
                     }
                 }
                 output[0] = value;
@@ -2442,7 +2560,7 @@ mod tests {
     }
 
     #[test]
-    fn side_effecting_conditional_break_is_rejected_without_miscompilation() {
+    fn side_effecting_conditional_break_uses_loop_exit_scratch() {
         let source = r"
             @group(0) @binding(0) var<storage, read_write> output: array<u32>;
 
@@ -2459,7 +2577,7 @@ mod tests {
                 output[0] = value;
             }
         ";
-        let error = Compiler
+        let artifact = Compiler
             .compile_wgsl(
                 source,
                 Stage::Compute,
@@ -2467,8 +2585,18 @@ mod tests {
                 &PipelineConstants::new(),
                 Options::default(),
             )
-            .unwrap_err();
-        assert!(matches!(error, Error::UnsupportedFeature(_)), "{error:?}");
+            .unwrap();
+        let ir = lowered_ir(source, naga::ShaderStage::Compute, "main");
+        assert_eq!(ir.matches("st.local").count(), 1, "{ir}");
+        assert_eq!(ir.matches("ld.local").count(), 1, "{ir}");
+        assert_eq!(ir.matches("phi_dst").count(), 2, "{ir}");
+        assert!(matches!(
+            deko_dksh::parse(&artifact.dksh).unwrap().program.payload,
+            deko_dksh::StagePayload::Compute {
+                local_positive_memory_size: 4..,
+                ..
+            }
+        ));
     }
 
     #[test]

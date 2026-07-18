@@ -23,12 +23,14 @@ workgroup synchronization points. Divergent structured branches predicate their 
 image, atomic, and discard side effects while pure calculations remain safely if-converted.
 Nested value and void returns remove completed lanes from later side effects.
 Returns taken from inside loops also remove those lanes from effects after the loop.
-Terminal unconditional loop controls preserve values written before `break` and route
-`continue` through the WGSL continuing block. Ordinary conditional loop exits retain the
-established loop-header value path, while changed break-edge values receive selective exit phis.
+Terminal, nested lexical, and side-effecting conditional loop controls preserve values written
+before `break` through per-invocation Maxwell local memory, avoiding fragile exit CFG phis, and
+route `continue` through the WGSL continuing block. Ordinary control-only conditional exits retain
+the established loop-header value path.
 Pointer arguments preserve per-invocation writes across divergent void and value helpers.
 WGSL switch cases with multiple selectors lower to one shared conditional body while ordinary
-switches retain their direct lowering path.
+switches retain their direct lowering path. Explicit and conditional switch breaks preserve local
+updates and target the innermost switch rather than an enclosing loop.
 Native Maxwell TXD lowering supports explicit WGSL gradients for 1D/2D sampled textures,
 including array layers and constant offsets. 3D and cube gradients use Mesa's mathematically
 equivalent derivative-to-LOD rewrite before the ordinary Maxwell texture instruction.

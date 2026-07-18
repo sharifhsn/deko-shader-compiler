@@ -510,9 +510,11 @@ fn lower_compute<'sm>(
             "compute entry point returned a value".to_owned(),
         ));
     }
+    let mut info = ShaderInfo::compute(local_size, shared_memory_size);
+    info.slm_size = lowerer.scratch_size;
     Ok(Shader {
         sm,
-        info: ShaderInfo::compute(local_size, shared_memory_size),
+        info,
         functions: vec![lowerer.finish()],
     })
 }
@@ -733,6 +735,7 @@ struct LoopContext {
     break_edges: Vec<LoopBreakEdge>,
     continue_edges: Vec<LoopContinueEdge>,
     needs_exit_local_merge: bool,
+    exit_scratch: HashMap<naga::Handle<naga::LocalVariable>, Vec<i32>>,
 }
 
 struct LoopBreakEdge {
@@ -753,6 +756,23 @@ struct LoopPhi {
     header_value: Value,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ControlKind {
+    Loop,
+    Switch,
+}
+
+struct SwitchBreakEdge {
+    predicate: Pred,
+    locals: HashMap<naga::Handle<naga::LocalVariable>, Value>,
+    arguments: Vec<Value>,
+}
+
+#[derive(Default)]
+struct SwitchContext {
+    break_edges: Vec<SwitchBreakEdge>,
+}
+
 struct FunctionLowerer<'function> {
     module: &'function naga::Module,
     source: &'function naga::Function,
@@ -764,12 +784,15 @@ struct FunctionLowerer<'function> {
     execution_predicate: Pred,
     labels: LabelAllocator,
     loops: Vec<LoopContext>,
+    switches: Vec<SwitchContext>,
+    control_stack: Vec<ControlKind>,
     loop_base_depth: usize,
     values: HashMap<naga::Handle<naga::Expression>, Value>,
     locals: HashMap<naga::Handle<naga::LocalVariable>, Value>,
     arguments: Vec<Value>,
     resource_arguments: HashMap<u32, naga::Handle<naga::GlobalVariable>>,
     early_returns: Vec<(Src, Value)>,
+    scratch_size: u32,
 }
 
 impl<'function> FunctionLowerer<'function> {
@@ -796,12 +819,15 @@ impl<'function> FunctionLowerer<'function> {
             execution_predicate: true.into(),
             labels,
             loops: Vec::new(),
+            switches: Vec::new(),
+            control_stack: Vec::new(),
             loop_base_depth: 0,
             values: HashMap::default(),
             locals: HashMap::default(),
             arguments,
             resource_arguments: HashMap::default(),
             early_returns: Vec::new(),
+            scratch_size: 0,
         }
     }
 
@@ -6585,21 +6611,34 @@ impl<'function> FunctionLowerer<'function> {
         Self::loop_control_prefix(block, false)
     }
 
+    fn loop_requires_exit_scratch(block: &naga::Block) -> bool {
+        if Self::break_prefix(block).is_some_and(|prefix| !prefix.is_empty()) {
+            return true;
+        }
+        block.iter().any(|statement| match statement {
+            naga::Statement::Block(block) => Self::loop_requires_exit_scratch(block),
+            naga::Statement::If { accept, reject, .. } => {
+                Self::break_prefix(accept).is_some_and(|prefix| !prefix.is_empty())
+                    || Self::break_prefix(reject).is_some_and(|prefix| !prefix.is_empty())
+                    || Self::loop_requires_exit_scratch(accept)
+                    || Self::loop_requires_exit_scratch(reject)
+            }
+            _ => false,
+        })
+    }
+
     fn loop_control_prefix(block: &naga::Block, is_break: bool) -> Option<naga::Block> {
         let control_index = block
             .iter()
             .rposition(|statement| !matches!(statement, naga::Statement::Emit(_)))?;
-        let prefix = block[..control_index].to_vec();
+        let mut prefix = block[..control_index].to_vec();
         match &block[control_index] {
             naga::Statement::Break if is_break => {}
             naga::Statement::Continue if !is_break => {}
             naga::Statement::Block(nested) => {
-                if !prefix.is_empty() {
-                    return None;
-                }
                 let nested_prefix = Self::loop_control_prefix(nested, is_break)?;
                 if !nested_prefix.is_empty() {
-                    return None;
+                    prefix.push(naga::Statement::Block(nested_prefix));
                 }
             }
             _ => return None,
@@ -6619,6 +6658,147 @@ impl<'function> FunctionLowerer<'function> {
             }
         }
         None
+    }
+
+    fn local_scratch_access() -> MemAccess {
+        MemAccess {
+            mem_type: MemType::B32,
+            space: MemSpace::Local,
+            order: MemOrder::Strong(MemScope::CTA),
+            eviction_priority: MemEvictionPriority::Normal,
+        }
+    }
+
+    fn allocate_loop_exit_scratch(
+        &mut self,
+        locals: &[naga::Handle<naga::LocalVariable>],
+    ) -> Result<HashMap<naga::Handle<naga::LocalVariable>, Vec<i32>>, Error> {
+        let mut allocations = HashMap::default();
+        for &local in locals {
+            let component_count = self.local_value(local)?.components.len();
+            let mut offsets = Vec::with_capacity(component_count);
+            for _ in 0..component_count {
+                let offset = i32::try_from(self.scratch_size).map_err(|_| {
+                    Error::UnsupportedFeature("loop exit scratch exceeds Maxwell range".to_owned())
+                })?;
+                offsets.push(offset);
+                self.scratch_size = self.scratch_size.checked_add(4).ok_or_else(|| {
+                    Error::UnsupportedFeature("loop exit scratch size overflow".to_owned())
+                })?;
+            }
+            allocations.insert(local, offsets);
+        }
+        Ok(allocations)
+    }
+
+    fn store_loop_exit_scratch(&mut self, predicate: Pred) -> Result<(), Error> {
+        let stores = self
+            .loops
+            .last()
+            .expect("loop context was pushed")
+            .exit_scratch
+            .iter()
+            .map(|(&local, offsets)| (local, offsets.clone()))
+            .collect::<Vec<_>>();
+        for (local, offsets) in stores {
+            let value = self.local_value(local)?;
+            let components = self.materialize_loop_components(&value)?;
+            if components.len() != offsets.len() {
+                return Err(Error::UnsupportedFeature(
+                    "loop exit scratch value shape changed".to_owned(),
+                ));
+            }
+            for (component, offset) in components.into_iter().zip(offsets) {
+                let mut instruction = Instr::new(OpSt {
+                    addr: Src::ZERO,
+                    data: Src::from(component),
+                    uniform_addr: Src::ZERO,
+                    offset,
+                    stride: OffsetStride::X1,
+                    access: Self::local_scratch_access(),
+                });
+                instruction.pred = predicate;
+                self.emit(instruction);
+            }
+        }
+        Ok(())
+    }
+
+    fn load_loop_exit_scratch(&mut self, context: &LoopContext) -> Result<(), Error> {
+        for (&local, offsets) in &context.exit_scratch {
+            let template = context.entry_locals.get(&local).ok_or_else(|| {
+                Error::UnsupportedFeature("missing loop exit scratch local".to_owned())
+            })?;
+            let mut registers = Vec::with_capacity(offsets.len());
+            for &offset in offsets {
+                let destination = self.target.ssa_alloc.alloc(RegFile::GPR);
+                self.emit(Instr::new(OpLd {
+                    dst: Dst::from(destination),
+                    addr: Src::ZERO,
+                    uniform_addr: Src::ZERO,
+                    pred: Src::new_imm_bool(true),
+                    offset,
+                    stride: OffsetStride::X1,
+                    access: Self::local_scratch_access(),
+                }));
+                registers.push(destination);
+            }
+            let value = if template.kind == naga::ScalarKind::Bool {
+                self.boolean_loop_value(&registers)
+            } else {
+                Value {
+                    components: registers.into_iter().map(Src::from).collect(),
+                    kind: template.kind,
+                }
+            };
+            self.locals.insert(local, value);
+        }
+        Ok(())
+    }
+
+    fn break_targets_loop(&self) -> bool {
+        self.control_stack.last() == Some(&ControlKind::Loop)
+    }
+
+    fn switch_break_count(&self) -> usize {
+        self.switches
+            .last()
+            .map_or(0, |context| context.break_edges.len())
+    }
+
+    fn loop_control_edge_count(&self) -> usize {
+        self.loops.last().map_or(0, |context| {
+            context.break_edges.len() + context.continue_edges.len()
+        })
+    }
+
+    fn true_condition() -> Value {
+        Value {
+            components: vec![Src::new_imm_bool(true)],
+            kind: naga::ScalarKind::Bool,
+        }
+    }
+
+    fn emit_switch_break(&mut self) -> Result<(), Error> {
+        if self.control_stack.last() != Some(&ControlKind::Switch) {
+            return Err(Error::UnsupportedFeature(
+                "break outside a loop or switch".to_owned(),
+            ));
+        }
+        let predicate = self.execution_predicate;
+        if !predicate.is_false() {
+            self.switches
+                .last_mut()
+                .expect("switch control context was pushed")
+                .break_edges
+                .push(SwitchBreakEdge {
+                    predicate,
+                    locals: self.locals.clone(),
+                    arguments: self.arguments.clone(),
+                });
+        }
+        self.execution_predicate = false.into();
+        Ok(())
     }
 
     fn emit_conditional_break(
@@ -6644,6 +6824,7 @@ impl<'function> FunctionLowerer<'function> {
         if predicate.is_false() {
             return Ok(());
         }
+        self.store_loop_exit_scratch(predicate)?;
         let branch_block = self.current_block;
         let locals = self.locals.clone();
         let mut instruction = Instr::new(OpBrk { target: exit_label });
@@ -6734,6 +6915,11 @@ impl<'function> FunctionLowerer<'function> {
         for &local in &exit_local_handles {
             self.local_value(local)?;
         }
+        let exit_scratch = if Self::loop_requires_exit_scratch(body) {
+            self.allocate_loop_exit_scratch(&exit_local_handles)?
+        } else {
+            HashMap::default()
+        };
         let mut local_handles = carried_locals.into_iter().collect::<Vec<_>>();
         local_handles.sort_by_key(|handle| handle.index());
         let mut preheader_sources = OpPhiSrcs::new();
@@ -6803,7 +6989,9 @@ impl<'function> FunctionLowerer<'function> {
             break_edges: Vec::new(),
             continue_edges: Vec::new(),
             needs_exit_local_merge: false,
+            exit_scratch,
         });
+        self.control_stack.push(ControlKind::Loop);
         let break_prefix = Self::break_prefix(body);
         let continue_prefix = Self::continue_prefix(body);
         let executable_body = break_prefix
@@ -6830,9 +7018,10 @@ impl<'function> FunctionLowerer<'function> {
                 .last()
                 .expect("loop context was pushed")
                 .exit_label;
+            self.store_loop_exit_scratch(true.into())?;
             self.emit(Instr::new(OpBrk { target: exit_label }));
             let context = self.loops.last_mut().expect("loop context was pushed");
-            context.needs_exit_local_merge = true;
+            context.needs_exit_local_merge = context.exit_scratch.is_empty();
             context.break_edges.push(LoopBreakEdge {
                 block: body_end,
                 returned: None,
@@ -6890,13 +7079,16 @@ impl<'function> FunctionLowerer<'function> {
         }));
         self.add_edge(backedge, header);
 
+        assert_eq!(self.control_stack.pop(), Some(ControlKind::Loop));
         let context = self.loops.pop().expect("loop context was pushed");
         let exit = self.append_block(exit_label);
         for edge in &context.break_edges {
             self.add_edge(edge.block, exit);
         }
         self.current_block = exit;
-        if context.needs_exit_local_merge {
+        if !context.exit_scratch.is_empty() {
+            self.load_loop_exit_scratch(&context)?;
+        } else if context.needs_exit_local_merge {
             self.merge_break_locals(&context, exit)?;
         } else {
             for phi in loop_phis {
@@ -7542,19 +7734,43 @@ impl<'function> FunctionLowerer<'function> {
                             continue;
                         }
                     }
-                    if !self.loops.is_empty()
+                    if self.break_targets_loop()
                         && accept.is_empty()
                         && let Some(prefix) = Self::break_prefix(reject)
-                        && prefix.is_empty()
+                        && (prefix.is_empty()
+                            || !self
+                                .loops
+                                .last()
+                                .expect("loop context checked above")
+                                .exit_scratch
+                                .is_empty())
                     {
+                        if !prefix.is_empty()
+                            && let Some(value) =
+                                self.conditional(&condition, &naga::Block::new(), &prefix)?
+                        {
+                            return Ok(Some(value));
+                        }
                         self.emit_conditional_break(&condition, false, None)?;
                         continue;
                     }
-                    if !self.loops.is_empty()
+                    if self.break_targets_loop()
                         && reject.is_empty()
                         && let Some(prefix) = Self::break_prefix(accept)
-                        && prefix.is_empty()
+                        && (prefix.is_empty()
+                            || !self
+                                .loops
+                                .last()
+                                .expect("loop context checked above")
+                                .exit_scratch
+                                .is_empty())
                     {
+                        if !prefix.is_empty()
+                            && let Some(value) =
+                                self.conditional(&condition, &prefix, &naga::Block::new())?
+                        {
+                            return Ok(Some(value));
+                        }
                         self.emit_conditional_break(&condition, true, None)?;
                         continue;
                     }
@@ -7571,6 +7787,27 @@ impl<'function> FunctionLowerer<'function> {
                     if let Some(value) = self.lower_switch(*selector, cases)? {
                         return Ok(Some(value));
                     }
+                }
+                naga::Statement::Break => match self.control_stack.last() {
+                    Some(ControlKind::Switch) => self.emit_switch_break()?,
+                    Some(ControlKind::Loop) => {
+                        self.emit_conditional_break(&Self::true_condition(), true, None)?;
+                        self.execution_predicate = false.into();
+                    }
+                    None => {
+                        return Err(Error::UnsupportedFeature(
+                            "break outside a loop or switch".to_owned(),
+                        ));
+                    }
+                },
+                naga::Statement::Continue => {
+                    if self.loops.is_empty() {
+                        return Err(Error::UnsupportedFeature(
+                            "continue outside a loop".to_owned(),
+                        ));
+                    }
+                    self.emit_conditional_continue(&Self::true_condition(), true)?;
+                    self.execution_predicate = false.into();
                 }
                 naga::Statement::Emit(range) => {
                     for expression in range.clone() {
@@ -7637,6 +7874,7 @@ impl<'function> FunctionLowerer<'function> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     fn conditional(
         &mut self,
         condition: &Value,
@@ -7664,9 +7902,15 @@ impl<'function> FunctionLowerer<'function> {
         let accepted_predicate = self.combine_predicates(parent_predicate, condition_predicate);
         self.execution_predicate = accepted_predicate;
         let early_returns_before_accept = self.early_returns.len();
+        let switch_breaks_before_accept = self.switch_break_count();
+        let loop_controls_before_accept = self.loop_control_edge_count();
         let accepted = self.execute_statements(accept)?;
         let accepted_has_partial_return =
             accepted.is_none() && self.early_returns.len() != early_returns_before_accept;
+        let accepted_has_switch_break =
+            accepted.is_none() && self.switch_break_count() != switch_breaks_before_accept;
+        let accepted_has_loop_control =
+            accepted.is_none() && self.loop_control_edge_count() != loop_controls_before_accept;
         let accepted_locals = self.locals.clone();
         let accepted_arguments = self.arguments.clone();
         let accepted_continuation = if accepted.is_some() {
@@ -7680,9 +7924,15 @@ impl<'function> FunctionLowerer<'function> {
             self.combine_predicates(parent_predicate, condition_predicate.bnot());
         self.execution_predicate = rejected_predicate;
         let early_returns_before_reject = self.early_returns.len();
+        let switch_breaks_before_reject = self.switch_break_count();
+        let loop_controls_before_reject = self.loop_control_edge_count();
         let rejected = self.execute_statements(reject)?;
         let rejected_has_partial_return =
             rejected.is_none() && self.early_returns.len() != early_returns_before_reject;
+        let rejected_has_switch_break =
+            rejected.is_none() && self.switch_break_count() != switch_breaks_before_reject;
+        let rejected_has_loop_control =
+            rejected.is_none() && self.loop_control_edge_count() != loop_controls_before_reject;
         let rejected_locals = self.locals.clone();
         let rejected_arguments = self.arguments.clone();
         let rejected_continuation = if rejected.is_some() {
@@ -7727,18 +7977,40 @@ impl<'function> FunctionLowerer<'function> {
                     let merged = self.select(condition, accepted.clone(), rejected.clone())?;
                     self.locals.insert(handle, merged);
                 }
-                self.execution_predicate =
-                    if !accepted_has_partial_return && !rejected_has_partial_return {
-                        parent_predicate
-                    } else {
-                        self.combine_predicates_or(accepted_continuation, rejected_continuation)
-                    };
+                self.execution_predicate = if !accepted_has_partial_return
+                    && !rejected_has_partial_return
+                    && !accepted_has_switch_break
+                    && !rejected_has_switch_break
+                    && !accepted_has_loop_control
+                    && !rejected_has_loop_control
+                {
+                    parent_predicate
+                } else {
+                    self.combine_predicates_or(accepted_continuation, rejected_continuation)
+                };
                 Ok(None)
             }
         }
     }
 
     fn lower_switch(
+        &mut self,
+        selector: naga::Handle<naga::Expression>,
+        cases: &[naga::SwitchCase],
+    ) -> Result<Option<Value>, Error> {
+        self.switches.push(SwitchContext::default());
+        self.control_stack.push(ControlKind::Switch);
+        let result = self.lower_switch_cases(selector, cases);
+        assert_eq!(self.control_stack.pop(), Some(ControlKind::Switch));
+        let context = self.switches.pop().expect("switch context was pushed");
+        let returned = result?;
+        if returned.is_none() {
+            self.merge_switch_breaks(context)?;
+        }
+        Ok(returned)
+    }
+
+    fn lower_switch_cases(
         &mut self,
         selector: naga::Handle<naga::Expression>,
         cases: &[naga::SwitchCase],
@@ -7808,6 +8080,43 @@ impl<'function> FunctionLowerer<'function> {
             }
         }
         Ok(None)
+    }
+
+    fn merge_switch_breaks(&mut self, context: SwitchContext) -> Result<(), Error> {
+        if context.break_edges.is_empty() {
+            return Ok(());
+        }
+
+        let mut continuation = self.execution_predicate;
+        for edge in &context.break_edges {
+            continuation = self.combine_predicates_or(continuation, edge.predicate);
+        }
+        self.execution_predicate = continuation;
+
+        let mut merged_locals = self.locals.clone();
+        let mut merged_arguments = self.arguments.clone();
+        for edge in context.break_edges.into_iter().rev() {
+            let condition = Value {
+                components: vec![Src::from(edge.predicate)],
+                kind: naga::ScalarKind::Bool,
+            };
+            for (&handle, broken) in &edge.locals {
+                let fallthrough = merged_locals.get(&handle).ok_or_else(|| {
+                    Error::UnsupportedFeature("missing switch fallthrough local".to_owned())
+                })?;
+                let merged = self.select(&condition, broken.clone(), fallthrough.clone())?;
+                merged_locals.insert(handle, merged);
+            }
+            for (index, broken) in edge.arguments.into_iter().enumerate() {
+                let fallthrough = merged_arguments.get(index).ok_or_else(|| {
+                    Error::UnsupportedFeature("missing switch fallthrough argument".to_owned())
+                })?;
+                merged_arguments[index] = self.select(&condition, broken, fallthrough.clone())?;
+            }
+        }
+        self.locals = merged_locals;
+        self.arguments = merged_arguments;
+        Ok(())
     }
 
     fn lower_simple_switch(
@@ -7964,12 +8273,15 @@ impl<'function> FunctionLowerer<'function> {
             execution_predicate: self.execution_predicate,
             labels: std::mem::replace(&mut self.labels, LabelAllocator::new()),
             loops: std::mem::take(&mut self.loops),
+            switches: std::mem::take(&mut self.switches),
+            control_stack: std::mem::take(&mut self.control_stack),
             loop_base_depth,
             values: HashMap::default(),
             locals: HashMap::default(),
             arguments,
             resource_arguments,
             early_returns: Vec::new(),
+            scratch_size: self.scratch_size,
         };
         let result = callee.return_value().map_err(|error| match error {
             Error::UnsupportedFeature(message) => Error::UnsupportedFeature(format!(
@@ -7985,6 +8297,9 @@ impl<'function> FunctionLowerer<'function> {
         self.current_block = callee.current_block;
         self.labels = callee.labels;
         self.loops = callee.loops;
+        self.switches = callee.switches;
+        self.control_stack = callee.control_stack;
+        self.scratch_size = callee.scratch_size;
         result.map(|value| (value, updated_arguments))
     }
 
@@ -8007,12 +8322,15 @@ impl<'function> FunctionLowerer<'function> {
             execution_predicate: self.execution_predicate,
             labels: std::mem::replace(&mut self.labels, LabelAllocator::new()),
             loops: std::mem::take(&mut self.loops),
+            switches: std::mem::take(&mut self.switches),
+            control_stack: std::mem::take(&mut self.control_stack),
             loop_base_depth,
             values: HashMap::default(),
             locals: HashMap::default(),
             arguments,
             resource_arguments,
             early_returns: Vec::new(),
+            scratch_size: self.scratch_size,
         };
         let body = callee.source.body.clone();
         let result = (|| {
@@ -8041,6 +8359,9 @@ impl<'function> FunctionLowerer<'function> {
         self.current_block = callee.current_block;
         self.labels = callee.labels;
         self.loops = callee.loops;
+        self.switches = callee.switches;
+        self.control_stack = callee.control_stack;
+        self.scratch_size = callee.scratch_size;
         result
     }
 
@@ -8943,6 +9264,7 @@ fn lower_vertex<'sm>(
         io.mark_attrs_written(LAYER_ATTRIBUTE_ADDRESS..LAYER_ATTRIBUTE_ADDRESS + 4);
         io.mark_store_req(LAYER_ATTRIBUTE_ADDRESS..LAYER_ATTRIBUTE_ADDRESS + 4);
     }
+    info.slm_size = lowerer.scratch_size;
     Ok(Shader {
         sm,
         info,
@@ -9042,6 +9364,7 @@ fn lower_fragment<'sm>(
     };
     io.writes_color = writes_color;
     io.writes_depth = writes_depth;
+    info.slm_size = lowerer.scratch_size;
     Ok(Shader {
         sm,
         info,

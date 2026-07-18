@@ -2,11 +2,13 @@
 
 ## Unreleased
 
-- Invalidate experimental ABI 46 loop-exit artifacts and keep mutation-bearing nested and
-  conditional exits fail-closed until their values can be carried without exit CFG phis.
-
-- Bump the backend cache ABI after loop-control lowering changed so persistent DKSH artifacts
-  produced by earlier ABI 44 builds cannot survive corrective compiler revisions.
+- Carry mutation-bearing loop-exit values through per-invocation Maxwell local memory instead of
+  exit CFG phis, covering terminal, nested lexical, and side-effecting conditional breaks.
+- Track lexical switch and loop ownership so explicit and conditional switch breaks preserve
+  modified locals without exiting an enclosing loop, while switch-local `continue` statements
+  still target the enclosing loop.
+- Advance the backend cache ABI to 48 for the local-memory loop-exit carrier and control-flow
+  ownership changes.
 
 - Create a publishable, SDK-independent compiler workspace targeting the Nintendo
   Switch GM20B GPU.
