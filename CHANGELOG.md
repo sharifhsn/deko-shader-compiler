@@ -34,6 +34,8 @@
   workgroup, image, atomic, and discard effects occur only in invocations that selected
   that arm. Pure calculations and structured-control operations remain unconditional,
   preserving NAK SSA lifetime and scheduling invariants through if-converted loops.
+- Track the live invocation mask through nested early returns, including void returns,
+  so lanes that have returned cannot execute later side effects.
 - Lower array texture layer-count queries, including the Maxwell cube-face count to
   cube-layer conversion used by Mesa NIR.
 - Accept pipeline-specialized compute workgroup-size overrides and preserve their

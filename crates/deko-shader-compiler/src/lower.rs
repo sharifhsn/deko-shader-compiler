@@ -502,7 +502,10 @@ fn lower_compute<'sm>(
     let mut lowerer = FunctionLowerer::new(module, &entry.function, resources, Vec::new());
     bind_compute_arguments(module, &mut lowerer, entry.workgroup_size)?;
     let body = entry.function.body.clone();
-    if lowerer.execute_statements(&body)?.is_some() {
+    let returned = lowerer
+        .execute_statements(&body)?
+        .unwrap_or_else(Value::void);
+    if !lowerer.finalize_return(returned)?.is_void() {
         return Err(Error::UnsupportedFeature(
             "compute entry point returned a value".to_owned(),
         ));
@@ -686,6 +689,19 @@ struct Value {
     kind: naga::ScalarKind,
 }
 
+impl Value {
+    fn void() -> Self {
+        Self {
+            components: Vec::new(),
+            kind: naga::ScalarKind::Uint,
+        }
+    }
+
+    fn is_void(&self) -> bool {
+        self.components.is_empty()
+    }
+}
+
 type UniformPointer = (
     naga::Handle<naga::GlobalVariable>,
     naga::Handle<naga::Type>,
@@ -819,6 +835,27 @@ impl<'function> FunctionLowerer<'function> {
             .push(Instr::new(OpPSetP {
                 dsts: [Dst::from(destination), Dst::None],
                 ops: [PredSetOp::And, PredSetOp::And],
+                srcs: [Src::from(left), true.into(), Src::from(right)],
+            }));
+        Pred::from(destination)
+    }
+
+    fn combine_predicates_or(&mut self, left: Pred, right: Pred) -> Pred {
+        if left.is_true() || right.is_true() {
+            return true.into();
+        }
+        if left.is_false() {
+            return right;
+        }
+        if right.is_false() {
+            return left;
+        }
+        let destination = self.target.ssa_alloc.alloc(RegFile::Pred);
+        self.blocks[self.current_block]
+            .instrs
+            .push(Instr::new(OpPSetP {
+                dsts: [Dst::from(destination), Dst::None],
+                ops: [PredSetOp::And, PredSetOp::Or],
                 srcs: [Src::from(left), true.into(), Src::from(right)],
             }));
         Pred::from(destination)
@@ -6364,8 +6401,10 @@ impl<'function> FunctionLowerer<'function> {
 
     fn return_value(&mut self) -> Result<Value, Error> {
         let body = self.source.body.clone();
-        self.execute_statements(&body)?
-            .ok_or_else(|| Error::UnsupportedFeature("missing return value".to_owned()))
+        let value = self
+            .execute_statements(&body)?
+            .ok_or_else(|| Error::UnsupportedFeature("missing return value".to_owned()))?;
+        self.finalize_return(value)
     }
 
     fn call_argument(&mut self, argument: naga::Handle<naga::Expression>) -> Result<Value, Error> {
@@ -6969,7 +7008,7 @@ impl<'function> FunctionLowerer<'function> {
                     value: Some(handle),
                 } => {
                     let value = self.expression(*handle)?;
-                    return Ok(Some(self.finalize_return(value)?));
+                    return Ok(Some(value));
                 }
                 naga::Statement::Call {
                     function,
@@ -7147,7 +7186,7 @@ impl<'function> FunctionLowerer<'function> {
                         if let Some(value) =
                             self.conditional(&condition, &prefix, &naga::Block::new())?
                         {
-                            return Ok(Some(self.finalize_return(value)?));
+                            return Ok(Some(value));
                         }
                         self.emit_conditional_continue(&condition, true)?;
                         continue;
@@ -7159,7 +7198,7 @@ impl<'function> FunctionLowerer<'function> {
                         if let Some(value) =
                             self.conditional(&condition, &naga::Block::new(), &prefix)?
                         {
-                            return Ok(Some(self.finalize_return(value)?));
+                            return Ok(Some(value));
                         }
                         self.emit_conditional_continue(&condition, false)?;
                         continue;
@@ -7193,7 +7232,7 @@ impl<'function> FunctionLowerer<'function> {
                         continue;
                     }
                     if let Some(value) = self.conditional(&condition, accept, reject)? {
-                        return Ok(Some(self.finalize_return(value)?));
+                        return Ok(Some(value));
                     }
                 }
                 naga::Statement::Loop {
@@ -7226,7 +7265,9 @@ impl<'function> FunctionLowerer<'function> {
                         self.expression(expression)?;
                     }
                 }
-                naga::Statement::Return { value: None } => {}
+                naga::Statement::Return { value: None } => {
+                    return Ok(Some(Value::void()));
+                }
                 other => {
                     return Err(Error::UnsupportedFeature(format!("statement {other:?}")));
                 }
@@ -7258,29 +7299,49 @@ impl<'function> FunctionLowerer<'function> {
         let parent_predicate = self.execution_predicate;
         let condition_predicate = Self::predicate(&condition.components[0])?;
         let locals = self.locals.clone();
-        self.execution_predicate = self.combine_predicates(parent_predicate, condition_predicate);
+        let accepted_predicate = self.combine_predicates(parent_predicate, condition_predicate);
+        self.execution_predicate = accepted_predicate;
+        let early_returns_before_accept = self.early_returns.len();
         let accepted = self.execute_statements(accept)?;
+        let accepted_has_partial_return =
+            accepted.is_none() && self.early_returns.len() != early_returns_before_accept;
         let accepted_locals = self.locals.clone();
+        let accepted_continuation = if accepted.is_some() {
+            false.into()
+        } else {
+            self.execution_predicate
+        };
         self.locals.clone_from(&locals);
-        self.execution_predicate =
+        let rejected_predicate =
             self.combine_predicates(parent_predicate, condition_predicate.bnot());
+        self.execution_predicate = rejected_predicate;
+        let early_returns_before_reject = self.early_returns.len();
         let rejected = self.execute_statements(reject)?;
+        let rejected_has_partial_return =
+            rejected.is_none() && self.early_returns.len() != early_returns_before_reject;
         let rejected_locals = self.locals.clone();
-        self.execution_predicate = parent_predicate;
+        let rejected_continuation = if rejected.is_some() {
+            false.into()
+        } else {
+            self.execution_predicate
+        };
         match (accepted, rejected) {
             (Some(accepted), Some(rejected)) => {
+                self.execution_predicate = parent_predicate;
                 Ok(Some(self.select(condition, accepted, rejected)?))
             }
             (Some(accepted), None) => {
                 self.early_returns
-                    .push((condition.components[0].clone(), accepted));
+                    .push((Src::from(accepted_predicate), accepted));
                 self.locals = rejected_locals;
+                self.execution_predicate = rejected_continuation;
                 Ok(None)
             }
             (None, Some(rejected)) => {
                 self.early_returns
-                    .push((condition.components[0].clone().bnot(), rejected));
+                    .push((Src::from(rejected_predicate), rejected));
                 self.locals = accepted_locals;
+                self.execution_predicate = accepted_continuation;
                 Ok(None)
             }
             (None, None) => {
@@ -7295,6 +7356,12 @@ impl<'function> FunctionLowerer<'function> {
                     let merged = self.select(condition, accepted.clone(), rejected.clone())?;
                     self.locals.insert(handle, merged);
                 }
+                self.execution_predicate =
+                    if !accepted_has_partial_return && !rejected_has_partial_return {
+                        parent_predicate
+                    } else {
+                        self.combine_predicates_or(accepted_continuation, rejected_continuation)
+                    };
                 Ok(None)
             }
         }
@@ -7448,15 +7515,19 @@ impl<'function> FunctionLowerer<'function> {
             early_returns: Vec::new(),
         };
         let body = callee.source.body.clone();
-        let result = callee.execute_statements(&body).and_then(|value| {
-            if value.is_some() {
+        let result = (|| {
+            let value = callee
+                .execute_statements(&body)?
+                .unwrap_or_else(Value::void);
+            let value = callee.finalize_return(value)?;
+            if value.is_void() {
+                Ok(callee.arguments.clone())
+            } else {
                 Err(Error::UnsupportedFeature(
                     "void function returned a value".to_owned(),
                 ))
-            } else {
-                Ok(callee.arguments.clone())
             }
-        });
+        })();
         let result = result.map_err(|error| match error {
             Error::UnsupportedFeature(message) => Error::UnsupportedFeature(format!(
                 "in function {}: {message}",
@@ -8449,7 +8520,10 @@ fn lower_fragment<'sm>(
         }
     } else {
         let body = entry.function.body.clone();
-        if lowerer.execute_statements(&body)?.is_some() {
+        let returned = lowerer
+            .execute_statements(&body)?
+            .unwrap_or_else(Value::void);
+        if !lowerer.finalize_return(returned)?.is_void() {
             return Err(Error::UnsupportedFeature(
                 "void fragment entry point returned a value".to_owned(),
             ));

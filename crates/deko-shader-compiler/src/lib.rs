@@ -2054,6 +2054,98 @@ mod tests {
     }
 
     #[test]
+    fn divergent_early_return_masks_later_side_effects() {
+        let source = r"
+            @group(0) @binding(0) var<storage, read_write> output: array<u32>;
+
+            @compute @workgroup_size(4)
+            fn main(@builtin(local_invocation_index) lane: u32) {
+                if lane == 0u {
+                    return;
+                }
+                output[lane] = 7u;
+            }
+        ";
+        let ir = lowered_ir(source, naga::ShaderStage::Compute, "main");
+        let stores = ir
+            .lines()
+            .filter(|line| line.contains("st.global"))
+            .collect::<Vec<_>>();
+        assert_eq!(stores.len(), 1, "{ir}");
+        assert!(stores[0].contains('@'), "{ir}");
+        assert!(stores[0].contains('!'), "{ir}");
+    }
+
+    #[test]
+    fn nested_early_return_preserves_only_live_invocations() {
+        let source = r"
+            @group(0) @binding(0) var<storage, read_write> output: array<u32>;
+
+            @compute @workgroup_size(4)
+            fn main(@builtin(local_invocation_index) lane: u32) {
+                if lane < 2u {
+                    if lane == 0u {
+                        return;
+                    }
+                }
+                output[lane] = 9u;
+            }
+        ";
+        let artifact = Compiler
+            .compile_wgsl(
+                source,
+                Stage::Compute,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap();
+        assert!(artifact.dksh.starts_with(b"DKSH"));
+
+        let ir = lowered_ir(source, naga::ShaderStage::Compute, "main");
+        let store = ir
+            .lines()
+            .find(|line| line.contains("st.global"))
+            .unwrap_or_else(|| panic!("{ir}"));
+        assert!(store.contains('@'), "{ir}");
+    }
+
+    #[test]
+    fn sequential_value_returns_keep_prior_return_lanes() {
+        let source = r"
+            @group(0) @binding(0) var<storage, read_write> output: array<u32>;
+
+            fn choose(lane: u32) -> u32 {
+                if lane == 0u {
+                    return 11u;
+                }
+                if lane == 1u {
+                    return 22u;
+                }
+                return 33u;
+            }
+
+            @compute @workgroup_size(4)
+            fn main(@builtin(local_invocation_index) lane: u32) {
+                output[lane] = choose(lane);
+            }
+        ";
+        let artifact = Compiler
+            .compile_wgsl(
+                source,
+                Stage::Compute,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap();
+        assert!(artifact.dksh.starts_with(b"DKSH"));
+
+        let ir = lowered_ir(source, naga::ShaderStage::Compute, "main");
+        assert!(ir.matches("sel").count() >= 2, "{ir}");
+    }
+
+    #[test]
     fn gradient_lowering_selects_native_and_rewritten_paths() {
         let two_dimensional = lowered_ir(
             r"
