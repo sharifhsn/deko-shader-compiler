@@ -36,6 +36,8 @@
   preserving NAK SSA lifetime and scheduling invariants through if-converted loops.
 - Track the live invocation mask through nested early returns, including void returns,
   so lanes that have returned cannot execute later side effects.
+- Snapshot and merge pointer arguments across divergent helper-function arms, and write
+  updated pointer values back from both void and value-returning calls.
 - Lower array texture layer-count queries, including the Maxwell cube-face count to
   cube-layer conversion used by Mesa NIR.
 - Accept pipeline-specialized compute workgroup-size overrides and preserve their

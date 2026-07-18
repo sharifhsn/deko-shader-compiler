@@ -21,6 +21,7 @@ undefined shuffle values.
 workgroup synchronization points. Divergent structured branches predicate their memory,
 image, atomic, and discard side effects while pure calculations remain safely if-converted.
 Nested value and void returns remove completed lanes from later side effects.
+Pointer arguments preserve per-invocation writes across divergent void and value helpers.
 Native Maxwell TXD lowering supports explicit WGSL gradients for 1D/2D sampled textures,
 including array layers and constant offsets. 3D and cube gradients use Mesa's mathematically
 equivalent derivative-to-LOD rewrite before the ordinary Maxwell texture instruction.

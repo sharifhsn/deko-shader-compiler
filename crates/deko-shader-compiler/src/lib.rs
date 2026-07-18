@@ -1311,6 +1311,80 @@ mod tests {
     }
 
     #[test]
+    fn divergent_pointer_argument_writes_merge_per_invocation() {
+        let source = r"
+            @group(0) @binding(0) var<storage, read_write> output: array<u32>;
+
+            fn choose(destination: ptr<function, u32>, lane: u32) {
+                if lane == 0u {
+                    *destination = 11u;
+                    return;
+                } else {
+                    *destination = 22u;
+                }
+            }
+
+            @compute @workgroup_size(4)
+            fn main(@builtin(local_invocation_index) lane: u32) {
+                var value = 0u;
+                choose(&value, lane);
+                output[lane] = value;
+            }
+        ";
+        let artifact = Compiler
+            .compile_wgsl(
+                source,
+                Stage::Compute,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap();
+        assert!(artifact.dksh.starts_with(b"DKSH"));
+
+        let ir = lowered_ir(source, naga::ShaderStage::Compute, "main");
+        assert!(ir.contains("sel"), "{ir}");
+        assert_eq!(ir.matches("st.global").count(), 1, "{ir}");
+    }
+
+    #[test]
+    fn value_helpers_write_back_pointer_arguments() {
+        let source = r"
+            @group(0) @binding(0) var<storage, read_write> output: array<u32>;
+
+            fn choose(destination: ptr<function, u32>, lane: u32) -> u32 {
+                if lane == 0u {
+                    *destination = 11u;
+                    return 1u;
+                }
+                *destination = 22u;
+                return 2u;
+            }
+
+            @compute @workgroup_size(4)
+            fn main(@builtin(local_invocation_index) lane: u32) {
+                var value = 0u;
+                let selected = choose(&value, lane);
+                output[lane] = value + selected;
+            }
+        ";
+        let artifact = Compiler
+            .compile_wgsl(
+                source,
+                Stage::Compute,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap();
+        assert!(artifact.dksh.starts_with(b"DKSH"));
+
+        let ir = lowered_ir(source, naga::ShaderStage::Compute, "main");
+        assert!(ir.matches("sel").count() >= 2, "{ir}");
+        assert_eq!(ir.matches("st.global").count(), 1, "{ir}");
+    }
+
+    #[test]
     fn bevy_style_dynamic_uniform_vertex_features_compile() {
         let source = r"
             struct Mesh { world_from_local: mat3x4<f32> }

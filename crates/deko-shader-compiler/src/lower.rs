@@ -7016,11 +7016,17 @@ impl<'function> FunctionLowerer<'function> {
                     result: Some(call_result),
                 } => {
                     let resource_arguments = self.call_resource_arguments(*function, arguments);
-                    let arguments = arguments
+                    let argument_values = arguments
                         .iter()
                         .map(|argument| self.call_argument(*argument))
                         .collect::<Result<Vec<_>, _>>()?;
-                    let value = self.inline_call(*function, arguments, resource_arguments)?;
+                    let (value, updated_arguments) =
+                        self.inline_call(*function, argument_values, resource_arguments)?;
+                    self.write_back_call_pointer_arguments(
+                        *function,
+                        arguments,
+                        updated_arguments,
+                    )?;
                     self.values.insert(*call_result, value);
                 }
                 naga::Statement::Call {
@@ -7035,28 +7041,11 @@ impl<'function> FunctionLowerer<'function> {
                         .collect::<Result<Vec<_>, _>>()?;
                     let updated_arguments =
                         self.inline_void_call(*function, argument_values, resource_arguments)?;
-                    for ((argument, parameter), value) in arguments
-                        .iter()
-                        .zip(&self.module.functions[*function].arguments)
-                        .zip(updated_arguments)
-                    {
-                        if !matches!(
-                            self.module.types[parameter.ty].inner,
-                            naga::TypeInner::Pointer { .. }
-                        ) {
-                            continue;
-                        }
-                        if self.pointer_is_argument(*argument) {
-                            self.store_argument_pointer(*argument, value)?;
-                        } else if self.pointer_is_local(*argument) {
-                            self.store_local_pointer(*argument, value)?;
-                        } else {
-                            return Err(Error::UnsupportedFeature(format!(
-                                "call pointer argument {:?}",
-                                self.source.expressions[*argument]
-                            )));
-                        }
-                    }
+                    self.write_back_call_pointer_arguments(
+                        *function,
+                        arguments,
+                        updated_arguments,
+                    )?;
                 }
                 naga::Statement::Kill => self.emit(Instr::new(OpKill {})),
                 naga::Statement::ControlBarrier(flags) => {
@@ -7276,6 +7265,40 @@ impl<'function> FunctionLowerer<'function> {
         Ok(None)
     }
 
+    fn merge_conditional_pointer_arguments(
+        &mut self,
+        condition: &Value,
+        arguments: Vec<Value>,
+        accepted_arguments: &[Value],
+        rejected_arguments: &[Value],
+    ) -> Result<(), Error> {
+        self.arguments = arguments;
+        let pointer_arguments = self
+            .source
+            .arguments
+            .iter()
+            .enumerate()
+            .filter_map(|(index, argument)| {
+                matches!(
+                    self.module.types[argument.ty].inner,
+                    naga::TypeInner::Pointer { .. }
+                )
+                .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        for index in pointer_arguments {
+            let accepted = accepted_arguments.get(index).ok_or_else(|| {
+                Error::UnsupportedFeature(format!("missing accept-branch argument {index}"))
+            })?;
+            let rejected = rejected_arguments.get(index).ok_or_else(|| {
+                Error::UnsupportedFeature(format!("missing reject-branch argument {index}"))
+            })?;
+            let merged = self.select(condition, accepted.clone(), rejected.clone())?;
+            self.arguments[index] = merged;
+        }
+        Ok(())
+    }
+
     fn conditional(
         &mut self,
         condition: &Value,
@@ -7299,6 +7322,7 @@ impl<'function> FunctionLowerer<'function> {
         let parent_predicate = self.execution_predicate;
         let condition_predicate = Self::predicate(&condition.components[0])?;
         let locals = self.locals.clone();
+        let arguments = self.arguments.clone();
         let accepted_predicate = self.combine_predicates(parent_predicate, condition_predicate);
         self.execution_predicate = accepted_predicate;
         let early_returns_before_accept = self.early_returns.len();
@@ -7306,12 +7330,14 @@ impl<'function> FunctionLowerer<'function> {
         let accepted_has_partial_return =
             accepted.is_none() && self.early_returns.len() != early_returns_before_accept;
         let accepted_locals = self.locals.clone();
+        let accepted_arguments = self.arguments.clone();
         let accepted_continuation = if accepted.is_some() {
             false.into()
         } else {
             self.execution_predicate
         };
         self.locals.clone_from(&locals);
+        self.arguments.clone_from(&arguments);
         let rejected_predicate =
             self.combine_predicates(parent_predicate, condition_predicate.bnot());
         self.execution_predicate = rejected_predicate;
@@ -7320,11 +7346,18 @@ impl<'function> FunctionLowerer<'function> {
         let rejected_has_partial_return =
             rejected.is_none() && self.early_returns.len() != early_returns_before_reject;
         let rejected_locals = self.locals.clone();
+        let rejected_arguments = self.arguments.clone();
         let rejected_continuation = if rejected.is_some() {
             false.into()
         } else {
             self.execution_predicate
         };
+        self.merge_conditional_pointer_arguments(
+            condition,
+            arguments,
+            &accepted_arguments,
+            &rejected_arguments,
+        )?;
         match (accepted, rejected) {
             (Some(accepted), Some(rejected)) => {
                 self.execution_predicate = parent_predicate;
@@ -7446,12 +7479,43 @@ impl<'function> FunctionLowerer<'function> {
         Ok(value)
     }
 
+    fn write_back_call_pointer_arguments(
+        &mut self,
+        function: naga::Handle<naga::Function>,
+        arguments: &[naga::Handle<naga::Expression>],
+        updated_arguments: Vec<Value>,
+    ) -> Result<(), Error> {
+        for ((argument, parameter), value) in arguments
+            .iter()
+            .zip(&self.module.functions[function].arguments)
+            .zip(updated_arguments)
+        {
+            if !matches!(
+                self.module.types[parameter.ty].inner,
+                naga::TypeInner::Pointer { .. }
+            ) {
+                continue;
+            }
+            if self.pointer_is_argument(*argument) {
+                self.store_argument_pointer(*argument, value)?;
+            } else if self.pointer_is_local(*argument) {
+                self.store_local_pointer(*argument, value)?;
+            } else {
+                return Err(Error::UnsupportedFeature(format!(
+                    "call pointer argument {:?}",
+                    self.source.expressions[*argument]
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn inline_call(
         &mut self,
         function: naga::Handle<naga::Function>,
         arguments: Vec<Value>,
         resource_arguments: HashMap<u32, naga::Handle<naga::GlobalVariable>>,
-    ) -> Result<Value, Error> {
+    ) -> Result<(Value, Vec<Value>), Error> {
         let target = std::mem::replace(&mut self.target, Function::single_block(Vec::new()));
         let loop_base_depth = self.loops.len();
         let mut callee = Self {
@@ -7479,13 +7543,14 @@ impl<'function> FunctionLowerer<'function> {
             )),
             error => error,
         });
+        let updated_arguments = callee.arguments.clone();
         self.target = callee.target;
         self.blocks = callee.blocks;
         self.edges = callee.edges;
         self.current_block = callee.current_block;
         self.labels = callee.labels;
         self.loops = callee.loops;
-        result
+        result.map(|value| (value, updated_arguments))
     }
 
     fn inline_void_call(
