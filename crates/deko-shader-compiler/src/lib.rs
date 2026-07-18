@@ -2405,6 +2405,76 @@ mod tests {
     }
 
     #[test]
+    fn nested_lexical_block_loop_controls_compile() {
+        let source = r"
+            @group(0) @binding(0) var<storage, read_write> output: array<u32>;
+
+            @compute @workgroup_size(1)
+            fn main() {
+                var value = 0u;
+                loop {
+                    {
+                        value += 1u;
+                        break;
+                    }
+                }
+                loop {
+                    {
+                        value += 1u;
+                        continue;
+                    }
+                    continuing {
+                        break if value == 4u;
+                    }
+                }
+                output[0] = value;
+            }
+        ";
+        let artifact = Compiler
+            .compile_wgsl(
+                source,
+                Stage::Compute,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap();
+        assert!(artifact.dksh.starts_with(b"DKSH"));
+    }
+
+    #[test]
+    fn side_effecting_conditional_break_merges_exit_value() {
+        let source = r"
+            @group(0) @binding(0) var<storage, read_write> output: array<u32>;
+
+            @compute @workgroup_size(1)
+            fn main() {
+                var value = 0u;
+                loop {
+                    if value == 3u {
+                        value += 10u;
+                        break;
+                    }
+                    value += 1u;
+                }
+                output[0] = value;
+            }
+        ";
+        let artifact = Compiler
+            .compile_wgsl(
+                source,
+                Stage::Compute,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap();
+        assert!(artifact.dksh.starts_with(b"DKSH"));
+        let ir = lowered_ir(source, naga::ShaderStage::Compute, "main");
+        assert_eq!(ir.matches("phi_dst").count(), 3, "{ir}");
+    }
+
+    #[test]
     fn nested_early_return_preserves_only_live_invocations() {
         let source = r"
             @group(0) @binding(0) var<storage, read_write> output: array<u32>;

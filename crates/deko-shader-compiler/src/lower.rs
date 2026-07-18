@@ -6576,25 +6576,31 @@ impl<'function> FunctionLowerer<'function> {
             .collect()
     }
 
-    fn block_is_single_break(block: &naga::Block) -> bool {
-        let mut statements = block.iter();
-        matches!(statements.next(), Some(naga::Statement::Break)) && statements.next().is_none()
-    }
-
     fn break_prefix(block: &naga::Block) -> Option<naga::Block> {
-        let break_index = block
-            .iter()
-            .rposition(|statement| !matches!(statement, naga::Statement::Emit(_)))?;
-        matches!(block[break_index], naga::Statement::Break)
-            .then(|| naga::Block::from_vec(block[..break_index].to_vec()))
+        Self::loop_control_prefix(block, true)
     }
 
     fn continue_prefix(block: &naga::Block) -> Option<naga::Block> {
-        let continue_index = block
+        Self::loop_control_prefix(block, false)
+    }
+
+    fn loop_control_prefix(block: &naga::Block, is_break: bool) -> Option<naga::Block> {
+        let control_index = block
             .iter()
             .rposition(|statement| !matches!(statement, naga::Statement::Emit(_)))?;
-        matches!(block[continue_index], naga::Statement::Continue)
-            .then(|| naga::Block::from_vec(block[..continue_index].to_vec()))
+        let mut prefix = block[..control_index].to_vec();
+        match &block[control_index] {
+            naga::Statement::Break if is_break => {}
+            naga::Statement::Continue if !is_break => {}
+            naga::Statement::Block(nested) => {
+                let nested_prefix = Self::loop_control_prefix(nested, is_break)?;
+                if !nested_prefix.is_empty() {
+                    prefix.push(naga::Statement::Block(nested_prefix));
+                }
+            }
+            _ => return None,
+        }
+        Some(naga::Block::from_vec(prefix))
     }
 
     fn block_return_value(block: &naga::Block) -> Option<naga::Handle<naga::Expression>> {
@@ -6795,7 +6801,6 @@ impl<'function> FunctionLowerer<'function> {
         });
         let break_prefix = Self::break_prefix(body);
         let continue_prefix = Self::continue_prefix(body);
-        let merge_exit_locals = break_prefix.is_some();
         let executable_body = break_prefix
             .as_ref()
             .or(continue_prefix.as_ref())
@@ -6888,35 +6893,36 @@ impl<'function> FunctionLowerer<'function> {
             self.add_edge(edge.block, exit);
         }
         self.current_block = exit;
-        if merge_exit_locals {
-            self.merge_break_locals(&context, exit)?;
-            self.merge_loop_returns(&context)?;
-        } else {
-            self.merge_loop_returns(&context)?;
-            for phi in loop_phis {
-                self.locals.insert(phi.local, phi.header_value);
-            }
-        }
+        self.merge_break_locals(&context, exit)?;
+        self.merge_loop_returns(&context)?;
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     fn merge_break_locals(
         &mut self,
         context: &LoopContext,
         exit_block: usize,
     ) -> Result<(), Error> {
+        if context
+            .break_edges
+            .iter()
+            .any(|edge| edge.returned.is_some())
+        {
+            self.locals.clone_from(&context.entry_locals);
+            return Ok(());
+        }
         let Some(first) = context.break_edges.first() else {
             self.locals.clone_from(&context.entry_locals);
             return Ok(());
         };
-        let mut local_handles = context.carried_locals.clone();
+        let mut local_handles = Vec::new();
         for &handle in &context.exit_locals {
-            if !local_handles.contains(&handle)
-                && context
-                    .break_edges
-                    .iter()
-                    .filter(|edge| edge.returned.is_none())
-                    .any(|edge| edge.locals.get(&handle) != context.entry_locals.get(&handle))
+            if context
+                .break_edges
+                .iter()
+                .filter(|edge| edge.returned.is_none())
+                .any(|edge| edge.locals.get(&handle) != context.entry_locals.get(&handle))
             {
                 local_handles.push(handle);
             }
@@ -7529,15 +7535,25 @@ impl<'function> FunctionLowerer<'function> {
                     }
                     if !self.loops.is_empty()
                         && accept.is_empty()
-                        && Self::block_is_single_break(reject)
+                        && let Some(prefix) = Self::break_prefix(reject)
                     {
+                        if let Some(value) =
+                            self.conditional(&condition, &naga::Block::new(), &prefix)?
+                        {
+                            return Ok(Some(value));
+                        }
                         self.emit_conditional_break(&condition, false, None)?;
                         continue;
                     }
                     if !self.loops.is_empty()
                         && reject.is_empty()
-                        && Self::block_is_single_break(accept)
+                        && let Some(prefix) = Self::break_prefix(accept)
                     {
+                        if let Some(value) =
+                            self.conditional(&condition, &prefix, &naga::Block::new())?
+                        {
+                            return Ok(Some(value));
+                        }
                         self.emit_conditional_break(&condition, true, None)?;
                         continue;
                     }

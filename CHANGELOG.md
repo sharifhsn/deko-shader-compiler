@@ -43,6 +43,8 @@
   removed.
 - Preserve the proven loop-header value path for ordinary conditional loop exits; exit-edge
   phi merging is restricted to terminal unconditional breaks that require post-body values.
+- Recognize `break` and `continue` through nested lexical blocks and conditional prefixes,
+  and emit exit phis only for locals whose live break-edge value differs from the loop header.
 - Snapshot and merge pointer arguments across divergent helper-function arms, and write
   updated pointer values back from both void and value-returning calls.
 - Lower WGSL atomic operations on `r32uint` and `r32sint` storage textures to native
