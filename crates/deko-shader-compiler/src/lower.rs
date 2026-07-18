@@ -732,6 +732,7 @@ struct LoopContext {
     entry_locals: HashMap<naga::Handle<naga::LocalVariable>, Value>,
     break_edges: Vec<LoopBreakEdge>,
     continue_edges: Vec<LoopContinueEdge>,
+    needs_exit_local_merge: bool,
 }
 
 struct LoopBreakEdge {
@@ -6798,6 +6799,7 @@ impl<'function> FunctionLowerer<'function> {
             entry_locals: self.locals.clone(),
             break_edges: Vec::new(),
             continue_edges: Vec::new(),
+            needs_exit_local_merge: false,
         });
         let break_prefix = Self::break_prefix(body);
         let continue_prefix = Self::continue_prefix(body);
@@ -6826,15 +6828,13 @@ impl<'function> FunctionLowerer<'function> {
                 .expect("loop context was pushed")
                 .exit_label;
             self.emit(Instr::new(OpBrk { target: exit_label }));
-            self.loops
-                .last_mut()
-                .expect("loop context was pushed")
-                .break_edges
-                .push(LoopBreakEdge {
-                    block: body_end,
-                    returned: None,
-                    locals: self.locals.clone(),
-                });
+            let context = self.loops.last_mut().expect("loop context was pushed");
+            context.needs_exit_local_merge = true;
+            context.break_edges.push(LoopBreakEdge {
+                block: body_end,
+                returned: None,
+                locals: self.locals.clone(),
+            });
             body_falls_through = false;
         }
         let continuing_block = self.append_block(continue_label);
@@ -6893,7 +6893,13 @@ impl<'function> FunctionLowerer<'function> {
             self.add_edge(edge.block, exit);
         }
         self.current_block = exit;
-        self.merge_break_locals(&context, exit)?;
+        if context.needs_exit_local_merge {
+            self.merge_break_locals(&context, exit)?;
+        } else {
+            for phi in loop_phis {
+                self.locals.insert(phi.local, phi.header_value);
+            }
+        }
         self.merge_loop_returns(&context)?;
         Ok(())
     }
@@ -7537,10 +7543,17 @@ impl<'function> FunctionLowerer<'function> {
                         && accept.is_empty()
                         && let Some(prefix) = Self::break_prefix(reject)
                     {
+                        let prefix_has_side_effects = !prefix.is_empty();
                         if let Some(value) =
                             self.conditional(&condition, &naga::Block::new(), &prefix)?
                         {
                             return Ok(Some(value));
+                        }
+                        if prefix_has_side_effects {
+                            self.loops
+                                .last_mut()
+                                .expect("loop context checked above")
+                                .needs_exit_local_merge = true;
                         }
                         self.emit_conditional_break(&condition, false, None)?;
                         continue;
@@ -7549,10 +7562,17 @@ impl<'function> FunctionLowerer<'function> {
                         && reject.is_empty()
                         && let Some(prefix) = Self::break_prefix(accept)
                     {
+                        let prefix_has_side_effects = !prefix.is_empty();
                         if let Some(value) =
                             self.conditional(&condition, &prefix, &naga::Block::new())?
                         {
                             return Ok(Some(value));
+                        }
+                        if prefix_has_side_effects {
+                            self.loops
+                                .last_mut()
+                                .expect("loop context checked above")
+                                .needs_exit_local_merge = true;
                         }
                         self.emit_conditional_break(&condition, true, None)?;
                         continue;
