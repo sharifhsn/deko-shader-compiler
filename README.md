@@ -25,8 +25,7 @@ Nested value and void returns remove completed lanes from later side effects.
 Returns taken from inside loops also remove those lanes from effects after the loop.
 Terminal unconditional loop controls preserve values written before `break` and route
 `continue` through the WGSL continuing block. Ordinary conditional loop exits retain the
-established loop-header value path, while backward local-liveness analysis limits changed
-break-edge exit phis to values actually read after the loop.
+established loop-header value path, while changed break-edge values receive selective exit phis.
 Pointer arguments preserve per-invocation writes across divergent void and value helpers.
 WGSL switch cases with multiple selectors lower to one shared conditional body while ordinary
 switches retain their direct lowering path.
