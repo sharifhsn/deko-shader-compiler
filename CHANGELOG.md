@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Bump the backend cache ABI after loop-control lowering changed so persistent DKSH artifacts
+  produced by earlier ABI 44 builds cannot survive corrective compiler revisions.
+
 - Create a publishable, SDK-independent compiler workspace targeting the Nintendo
   Switch GM20B GPU.
 - Add direct WGSL/Naga lowering for vertex, fragment, and compute shaders into the
