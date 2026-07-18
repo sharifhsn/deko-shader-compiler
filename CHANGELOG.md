@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Invalidate experimental ABI 46 loop-exit artifacts and keep mutation-bearing nested and
+  conditional exits fail-closed until their values can be carried without exit CFG phis.
+
 - Bump the backend cache ABI after loop-control lowering changed so persistent DKSH artifacts
   produced by earlier ABI 44 builds cannot survive corrective compiler revisions.
 
