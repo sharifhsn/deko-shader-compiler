@@ -1,7 +1,7 @@
 //! Safe, deterministic support for `Deko3D`'s DKSH shader container.
 //!
 //! DKSH has one aligned control section followed by one aligned machine-code section.
-//! wgpu's `Deko3D` backend additionally appends versioned resource-binding metadata after
+//! wgpu's `Deko3D` backend additionally appends resource-binding metadata after
 //! those sections. This crate reads and writes both without casting byte slices to Rust
 //! structs.
 
@@ -20,7 +20,7 @@ const HEADER_SIZE_U32: u32 = 24;
 /// Size of one DKSH program-table entry.
 pub const PROGRAM_HEADER_SIZE: usize = 64;
 /// Signature of the wgpu `Deko3D` binding metadata extension.
-pub const BINDING_METADATA_MAGIC: &[u8; 8] = b"DKRBv001";
+pub const BINDING_METADATA_MAGIC: &[u8; 8] = b"DKRBMETA";
 
 /// Shader program type stored in a DKSH program-table entry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

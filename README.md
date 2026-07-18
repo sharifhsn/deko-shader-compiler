@@ -34,7 +34,7 @@ updates and target the innermost switch rather than an enclosing loop.
 Native Maxwell TXD lowering supports explicit WGSL gradients for 1D/2D sampled textures,
 including array layers and constant offsets. 3D and cube gradients use Mesa's mathematically
 equivalent derivative-to-LOD rewrite before the ordinary Maxwell texture instruction.
-Multiview pipelines use wgpu's Deko draw-replay ABI: the compiler loads the current view from
+Multiview pipelines use wgpu's Deko draw-replay contract: the compiler loads the current view from
 reserved uniform target 14, writes the Maxwell layer output, and exposes the layer as fragment
 `view_index`.
 
@@ -55,10 +55,10 @@ foundation. Imported upstream source retains its original notices and is recorde
 - `deko-dksh`: safe DKSH container and binding-metadata model
 - `deko-shader-compiler-macros`: proc macros required by the extracted NAK IR
 
-`deko-shader-compiler` also exposes a versioned `CacheKey` and thread-safe `CompilerCache`.
+`deko-shader-compiler` also exposes a deterministic `CacheKey` and thread-safe `CompilerCache`.
 Cache identities include the exact WGSL, stage, entry point, canonical pipeline constants, every
-code-generation option, the package version, and a manually versioned backend ABI. The RAM cache
-has configurable entry and byte limits with deterministic LRU eviction. Call
+code-generation option, and the compiler package version. The RAM cache has configurable entry
+and byte limits with deterministic LRU eviction. Call
 `with_persistent_directory` to opt into checksummed, structurally validated DKSH files written by
 atomic rename; corrupt or stale files are removed and regenerated without making compilation fail.
 

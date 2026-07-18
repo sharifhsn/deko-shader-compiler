@@ -1,4 +1,4 @@
-//! Minimal debug-flag compatibility surface for extracted Mesa NAK passes.
+//! Standalone debug settings consumed by the extracted Mesa NAK passes.
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Debug;

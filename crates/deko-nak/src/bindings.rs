@@ -79,7 +79,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn compatibility_values_match_public_nak_headers() {
+    fn rust_values_match_public_nak_headers() {
         assert_eq!(size_of::<FsKey>(), 4);
         assert_eq!(MeshTopology::Points as u32, 0);
         assert_eq!(MeshTopology::Lines as u32, 1);

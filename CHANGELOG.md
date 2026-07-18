@@ -7,9 +7,6 @@
 - Track lexical switch and loop ownership so explicit and conditional switch breaks preserve
   modified locals without exiting an enclosing loop, while switch-local `continue` statements
   still target the enclosing loop.
-- Advance the backend cache ABI to 48 for the local-memory loop-exit carrier and control-flow
-  ownership changes.
-
 - Create a publishable, SDK-independent compiler workspace targeting the Nintendo
   Switch GM20B GPU.
 - Add direct WGSL/Naga lowering for vertex, fragment, and compute shaders into the
@@ -24,7 +21,6 @@
   array-layer and offset operand packing.
 - Add derivative-to-LOD lowering for explicit 3D and cube texture gradients, including
   the cube-face selection and quotient-rule calculation used by Mesa NIR.
-- Advance the backend ABI cache namespace for the explicit-gradient codegen changes.
 - Lower subgroup barriers to CTA-scoped memory fences on lockstep GM20B warps without
   introducing a whole-workgroup synchronization point.
 - Lower `subgroupBroadcastFirst` using a Maxwell active-lane ballot, first-set-lane
@@ -68,10 +64,10 @@
 - Lower emulated multiview `view_index` inputs through wgpu's reserved Deko uniform
   slot and emit the Maxwell layer output used by replayed vertex draws and fragment input.
 - Add a safe deterministic DKSH encoder/parser with typed stage payloads and
-  versioned binding metadata consumed by wgpu-hal.
+  binding metadata consumed by wgpu-hal.
 - Add the explicit GM20B target descriptor, register allocation, scheduling, SPH
   generation, and machine-code encoding derived from Mesa NAK.
-- Add a versioned deterministic cache key and bounded thread-safe in-memory compiler
+- Add a deterministic cache key and bounded thread-safe in-memory compiler
   cache.
 - Add the `deko-shaderc` command-line compiler and a public Rust API that accepts
   either WGSL or an already validated Naga module.

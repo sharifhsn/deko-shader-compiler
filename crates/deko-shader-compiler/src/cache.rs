@@ -12,21 +12,13 @@ use sha2::{Digest, Sha256};
 
 use crate::{Artifact, Compiler, Error, Options, PipelineConstants, Stage};
 
-/// Version of the stable cache-key encoding.
-pub const CACHE_KEY_VERSION: u32 = 1;
-
-/// Version of the native code-generation contract.
-///
-/// This must be incremented whenever a backend change can alter or invalidate DKSH output without
-/// a package-version change.
-pub const BACKEND_ABI_VERSION: u32 = 48;
-
 /// Default maximum number of compiled artifacts retained in process memory.
 pub const DEFAULT_MEMORY_CACHE_ENTRIES: usize = 256;
 /// Default maximum DKSH and reflection bytes retained in process memory.
 pub const DEFAULT_MEMORY_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
-const PERSISTENT_CACHE_MAGIC: &[u8; 8] = b"DKSCv001";
+const CACHE_KEY_DOMAIN: &[u8] = b"deko-shader-compiler-cache";
+const PERSISTENT_CACHE_MAGIC: &[u8; 8] = b"DKSCACHE";
 const PERSISTENT_CACHE_HEADER_SIZE: usize = 8 + 32 + 8 + 32;
 const MAX_PERSISTENT_ARTIFACT_SIZE: usize = 16 * 1024 * 1024;
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -46,9 +38,7 @@ impl CacheKey {
         options: &Options,
     ) -> Self {
         let mut digest = Sha256::new();
-        digest.update(b"deko-shader-compiler-cache\0");
-        digest.update(CACHE_KEY_VERSION.to_le_bytes());
-        digest.update(BACKEND_ABI_VERSION.to_le_bytes());
+        put_bytes(&mut digest, CACHE_KEY_DOMAIN);
         put_bytes(&mut digest, env!("CARGO_PKG_VERSION").as_bytes());
         put_bytes(&mut digest, source.as_bytes());
         digest.update([match stage {

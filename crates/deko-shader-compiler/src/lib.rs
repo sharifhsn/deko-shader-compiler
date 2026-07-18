@@ -11,8 +11,8 @@ mod cache;
 mod lower;
 
 pub use cache::{
-    BACKEND_ABI_VERSION, CACHE_KEY_VERSION, CacheKey, CacheSource, CompileTelemetry, CompilerCache,
-    DEFAULT_MEMORY_CACHE_BYTES, DEFAULT_MEMORY_CACHE_ENTRIES,
+    CacheKey, CacheSource, CompileTelemetry, CompilerCache, DEFAULT_MEMORY_CACHE_BYTES,
+    DEFAULT_MEMORY_CACHE_ENTRIES,
 };
 
 /// Pipeline override values after wgpu resolves their names.
