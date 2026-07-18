@@ -160,22 +160,17 @@ pub enum Error {
 pub struct Compiler;
 
 impl Compiler {
-    /// Resolve wgpu-style automatic entry-point selection for WGSL.
-    ///
-    /// The requested name wins when present. Otherwise, a module with exactly one entry point for
-    /// the requested stage selects that entry point, matching wgpu's omitted-entry behavior.
-    ///
-    /// # Errors
-    ///
-    /// Returns a parse error or [`Error::MissingEntryPoint`] when selection is ambiguous or absent.
-    pub fn resolve_wgsl_entry_point(
+    fn parse_wgsl(self, source: &str) -> Result<naga::Module, Error> {
+        naga::front::wgsl::parse_str(source)
+            .map_err(|error| Error::Parse(error.emit_to_string(source)))
+    }
+
+    fn resolve_module_entry_point(
         self,
-        source: &str,
+        module: &naga::Module,
         stage: Stage,
         requested: &str,
     ) -> Result<String, Error> {
-        let module = naga::front::wgsl::parse_str(source)
-            .map_err(|error| Error::Parse(error.emit_to_string(source)))?;
         let stage = naga::ShaderStage::from(stage);
         if module
             .entry_points
@@ -204,6 +199,33 @@ impl Compiler {
         Ok(candidate.to_owned())
     }
 
+    fn validate_wgsl_module(self, module: &naga::Module) -> Result<naga::valid::ModuleInfo, Error> {
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(module)
+        .map_err(|error| Error::Validation(error.to_string()))
+    }
+
+    /// Resolve wgpu-style automatic entry-point selection for WGSL.
+    ///
+    /// The requested name wins when present. Otherwise, a module with exactly one entry point for
+    /// the requested stage selects that entry point, matching wgpu's omitted-entry behavior.
+    ///
+    /// # Errors
+    ///
+    /// Returns a parse error or [`Error::MissingEntryPoint`] when selection is ambiguous or absent.
+    pub fn resolve_wgsl_entry_point(
+        self,
+        source: &str,
+        stage: Stage,
+        requested: &str,
+    ) -> Result<String, Error> {
+        let module = self.parse_wgsl(source)?;
+        self.resolve_module_entry_point(&module, stage, requested)
+    }
+
     /// Parse and validate WGSL, then compile one selected pipeline entry point.
     ///
     /// # Errors
@@ -217,15 +239,8 @@ impl Compiler {
         constants: &PipelineConstants,
         options: Options,
     ) -> Result<Artifact, Error> {
-        let module = naga::front::wgsl::parse_str(source)
-            .map_err(|error| Error::Parse(error.emit_to_string(source)))?;
-        let mut validator = naga::valid::Validator::new(
-            naga::valid::ValidationFlags::all(),
-            naga::valid::Capabilities::all(),
-        );
-        let info = validator
-            .validate(&module)
-            .map_err(|error| Error::Validation(error.to_string()))?;
+        let module = self.parse_wgsl(source)?;
+        let info = self.validate_wgsl_module(&module)?;
         self.compile_module(&ModuleRequest {
             module: &module,
             info: &info,

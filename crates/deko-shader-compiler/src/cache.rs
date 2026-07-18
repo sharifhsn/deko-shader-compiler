@@ -256,6 +256,78 @@ impl CompilerCache {
         ))
     }
 
+    /// Resolve wgpu-style automatic entry-point selection, then compile WGSL or return a cached
+    /// artifact. Exact-name memory and persistent cache hits avoid parsing WGSL entirely; misses
+    /// parse once and reuse that module for validation and native compilation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed error as [`Compiler::compile_wgsl`]. Failed compilations are not
+    /// cached.
+    pub fn compile_wgsl_resolving_entry_point_with_telemetry(
+        &self,
+        source: &str,
+        stage: Stage,
+        requested_entry_point: &str,
+        constants: &PipelineConstants,
+        options: Options,
+    ) -> Result<(CacheKey, String, Arc<Artifact>, CompileTelemetry), Error> {
+        let started = Instant::now();
+        let requested_key =
+            CacheKey::new(source, stage, requested_entry_point, constants, &options);
+        if let Some((artifact, source)) = self.get(requested_key) {
+            return Ok((
+                requested_key,
+                requested_entry_point.to_owned(),
+                artifact,
+                CompileTelemetry {
+                    source,
+                    elapsed: started.elapsed(),
+                },
+            ));
+        }
+
+        let compiler = Compiler;
+        let module = compiler.parse_wgsl(source)?;
+        let entry_point =
+            compiler.resolve_module_entry_point(&module, stage, requested_entry_point)?;
+        let key = CacheKey::new(source, stage, &entry_point, constants, &options);
+        if key != requested_key {
+            if let Some((artifact, source)) = self.get(key) {
+                return Ok((
+                    key,
+                    entry_point,
+                    artifact,
+                    CompileTelemetry {
+                        source,
+                        elapsed: started.elapsed(),
+                    },
+                ));
+            }
+        }
+
+        let info = compiler.validate_wgsl_module(&module)?;
+        let artifact = Arc::new(compiler.compile_module(&crate::ModuleRequest {
+            module: &module,
+            info: &info,
+            stage: stage.into(),
+            entry_point: &entry_point,
+            constants,
+            options,
+        })?);
+        self.persistent_insert(key, &artifact);
+        let artifact = self.memory_insert(key, artifact);
+        Ok((
+            key,
+            entry_point,
+            artifact,
+            CompileTelemetry {
+                source: CacheSource::Compiled,
+                elapsed: started.elapsed(),
+            },
+        ))
+    }
+
     /// Number of successfully compiled entries currently retained in RAM.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -280,6 +352,14 @@ impl CompilerCache {
         let artifact = state.entries.get(&key).cloned()?;
         touch(&mut state.least_recently_used, key);
         Some(artifact)
+    }
+
+    fn get(&self, key: CacheKey) -> Option<(Arc<Artifact>, CacheSource)> {
+        if let Some(artifact) = self.memory_get(key) {
+            return Some((artifact, CacheSource::Memory));
+        }
+        let artifact = Arc::new(self.persistent_get(key)?);
+        Some((self.memory_insert(key, artifact), CacheSource::Persistent))
     }
 
     fn memory_insert(&self, key: CacheKey, artifact: Arc<Artifact>) -> Arc<Artifact> {
@@ -476,6 +556,55 @@ mod tests {
         let too_small = CompilerCache::with_memory_limits(8, artifact_size(&artifact) - 1);
         compile(&too_small, &source(4));
         assert!(too_small.is_empty());
+    }
+
+    #[test]
+    fn resolving_compile_skips_parsing_for_exact_memory_hit() {
+        let cache = CompilerCache::default();
+        let source = "this is deliberately not WGSL";
+        let options = Options::default();
+        let constants = PipelineConstants::new();
+        let key = CacheKey::new(source, Stage::Compute, "main", &constants, &options);
+        let expected = Arc::new(Artifact {
+            dksh: vec![1, 2, 3],
+            bindings: Vec::new(),
+        });
+        cache.memory_insert(key, expected.clone());
+
+        let (actual_key, entry_point, actual, telemetry) = cache
+            .compile_wgsl_resolving_entry_point_with_telemetry(
+                source,
+                Stage::Compute,
+                "main",
+                &constants,
+                options,
+            )
+            .unwrap();
+
+        assert_eq!(actual_key, key);
+        assert_eq!(entry_point, "main");
+        assert!(Arc::ptr_eq(&actual, &expected));
+        assert_eq!(telemetry.source, CacheSource::Memory);
+    }
+
+    #[test]
+    fn resolving_compile_selects_the_only_stage_entry_point() {
+        let cache = CompilerCache::default();
+        let source = "@compute @workgroup_size(1) fn actual() {}";
+
+        let (_, entry_point, artifact, telemetry) = cache
+            .compile_wgsl_resolving_entry_point_with_telemetry(
+                source,
+                Stage::Compute,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap();
+
+        assert_eq!(entry_point, "actual");
+        assert_eq!(&artifact.dksh[..4], b"DKSH");
+        assert_eq!(telemetry.source, CacheSource::Compiled);
     }
 
     #[test]
