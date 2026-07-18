@@ -2443,7 +2443,7 @@ mod tests {
     }
 
     #[test]
-    fn side_effecting_conditional_break_merges_exit_value() {
+    fn side_effecting_conditional_break_is_rejected_without_miscompilation() {
         let source = r"
             @group(0) @binding(0) var<storage, read_write> output: array<u32>;
 
@@ -2460,7 +2460,7 @@ mod tests {
                 output[0] = value;
             }
         ";
-        let artifact = Compiler
+        let error = Compiler
             .compile_wgsl(
                 source,
                 Stage::Compute,
@@ -2468,10 +2468,8 @@ mod tests {
                 &PipelineConstants::new(),
                 Options::default(),
             )
-            .unwrap();
-        assert!(artifact.dksh.starts_with(b"DKSH"));
-        let ir = lowered_ir(source, naga::ShaderStage::Compute, "main");
-        assert_eq!(ir.matches("phi_dst").count(), 3, "{ir}");
+            .unwrap_err();
+        assert!(matches!(error, Error::UnsupportedFeature(_)), "{error:?}");
     }
 
     #[test]

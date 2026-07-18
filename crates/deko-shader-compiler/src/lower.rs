@@ -6594,6 +6594,9 @@ impl<'function> FunctionLowerer<'function> {
             naga::Statement::Break if is_break => {}
             naga::Statement::Continue if !is_break => {}
             naga::Statement::Block(nested) => {
+                if !prefix.is_empty() {
+                    return None;
+                }
                 let nested_prefix = Self::loop_control_prefix(nested, is_break)?;
                 if !nested_prefix.is_empty() {
                     prefix.push(naga::Statement::Block(nested_prefix));
@@ -7542,38 +7545,16 @@ impl<'function> FunctionLowerer<'function> {
                     if !self.loops.is_empty()
                         && accept.is_empty()
                         && let Some(prefix) = Self::break_prefix(reject)
+                        && prefix.is_empty()
                     {
-                        let prefix_has_side_effects = !prefix.is_empty();
-                        if let Some(value) =
-                            self.conditional(&condition, &naga::Block::new(), &prefix)?
-                        {
-                            return Ok(Some(value));
-                        }
-                        if prefix_has_side_effects {
-                            self.loops
-                                .last_mut()
-                                .expect("loop context checked above")
-                                .needs_exit_local_merge = true;
-                        }
                         self.emit_conditional_break(&condition, false, None)?;
                         continue;
                     }
                     if !self.loops.is_empty()
                         && reject.is_empty()
                         && let Some(prefix) = Self::break_prefix(accept)
+                        && prefix.is_empty()
                     {
-                        let prefix_has_side_effects = !prefix.is_empty();
-                        if let Some(value) =
-                            self.conditional(&condition, &prefix, &naga::Block::new())?
-                        {
-                            return Ok(Some(value));
-                        }
-                        if prefix_has_side_effects {
-                            self.loops
-                                .last_mut()
-                                .expect("loop context checked above")
-                                .needs_exit_local_merge = true;
-                        }
                         self.emit_conditional_break(&condition, true, None)?;
                         continue;
                     }
