@@ -18,8 +18,8 @@ all/any reductions, ballots, arithmetic and bitwise reductions, and add/multiply
 Collectives use an active-lane ballot so partial and sparse GM20B warps do not contribute
 undefined shuffle values.
 `workgroupUniformLoad` supports constructible and atomic workgroup values with two
-workgroup synchronization points. Divergent structured branches predicate their emitted
-instructions, including memory and image side effects.
+workgroup synchronization points. Divergent structured branches predicate their memory,
+image, atomic, and discard side effects while pure calculations remain safely if-converted.
 Native Maxwell TXD lowering supports explicit WGSL gradients for 1D/2D sampled textures,
 including array layers and constant offsets. 3D and cube gradients use Mesa's mathematically
 equivalent derivative-to-LOD rewrite before the ordinary Maxwell texture instruction.

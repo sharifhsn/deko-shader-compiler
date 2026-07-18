@@ -787,21 +787,17 @@ impl<'function> FunctionLowerer<'function> {
     }
 
     fn emit(&mut self, mut instruction: Instr) {
-        let must_be_unpredicated = matches!(
+        let has_branch_side_effect = matches!(
             instruction.op,
-            Op::Undef(_)
-                | Op::PhiSrcs(_)
-                | Op::PhiDsts(_)
-                | Op::Copy(_)
-                | Op::Pin(_)
-                | Op::Unpin(_)
-                | Op::Swap(_)
-                | Op::ParCopy(_)
-                | Op::R2UR(_)
-                | Op::RegOut(_)
-                | Op::Annotate(_)
+            Op::St(_)
+                | Op::StSCheckUnlock(_)
+                | Op::Atom(_)
+                | Op::ASt(_)
+                | Op::SuSt(_)
+                | Op::SuAtom(_)
+                | Op::Kill(_)
         );
-        if !must_be_unpredicated && !self.execution_predicate.is_true() {
+        if has_branch_side_effect && !self.execution_predicate.is_true() {
             instruction.pred = self.combine_predicates(self.execution_predicate, instruction.pred);
         }
         self.blocks[self.current_block].instrs.push(instruction);

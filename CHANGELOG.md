@@ -30,10 +30,10 @@
   and divergent-lane semantics instead of reading inactive shuffle lanes.
 - Lower `workgroupUniformLoad` for scalar, atomic, and aggregate workgroup pointers
   with the required workgroup barrier-load-barrier sequence.
-- Predicate instructions emitted by divergent `if` arms, so storage, workgroup, image,
-  and atomic side effects occur only in the invocations that selected that arm.
-- Keep NAK SSA and register-allocation pseudo-operations unpredicated inside divergent
-  branches while preserving predicates on the native operations they define.
+- Predicate side-effecting instructions emitted by divergent `if` arms, so storage,
+  workgroup, image, atomic, and discard effects occur only in invocations that selected
+  that arm. Pure calculations and structured-control operations remain unconditional,
+  preserving NAK SSA lifetime and scheduling invariants through if-converted loops.
 - Lower array texture layer-count queries, including the Maxwell cube-face count to
   cube-layer conversion used by Mesa NIR.
 - Accept pipeline-specialized compute workgroup-size overrides and preserve their
