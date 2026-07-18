@@ -38,6 +38,9 @@
   so lanes that have returned cannot execute later side effects.
 - Preserve that live invocation mask across loop exits so lanes returning from inside a
   loop cannot execute side effects that follow the loop.
+- Lower terminal unconditional loop `break` and `continue` statements, merge loop-carried
+  locals from every break edge, and correctly remap CFG edges when unreachable blocks are
+  removed.
 - Snapshot and merge pointer arguments across divergent helper-function arms, and write
   updated pointer values back from both void and value-returning calls.
 - Lower WGSL atomic operations on `r32uint` and `r32sint` storage textures to native

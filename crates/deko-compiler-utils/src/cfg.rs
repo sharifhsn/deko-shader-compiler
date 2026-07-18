@@ -135,18 +135,47 @@ impl<'a, N> DepthFirstSearch for ReachableDFS<'a, N> {
 }
 
 fn remove_unreachable<N>(nodes: &mut Vec<CFGNode<N>>) {
-    let mut reachable_dfs = ReachableDFS {
-        nodes,
-        reachable: Default::default(),
+    let reachable = {
+        let mut reachable_dfs = ReachableDFS {
+            nodes,
+            reachable: Default::default(),
+        };
+        dfs(&mut reachable_dfs, 0);
+        (0..nodes.len())
+            .map(|index| reachable_dfs.reachable.contains(index))
+            .collect::<Vec<_>>()
     };
-    dfs(&mut reachable_dfs, 0);
 
-    // The Vec::retain() method guarantees that each item is visited once,
-    // in-order so it's safe to use an external iterator like this.
-    let mut idx_iter = (0_usize..).into_iter();
+    let mut next_index = 0;
+    let remap = reachable
+        .iter()
+        .map(|&is_reachable| {
+            is_reachable.then(|| {
+                let index = next_index;
+                next_index += 1;
+                index
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for node in nodes.iter_mut() {
+        let remap_edge = |index: &mut usize| {
+            if let Some(new_index) = remap[*index] {
+                *index = new_index;
+                true
+            } else {
+                false
+            }
+        };
+        node.pred.retain_mut(remap_edge);
+        node.succ.retain_mut(remap_edge);
+    }
+
+    let mut old_index = 0;
     nodes.retain(|_| {
-        let i = idx_iter.next().unwrap();
-        reachable_dfs.reachable.contains(i)
+        let keep = reachable[old_index];
+        old_index += 1;
+        keep
     });
 }
 
@@ -640,6 +669,23 @@ mod tests {
         }
 
         assert_eq!(&lphs, expected);
+    }
+
+    #[test]
+    fn removing_middle_unreachable_node_remaps_edges() {
+        let mut builder = CFGBuilder::<_, _, RandomState>::new();
+        builder.add_node(0, "entry");
+        builder.add_node(1, "unreachable");
+        builder.add_node(2, "exit");
+        builder.add_edge(0, 2);
+
+        let cfg = builder.as_cfg(false);
+
+        assert_eq!(cfg.len(), 2);
+        assert_eq!(cfg[0], "entry");
+        assert_eq!(cfg[1], "exit");
+        assert_eq!(cfg.succ_indices(0), &[1]);
+        assert_eq!(cfg.pred_indices(1), &[0]);
     }
 
     #[test]

@@ -2280,6 +2280,131 @@ mod tests {
     }
 
     #[test]
+    fn terminal_unconditional_loop_controls_compile() {
+        let source = r"
+            @group(0) @binding(0) var<storage, read_write> output: array<u32>;
+
+            @compute @workgroup_size(4)
+            fn main(@builtin(local_invocation_index) lane: u32) {
+                var value = lane;
+                loop {
+                    value += 1u;
+                    break;
+                }
+                output[lane] = value;
+            }
+        ";
+        let artifact = Compiler
+            .compile_wgsl(
+                source,
+                Stage::Compute,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap();
+        assert!(artifact.dksh.starts_with(b"DKSH"));
+        let ir = lowered_ir(source, naga::ShaderStage::Compute, "main");
+        assert_eq!(ir.matches("phi_dst").count(), 2, "{ir}");
+    }
+
+    #[test]
+    fn terminal_unconditional_continue_reaches_continuing() {
+        let source = r"
+            @group(0) @binding(0) var<storage, read_write> output: array<u32>;
+
+            @compute @workgroup_size(4)
+            fn main(@builtin(local_invocation_index) lane: u32) {
+                var value = lane;
+                loop {
+                    value += 1u;
+                    continue;
+                    continuing {
+                        break if value == lane + 3u;
+                    }
+                }
+                output[lane] = value;
+            }
+        ";
+        let artifact = Compiler
+            .compile_wgsl(
+                source,
+                Stage::Compute,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap();
+        assert!(artifact.dksh.starts_with(b"DKSH"));
+        let ir = lowered_ir(source, naga::ShaderStage::Compute, "main");
+        assert!(ir.contains("cont"), "{ir}");
+        assert!(ir.contains("brk"), "{ir}");
+    }
+
+    #[test]
+    fn competing_break_edges_merge_loop_local_values() {
+        let source = r"
+            @group(0) @binding(0) var<storage, read_write> output: array<u32>;
+
+            @compute @workgroup_size(4)
+            fn main(@builtin(local_invocation_index) lane: u32) {
+                var value = lane;
+                loop {
+                    value += 1u;
+                    if lane == 0u {
+                        break;
+                    }
+                    value += 2u;
+                    break;
+                }
+                output[lane] = value;
+            }
+        ";
+        let artifact = Compiler
+            .compile_wgsl(
+                source,
+                Stage::Compute,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap();
+        assert!(artifact.dksh.starts_with(b"DKSH"));
+        let ir = lowered_ir(source, naga::ShaderStage::Compute, "main");
+        assert_eq!(ir.matches("brk").count(), 2, "{ir}");
+        assert_eq!(ir.matches("phi_dst").count(), 2, "{ir}");
+    }
+
+    #[test]
+    fn write_only_loop_local_survives_break() {
+        let source = r"
+            @group(0) @binding(0) var<storage, read_write> output: array<u32>;
+
+            @compute @workgroup_size(1)
+            fn main() {
+                var value = 0u;
+                loop {
+                    value = 99u;
+                    break;
+                }
+                output[0] = value;
+            }
+        ";
+        let artifact = Compiler
+            .compile_wgsl(
+                source,
+                Stage::Compute,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap();
+        assert!(artifact.dksh.starts_with(b"DKSH"));
+        let ir = lowered_ir(source, naga::ShaderStage::Compute, "main");
+        assert_eq!(ir.matches("phi_dst").count(), 1, "{ir}");
+    }
+
+    #[test]
     fn nested_early_return_preserves_only_live_invocations() {
         let source = r"
             @group(0) @binding(0) var<storage, read_write> output: array<u32>;

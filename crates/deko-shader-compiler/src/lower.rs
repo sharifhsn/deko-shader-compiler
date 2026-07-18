@@ -683,7 +683,7 @@ fn bind_compute_builtin(
     })
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 struct Value {
     components: Vec<Src>,
     kind: naga::ScalarKind,
@@ -728,6 +728,7 @@ struct LoopContext {
     exit_label: Label,
     continue_label: Label,
     carried_locals: Vec<naga::Handle<naga::LocalVariable>>,
+    exit_locals: Vec<naga::Handle<naga::LocalVariable>>,
     entry_locals: HashMap<naga::Handle<naga::LocalVariable>, Value>,
     break_edges: Vec<LoopBreakEdge>,
     continue_edges: Vec<LoopContinueEdge>,
@@ -736,6 +737,7 @@ struct LoopContext {
 struct LoopBreakEdge {
     block: usize,
     returned: Option<Value>,
+    locals: HashMap<naga::Handle<naga::LocalVariable>, Value>,
 }
 
 #[derive(Clone)]
@@ -6579,6 +6581,14 @@ impl<'function> FunctionLowerer<'function> {
         matches!(statements.next(), Some(naga::Statement::Break)) && statements.next().is_none()
     }
 
+    fn break_prefix(block: &naga::Block) -> Option<naga::Block> {
+        let break_index = block
+            .iter()
+            .rposition(|statement| !matches!(statement, naga::Statement::Emit(_)))?;
+        matches!(block[break_index], naga::Statement::Break)
+            .then(|| naga::Block::from_vec(block[..break_index].to_vec()))
+    }
+
     fn continue_prefix(block: &naga::Block) -> Option<naga::Block> {
         let continue_index = block
             .iter()
@@ -6625,6 +6635,7 @@ impl<'function> FunctionLowerer<'function> {
             return Ok(());
         }
         let branch_block = self.current_block;
+        let locals = self.locals.clone();
         let mut instruction = Instr::new(OpBrk { target: exit_label });
         instruction.pred = predicate;
         self.emit(instruction);
@@ -6639,6 +6650,7 @@ impl<'function> FunctionLowerer<'function> {
             .push(LoopBreakEdge {
                 block: branch_block,
                 returned,
+                locals,
             });
         self.current_block = continuation;
         Ok(())
@@ -6704,6 +6716,14 @@ impl<'function> FunctionLowerer<'function> {
         let mut carried_locals = HashSet::default();
         self.collect_loop_carried_locals(body, &mut written_locals, &mut carried_locals);
         self.collect_loop_carried_locals(continuing, &mut written_locals, &mut carried_locals);
+        let mut exit_locals = HashSet::default();
+        self.collect_loop_written_locals(body, &mut exit_locals);
+        self.collect_loop_written_locals(continuing, &mut exit_locals);
+        let mut exit_local_handles = exit_locals.into_iter().collect::<Vec<_>>();
+        exit_local_handles.sort_by_key(|handle| handle.index());
+        for &local in &exit_local_handles {
+            self.local_value(local)?;
+        }
         let mut local_handles = carried_locals.into_iter().collect::<Vec<_>>();
         local_handles.sort_by_key(|handle| handle.index());
         let mut preheader_sources = OpPhiSrcs::new();
@@ -6768,12 +6788,19 @@ impl<'function> FunctionLowerer<'function> {
             exit_label,
             continue_label,
             carried_locals: local_handles,
+            exit_locals: exit_local_handles,
             entry_locals: self.locals.clone(),
             break_edges: Vec::new(),
             continue_edges: Vec::new(),
         });
-        let returned_from_body = self.execute_statements(body)?;
-        let body_falls_through = returned_from_body.is_none();
+        let break_prefix = Self::break_prefix(body);
+        let continue_prefix = Self::continue_prefix(body);
+        let executable_body = break_prefix
+            .as_ref()
+            .or(continue_prefix.as_ref())
+            .unwrap_or(body);
+        let returned_from_body = self.execute_statements(executable_body)?;
+        let mut body_falls_through = returned_from_body.is_none();
         let body_end = self.current_block;
         if let Some(returned) = returned_from_body {
             self.emit(Instr::new(OpBrk { target: exit_label }));
@@ -6784,7 +6811,25 @@ impl<'function> FunctionLowerer<'function> {
                 .push(LoopBreakEdge {
                     block: body_end,
                     returned: Some(returned),
+                    locals: self.locals.clone(),
                 });
+        } else if break_prefix.is_some() {
+            let exit_label = self
+                .loops
+                .last()
+                .expect("loop context was pushed")
+                .exit_label;
+            self.emit(Instr::new(OpBrk { target: exit_label }));
+            self.loops
+                .last_mut()
+                .expect("loop context was pushed")
+                .break_edges
+                .push(LoopBreakEdge {
+                    block: body_end,
+                    returned: None,
+                    locals: self.locals.clone(),
+                });
+            body_falls_through = false;
         }
         let continuing_block = self.append_block(continue_label);
         let mut continue_edges = self
@@ -6842,9 +6887,112 @@ impl<'function> FunctionLowerer<'function> {
             self.add_edge(edge.block, exit);
         }
         self.current_block = exit;
+        self.merge_break_locals(&context, exit)?;
         self.merge_loop_returns(&context)?;
-        for phi in loop_phis {
-            self.locals.insert(phi.local, phi.header_value);
+        Ok(())
+    }
+
+    fn merge_break_locals(
+        &mut self,
+        context: &LoopContext,
+        exit_block: usize,
+    ) -> Result<(), Error> {
+        let Some(first) = context.break_edges.first() else {
+            self.locals.clone_from(&context.entry_locals);
+            return Ok(());
+        };
+        let mut local_handles = context.carried_locals.clone();
+        for &handle in &context.exit_locals {
+            if !local_handles.contains(&handle)
+                && context
+                    .break_edges
+                    .iter()
+                    .filter(|edge| edge.returned.is_none())
+                    .any(|edge| edge.locals.get(&handle) != context.entry_locals.get(&handle))
+            {
+                local_handles.push(handle);
+            }
+        }
+        local_handles.sort_by_key(|handle| handle.index());
+        let mut merges = Vec::with_capacity(local_handles.len());
+        for handle in local_handles {
+            let template = first
+                .locals
+                .get(&handle)
+                .ok_or_else(|| Error::UnsupportedFeature("missing break-edge local".to_owned()))?;
+            let phis = (0..template.components.len())
+                .map(|_| self.target.phi_alloc.alloc())
+                .collect::<Vec<_>>();
+            let destinations = (0..template.components.len())
+                .map(|_| self.target.ssa_alloc.alloc(RegFile::GPR))
+                .collect::<Vec<_>>();
+            merges.push((
+                handle,
+                template.kind,
+                template.components.len(),
+                phis,
+                destinations,
+            ));
+        }
+
+        for edge in &context.break_edges {
+            self.current_block = edge.block;
+            let branch = self.blocks[edge.block].instrs.pop().ok_or_else(|| {
+                Error::UnsupportedFeature("loop break block has no branch".to_owned())
+            })?;
+            if !branch.op.is_branch() {
+                return Err(Error::UnsupportedFeature(
+                    "loop break block does not end in a branch".to_owned(),
+                ));
+            }
+            let mut sources = OpPhiSrcs::new();
+            for (handle, kind, component_count, phis, _) in &merges {
+                let values = if edge.returned.is_some() {
+                    &context.entry_locals
+                } else {
+                    &edge.locals
+                };
+                let value = values.get(handle).ok_or_else(|| {
+                    Error::UnsupportedFeature("missing break-edge local".to_owned())
+                })?;
+                if value.kind != *kind || value.components.len() != *component_count {
+                    return Err(Error::UnsupportedFeature(
+                        "break-edge local changed shape".to_owned(),
+                    ));
+                }
+                let materialized = self.materialize_loop_components(value)?;
+                for (phi, source) in phis.iter().zip(materialized) {
+                    sources.srcs.push(*phi, Src::from(source));
+                }
+            }
+            if !sources.srcs.is_empty() {
+                self.emit(Instr::new(sources));
+            }
+            self.emit(branch);
+        }
+
+        self.current_block = exit_block;
+        let mut destinations = OpPhiDsts::new();
+        for (_, _, _, phis, registers) in &merges {
+            for (phi, register) in phis.iter().zip(registers) {
+                destinations.dsts.push(*phi, Dst::from(*register));
+            }
+        }
+        if !destinations.dsts.is_empty() {
+            self.emit(Instr::new(destinations));
+        }
+
+        self.locals.clone_from(&context.entry_locals);
+        for (handle, kind, _, _, registers) in merges {
+            let value = if kind == naga::ScalarKind::Bool {
+                self.boolean_loop_value(&registers)
+            } else {
+                Value {
+                    components: registers.into_iter().map(Src::from).collect(),
+                    kind,
+                }
+            };
+            self.locals.insert(handle, value);
         }
         Ok(())
     }
@@ -7019,6 +7167,49 @@ impl<'function> FunctionLowerer<'function> {
                     let mut nested_written = written.clone();
                     self.collect_loop_carried_locals(body, &mut nested_written, carried);
                     self.collect_loop_carried_locals(continuing, &mut nested_written, carried);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn collect_loop_written_locals(
+        &self,
+        block: &naga::Block,
+        written: &mut HashSet<naga::Handle<naga::LocalVariable>>,
+    ) {
+        for statement in block {
+            match statement {
+                naga::Statement::Store { pointer, .. }
+                | naga::Statement::Atomic { pointer, .. } => {
+                    if let Ok((local, _, _)) = self.local_pointer(*pointer) {
+                        written.insert(local);
+                    }
+                }
+                naga::Statement::Call { arguments, .. } => {
+                    for argument in arguments {
+                        if let Ok((local, _, _)) = self.local_pointer(*argument) {
+                            written.insert(local);
+                        }
+                    }
+                }
+                naga::Statement::Block(block) => {
+                    self.collect_loop_written_locals(block, written);
+                }
+                naga::Statement::If { accept, reject, .. } => {
+                    self.collect_loop_written_locals(accept, written);
+                    self.collect_loop_written_locals(reject, written);
+                }
+                naga::Statement::Switch { cases, .. } => {
+                    for case in cases {
+                        self.collect_loop_written_locals(&case.body, written);
+                    }
+                }
+                naga::Statement::Loop {
+                    body, continuing, ..
+                } => {
+                    self.collect_loop_written_locals(body, written);
+                    self.collect_loop_written_locals(continuing, written);
                 }
                 _ => {}
             }
