@@ -3,7 +3,7 @@ use deko_nak::ir::{
     FloatCmpOp, FloatType, Function, HasRegFile, ImageAccess, ImageDim, Instr, IntCmpOp,
     IntCmpType, IntType, InterpFreq, InterpLoc, Label, LabelAllocator, LdcMode, LogicOp2,
     MemAccess, MemAddrType, MemEvictionPriority, MemOrder, MemScope, MemSpace, MemType, MuFuOp,
-    OffsetStride, OpALd, OpASt, OpAtom, OpBar, OpBfe, OpBrk, OpCont, OpExit, OpF2I, OpFAdd,
+    OffsetStride, Op, OpALd, OpASt, OpAtom, OpBar, OpBfe, OpBrk, OpCont, OpExit, OpF2I, OpFAdd,
     OpFMnMx, OpFMul, OpFSetP, OpFSwzAdd, OpFlo, OpI2F, OpIAdd2, OpIAdd2X, OpIMad, OpIMnMx, OpIMul,
     OpISetP, OpIpa, OpKill, OpLd, OpLdc, OpLop2, OpMemBar, OpMov, OpMuFu, OpPBk, OpPCnt, OpPSetP,
     OpPhiDsts, OpPhiSrcs, OpPrmt, OpRegOut, OpS2R, OpSel, OpShfl, OpShl, OpShr, OpSt, OpSuLd,
@@ -787,7 +787,21 @@ impl<'function> FunctionLowerer<'function> {
     }
 
     fn emit(&mut self, mut instruction: Instr) {
-        if !self.execution_predicate.is_true() {
+        let must_be_unpredicated = matches!(
+            instruction.op,
+            Op::Undef(_)
+                | Op::PhiSrcs(_)
+                | Op::PhiDsts(_)
+                | Op::Copy(_)
+                | Op::Pin(_)
+                | Op::Unpin(_)
+                | Op::Swap(_)
+                | Op::ParCopy(_)
+                | Op::R2UR(_)
+                | Op::RegOut(_)
+                | Op::Annotate(_)
+        );
+        if !must_be_unpredicated && !self.execution_predicate.is_true() {
             instruction.pred = self.combine_predicates(self.execution_predicate, instruction.pred);
         }
         self.blocks[self.current_block].instrs.push(instruction);

@@ -2016,6 +2016,44 @@ mod tests {
     }
 
     #[test]
+    fn divergent_branch_with_loop_compiles() {
+        let source = r"
+            @group(0) @binding(0) var<storage, read_write> output: array<u32>;
+
+            @compute @workgroup_size(4)
+            fn main(@builtin(local_invocation_index) lane: u32) {
+                var sum = 0u;
+                if (lane & 1u) == 0u {
+                    for (var index = 0u; index < 4u; index += 1u) {
+                        sum += index;
+                    }
+                    output[lane] = sum;
+                } else {
+                    output[lane] = 99u;
+                }
+            }
+        ";
+        let artifact = Compiler
+            .compile_wgsl(
+                source,
+                Stage::Compute,
+                "main",
+                &PipelineConstants::new(),
+                Options::default(),
+            )
+            .unwrap();
+        assert!(artifact.dksh.starts_with(b"DKSH"));
+
+        let ir = lowered_ir(source, naga::ShaderStage::Compute, "main");
+        let stores = ir
+            .lines()
+            .filter(|line| line.contains("st.global"))
+            .collect::<Vec<_>>();
+        assert_eq!(stores.len(), 2, "{ir}");
+        assert!(stores.iter().all(|line| line.contains('@')), "{ir}");
+    }
+
+    #[test]
     fn gradient_lowering_selects_native_and_rewritten_paths() {
         let two_dimensional = lowered_ir(
             r"

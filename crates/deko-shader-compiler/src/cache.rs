@@ -19,7 +19,7 @@ pub const CACHE_KEY_VERSION: u32 = 1;
 ///
 /// This must be incremented whenever a backend change can alter or invalidate DKSH output without
 /// a package-version change.
-pub const BACKEND_ABI_VERSION: u32 = 33;
+pub const BACKEND_ABI_VERSION: u32 = 34;
 
 /// Default maximum number of compiled artifacts retained in process memory.
 pub const DEFAULT_MEMORY_CACHE_ENTRIES: usize = 256;
