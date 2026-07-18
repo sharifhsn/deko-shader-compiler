@@ -36,6 +36,8 @@
   preserving NAK SSA lifetime and scheduling invariants through if-converted loops.
 - Track the live invocation mask through nested early returns, including void returns,
   so lanes that have returned cannot execute later side effects.
+- Preserve that live invocation mask across loop exits so lanes returning from inside a
+  loop cannot execute side effects that follow the loop.
 - Snapshot and merge pointer arguments across divergent helper-function arms, and write
   updated pointer values back from both void and value-returning calls.
 - Lower WGSL atomic operations on `r32uint` and `r32sint` storage textures to native

@@ -7107,8 +7107,11 @@ impl<'function> FunctionLowerer<'function> {
                 kind: template.kind,
             }
         };
+        let returned_predicate = Self::predicate(&flag.components[0])?;
         self.early_returns
             .push((flag.components[0].clone(), returned));
+        self.execution_predicate =
+            self.combine_predicates(self.execution_predicate, returned_predicate.bnot());
         Ok(())
     }
 
